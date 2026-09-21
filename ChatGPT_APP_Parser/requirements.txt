@@ -1,0 +1,3 @@
+pytsk3==20260715
+# Windows 휠은 Python 3.10~3.12 만 제공 (3.13+ 는 소스 빌드 필요)
+libewf-python==20240506

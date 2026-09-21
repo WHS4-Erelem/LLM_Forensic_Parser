@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════════
+#  증거·분석 결과는 절대 커밋하지 않는다
+#  복원된 대화 원문·계정 UUID·해시가 그대로 들어 있다
+# ══════════════════════════════════════════════════════════════════
+out/
+out_*/
+aifp_out/
+result/
+demo/
+*_out/
+_work/
+.aifp_work_*/
+_checkpoint.json
+_records.pkl
+
+# 결과물 형식 (어느 폴더에 있든)
+**/result.json
+**/report.txt
+**/timeline.csv
+**/events.csv
+**/artifacts.csv
+**/records.csv
+**/conversations.csv
+**/identifiers.csv
+**/negative_results.csv
+**/issues.csv
+**/manifest.csv
+**/statistics.json
+**/audit.json
+**/content/*.md
+
+# 디스크 이미지 — 실수로라도 올리면 안 된다
+*.dd
+*.raw
+*.img
+*.bin
+*.E01
+*.Ex01
+*.s01
+*.vmdk
+*.vhd
+*.vhdx
+*.001
+*.002
+*.003
+
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS·에디터
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# 로그
+*.log
+debug.txt

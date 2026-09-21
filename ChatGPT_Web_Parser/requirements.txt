@@ -1,0 +1,12 @@
+# ChatGPT Web Artifact Parser — 의존성
+# Parser 본체는 표준 라이브러리만으로 동작한다. 아래는 모두 "선택 import" 이며,
+# 없으면 해당 입력·Artifact 만 Coverage 에 NOT_SUPPORTED / warning 으로 남고 나머지는 그대로 동작한다.
+
+pytsk3==20260715      # Disk Image(DD/RAW·E01) 파티션 · NTFS 접근. --image 사용 시 필요
+brotli==1.2.0         # Chrome Cache 대화 API 응답(br) 해제. 대화 메시지 복구에 필요
+cramjam==2.12.1       # LevelDB .ldb(SSTable) raw Snappy 해제. Local Storage .ldb 읽기에 필요
+
+# E01/EWF 입력 전용 — Python 3.12 에서만 설치된다 (cp313 wheel 없음, LGPLv3+).
+# Python 3.13 에서 E01 을 주면 E01_INPUT_REQUIRES_PYEWF 로 거부하고 DD/RAW 는 정상 동작한다.
+#   py -3.12 -m venv <venv> && <venv>\Scripts\pip install -r requirements.txt libewf-python==20240506
+# libewf-python==20240506

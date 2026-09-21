@@ -1,0 +1,150 @@
+{
+  "_doc": "파서 레지스트리. python/cwd 는 이 파일 기준 상대경로. args 의 {image} {out} 은 실행 시 치환. outputs 는 out 폴더 기준 결과 파일명. version_args(CLI) 또는 version_file+version_regex(소스 상수)로 parser_version 을 얻고, 소스 해시(code=)를 항상 덧붙인다.",
+  "parsers": [
+    {
+      "name": "chatgpt_desktop",
+      "model": "chatgpt-desktop",
+      "python": ".venv312/Scripts/python.exe",
+      "cwd": "../ChatGPT_APP_Parser",
+      "args": [
+        "run_parser.py",
+        "-i",
+        "{image}",
+        "-o",
+        "{out}",
+        "--overwrite",
+        "--format",
+        "both"
+      ],
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 1800,
+      "version_file": "cxparser/pipeline.py",
+      "version_regex": "\"version\": \"([^\"]+)\""
+    },
+    {
+      "name": "chatgpt_web",
+      "model": "chatgpt-web",
+      "python": ".venv312/Scripts/python.exe",
+      "cwd": "../ChatGPT_Web_Parser",
+      "args": [
+        "-m",
+        "chatgpt_parser.cli",
+        "--image",
+        "{image}",
+        "--csv-dir",
+        "{out}",
+        "--out",
+        "{out}/result.json",
+        "--overwrite"
+      ],
+      "volume_json": {
+        "file": "result.json",
+        "pointer": "/input/partition",
+        "regex": "byte_offset=(\\d+)",
+        "format": "ntfs@{0}"
+      },
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 1800,
+      "version_file": "chatgpt_parser/constants.py",
+      "version_regex": "PARSER_VERSION = \"([^\"]+)\""
+    },
+    {
+      "name": "claude_desktop",
+      "model": "claude-desktop",
+      "python": ".venv312/Scripts/python.exe",
+      "cwd": "../Claude_APP_Parser",
+      "args": [
+        "aifp_parse.py",
+        "--image",
+        "{image}",
+        "--out",
+        "{out}",
+        "--no-banner"
+      ],
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 3600,
+      "version_args": [
+        "aifp_parse.py",
+        "--version"
+      ]
+    },
+    {
+      "name": "claude_web",
+      "model": "claude-web",
+      "python": ".venv312/Scripts/python.exe",
+      "cwd": "../Claude_Web_Parser",
+      "_note": "3.14 에서는 ccl-chromium-reader 의 zstd 가 MSVC 빌드를 요구해 3.12(휠 있음)로 실행",
+      "env": {
+        "PYTHONPATH": "src"
+      },
+      "args": [
+        "-m",
+        "claude_web_forensics",
+        "analyze",
+        "--image",
+        "{image}",
+        "--output",
+        "{out}",
+        "--overwrite"
+      ],
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 3600,
+      "version_args": [
+        "-m",
+        "claude_web_forensics",
+        "version"
+      ]
+    },
+    {
+      "name": "gemini_web",
+      "model": "gemini-web",
+      "python": ".venv312/Scripts/python.exe",
+      "cwd": "../Gemini_Web_Parser",
+      "args": [
+        "gemini_parser.py",
+        "{image}",
+        "--output",
+        "{out}",
+        "--csv"
+      ],
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 1800,
+      "version_file": "gemini_parser.py",
+      "version_regex": "PARSER_VERSION = \"([^\"]+)\""
+    },
+    {
+      "name": "lmstudio",
+      "model": "lmstudio",
+      "python": ".venv314/Scripts/python.exe",
+      "cwd": "../LMstudio_parser",
+      "args": [
+        "lmstudio_parser.py",
+        "{image}",
+        "--output",
+        "{out}"
+      ],
+      "outputs": {
+        "timeline": "timeline.csv",
+        "conversations": "recovered_conversations.csv"
+      },
+      "timeout_sec": 1800,
+      "version_file": "lmstudio_parser.py",
+      "version_regex": "REFERENCE_LM_STUDIO_VERSION = \"([^\"]+)\""
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-web-forensics"
+version = "1.0.0"
+description = "Single-snapshot forensic parser for Claude Web traces in Google Chrome on Windows (E01/dd input, CLI only)"
+requires-python = ">=3.12"
+license = {text = "Proprietary - research prototype"}
+dependencies = [
+    "dissect.evidence==3.13",
+    "dissect.volume==3.18",
+    "dissect.fve==4.6",
+    "dissect.ntfs==3.16",
+    "dissect.util==3.24",
+    "dissect.cstruct==4.7",
+    "pycryptodome==3.23.0",
+    "ccl-chromium-reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d",
+    "ccl-simplesnappy==0.4",
+    "Brotli==1.2.0",
+]
+
+[project.optional-dependencies]
+zstd = ["zstandard==0.25.0"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+claude-web-forensics = "claude_web_forensics.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
