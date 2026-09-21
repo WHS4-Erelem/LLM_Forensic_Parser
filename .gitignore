@@ -1,0 +1,52 @@
+# 실행 환경 (setup.ps1 로 재생성)
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 테스트/커버리지 캐시
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 빌드 결과
+build/
+dist/
+
+# 임시 작업 파일/폴더
+_staging/
+_work/
+temp/
+tmp/
+*.partial
+
+# 분석 결과 — 복원된 대화 원문·계정 식별자가 들어 있으므로 절대 커밋하지 않는다
+integration/out/
+**/out/
+**/out_*/
+**/result/
+**/timeline.csv
+**/recovered_conversations.csv
+**/unified.db*
+**/evidence_manifest.json
+**/integration_report.json
+*.log
+
+# 디스크 이미지
+*.E01
+*.Ex01
+*.dd
+*.raw
+*.img
+*.vmdk
+*.vhd
+*.vhdx
+*.001
+
+# OS·에디터
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

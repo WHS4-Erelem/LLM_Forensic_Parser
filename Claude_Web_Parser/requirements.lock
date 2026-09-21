@@ -1,0 +1,14 @@
+# Pinned dependency set. Versions verified in docs/design_review.md section 4.
+# Python 3.12+ (developed and verified on 3.14.2, Windows 11 x64).
+Brotli==1.2.0
+ccl-simplesnappy==0.4
+ccl-chromium-reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d
+dissect.cstruct==4.7
+dissect.evidence==3.13
+dissect.fve==4.6
+dissect.ntfs==3.16
+dissect.util==3.24
+dissect.volume==3.18
+pycryptodome==3.23.0
+# Optional: only needed when the Python build has no stdlib compression.zstd (< 3.14)
+zstandard==0.25.0 ; python_version < "3.14"
