@@ -12,14 +12,14 @@ python llm_forensic.py --self-test
 
 결과: `out\<evidence_id>\`
 - `<파서명>\` 파서별 원본 결과(그대로 보존, 같은 이미지로 재실행하면 그 파서 폴더만 새 결과로 교체) + `run.log`(파서 버전·python·명령·시작 시각·stdout/stderr·종료코드)
-- `timeline.csv`, `recovered_conversations.csv` 병합본 — 팀 7열/10열은 파서가 쓴 값 그대로(열 이름만 canonical), 그 뒤에 provenance 열
+- `timeline.csv`, `recovered_conversations.csv` 병합본 — 팀 7열/10열은 헤더·값 모두 파서가 쓴 그대로, 그 뒤에 provenance 열
 - `unified.db` — evidence / runs / events / messages
 - `integration_report.json` — 파서별 상태(`success` / `failed` / `contract_violation` / `normalization_error` / `db_error`), 적재 행 수, 오류 목록
 - `evidence_manifest.json` — 세그먼트별 `{file, size_bytes, sha256}` 매니페스트 + 전체 `evidence_sha256`. 분석 종료 후 같은 명령으로 다시 계산해 대조한다
 
 열 이름 (canonical header)
 - 파서 CSV 는 팀 계약 헤더(`Model`, `Behavior_details ` 등 끝 공백 포함)와 바이트 단위로 같아야 받는다. 다르면 고쳐 받지 않고 `HEADER_MISMATCH`.
-- 계약 검사를 통과한 뒤에만 통합 내부(DB·병합 CSV)에서 canonical 이름을 쓴다: 앞뒤 공백 제거 → 소문자 → 공백은 `_`.
+- 계약 검사를 통과한 뒤 통합 내부(unified.db)에서만 canonical 이름을 쓴다: 앞뒤 공백 제거 → 소문자 → 공백은 `_`. 병합 CSV 의 헤더는 팀 계약 이름 그대로다 (벤치마크·파서 출력과 같은 헤더).
   - timeline: `model, timestamp, user_behavior, behavior_details, verdict, artifact_path, artifact_details`
   - recovered_conversations: `model, timestamp, conversation_uuid, conversation_title, message_uuid, parent_message_uuid, message_order, role, content, artifact_path`
 - 파서가 쓴 CSV 파일(`<파서명>\*.csv`)은 다시 쓰지 않는다.

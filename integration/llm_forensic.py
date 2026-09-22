@@ -517,15 +517,16 @@ def _safe(v):
 def write_merged(db, evidence_id, out_dir):
     """반환: [(경로, 행 수, {source_parser: 행 수})]."""
     written = []
-    for name, table, fields in (("timeline.csv", "events", TIMELINE_FIELDS),
-                                ("recovered_conversations.csv", "messages", CONV_FIELDS)):
+    for name, table, fields, columns in (("timeline.csv", "events", TIMELINE_FIELDS, TIMELINE_COLUMNS),
+                                         ("recovered_conversations.csv", "messages", CONV_FIELDS, CONV_COLUMNS)):
         out_cols = fields + EXTRA_COLUMNS
+        header = columns + EXTRA_COLUMNS                 # 사람이 보는 병합 CSV 는 팀 계약 헤더 그대로 (DB 안에서만 snake_case)
         rows = db.execute("select %s from %s where evidence_id=? order by (timestamp_utc is null), timestamp_utc, source_parser"
                           % (", ".join(map(_q, out_cols)), table), (evidence_id,)).fetchall()
         path = os.path.join(out_dir, name)
         with open(path, "w", encoding="utf-8-sig", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(out_cols)
+            w.writerow(header)
             for r in rows:
                 w.writerow([_safe(c) for c in r])
         by_parser = Counter(r[out_cols.index("source_parser")] for r in rows)
@@ -946,14 +947,14 @@ def _self_test_end_to_end(td, image, evidence_id):
                               "normalization_error": 0, "db_error": 0} and rep["exit_code"] == 1
     with open(os.path.join(case, "timeline.csv"), encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.reader(fh))
-    assert rows[0] == TIMELINE_FIELDS + EXTRA_COLUMNS and all(h == h.strip() for h in rows[0])
-    tl = [dict(zip(rows[0], r)) for r in rows[1:]]
+    assert rows[0] == TIMELINE_COLUMNS + EXTRA_COLUMNS                      # 병합 CSV 헤더는 팀 계약 그대로
+    tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}
     assert {r["volume_ref"] for r in tl} == {"ntfs@5", "ntfs@7"}                         # volume_ref 규칙은 그대로
     assert all(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", r["parse_time_utc"]) for r in tl)
     with open(os.path.join(case, "recovered_conversations.csv"), encoding="utf-8-sig", newline="") as fh:
-        assert next(csv.reader(fh)) == CONV_FIELDS + EXTRA_COLUMNS
+        assert next(csv.reader(fh)) == CONV_COLUMNS + EXTRA_COLUMNS
 
     # 2) 같은 evidence 재실행 (alpha 출력이 바뀜): 이전 alpha 행은 남지 않고 runs 이력은 쌓인다
     rc, console, rep = cli(FAKE_MODE_ALPHA="v2")
