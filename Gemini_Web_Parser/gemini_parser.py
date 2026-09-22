@@ -100,11 +100,11 @@ PROJECT_ACTIONS = (
     "방문기록 삭제", "캐시 삭제",
 )
 TEAM_BEHAVIORS = set(PROJECT_ACTIONS) | {
-    "Gemini 접속", "대화 접근", "이미지 다운로드", "파일 다운로드",
+    "서비스 접속", "대화 접근", "이미지 다운로드", "파일 다운로드",
 }
 # Artifact families inspected for each action. Used only for optional coverage/debug output.
 ACTION_COVERAGE_ARTIFACTS = {
-    "Gemini 접속": {"Chrome History"},
+    "서비스 접속": {"Chrome History"},
     "대화 접근": {"Chrome History", "Chrome Sessions"},
     "로그인": {"Chrome History", "Chrome Cookies", "Chrome Preferences"},
     "로그아웃": {"Chrome History", "Chrome Local Storage", "Chrome Session Storage"},
@@ -2842,7 +2842,7 @@ class GeminiParser:
             "incognito_mode_candidate": "브라우저 시크릿 모드",
             "history_clear_candidate": "방문기록 삭제",
             "cache_clear_candidate": "캐시 삭제",
-            "gemini_access_candidate": "Gemini 접속",
+            "gemini_access_candidate": "서비스 접속",          # 팀 행위 분류 체계: 서비스명 없는 이름. 근거(Gemini URL 방문)는 Behavior_details 에
             "conversation_access": "대화 접근",
             "conversation_candidate": "대화 관련 흔적",
             "cached_image_candidate": "이미지 생성 관련 흔적",
