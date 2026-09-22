@@ -16,6 +16,8 @@ import sys
 from collections import Counter
 from datetime import datetime
 
+from llm_forensic import canonical_header
+
 # 정답지 이름과 파서 이름이 뜻은 같지만 표기가 다른 경우만 (파서 쪽 수정이 끝나면 비워도 됨)
 ALIASES = {
     "사용자 프롬프트 입력/전송": {"사용자 프롬프트 입력/전송", "프롬프트 전송"},
@@ -35,33 +37,33 @@ def _kst(s):
 def compare(timeline, key, window):
     by_model = {}
     for r in timeline:
-        by_model.setdefault(r["Model"], []).append(r)
+        by_model.setdefault(r["model"], []).append(r)
     out = []
     for k in key:
         rows = by_model.get(k["model"], [])
         want = ALIASES.get(k["action"], {k["action"]})
         target = _kst(k["kst"])
-        same = [r for r in rows if r["User_behavior"] in want]
+        same = [r for r in rows if r["user_behavior"] in want]
         best = None
         for r in same:
-            t = _kst(r["Timestamp"])
+            t = _kst(r["timestamp"])
             d = abs((t - target).total_seconds()) if t and target else None
             if d is not None and (best is None or d < best[0]):
                 best = (d, r)
         if best and best[0] <= window:
-            res, obs = "일치", "%s (%+ds) %s" % (best[1]["Timestamp"][:19], (_kst(best[1]["Timestamp"]) - target).total_seconds(), best[1]["Behavior_details "][:60])
+            res, obs = "일치", "%s (%+ds) %s" % (best[1]["timestamp"][:19], (_kst(best[1]["timestamp"]) - target).total_seconds(), best[1]["behavior_details"][:60])
         elif same:
-            res, obs = "부분 차이", "같은 행위 %d건이나 ±%ds 밖 (예: %s)" % (len(same), window, same[0]["Timestamp"][:19])
+            res, obs = "부분 차이", "같은 행위 %d건이나 ±%ds 밖 (예: %s)" % (len(same), window, same[0]["timestamp"][:19])
         else:
             near = None
             for r in rows:
-                t = _kst(r["Timestamp"])
+                t = _kst(r["timestamp"])
                 d = abs((t - target).total_seconds()) if t and target else None
                 if d is not None and (near is None or d < near[0]):
                     near = (d, r)
             res = "불일치"
-            obs = "해당 행위 없음. 가장 가까운 행: %s %s (%+ds)" % (near[1]["Timestamp"][:19], near[1]["User_behavior"],
-                                                   (_kst(near[1]["Timestamp"]) - target).total_seconds()) if near else "해당 Model 행 없음"
+            obs = "해당 행위 없음. 가장 가까운 행: %s %s (%+ds)" % (near[1]["timestamp"][:19], near[1]["user_behavior"],
+                                                   (_kst(near[1]["timestamp"]) - target).total_seconds()) if near else "해당 Model 행 없음"
         out.append({**k, "result": res, "observed": obs})
     return out
 
@@ -88,8 +90,8 @@ def main(argv=None):
     ap.add_argument("--window", type=int, default=120)
     ap.add_argument("--out", help="markdown 보고서 경로 (기본: 타임라인 옆 verify_report.md)")
     a = ap.parse_args(argv)
-    with open(a.timeline, encoding="utf-8-sig", newline="") as fh:
-        timeline = list(csv.DictReader(fh))
+    with open(a.timeline, encoding="utf-8-sig", newline="") as fh:   # 병합본 헤더는 canonical (이전 병합본의 원본 헤더도 같은 이름으로 읽는다)
+        timeline = [{canonical_header(k): v for k, v in r.items()} for r in csv.DictReader(fh)]
     with open(a.key, encoding="utf-8-sig", newline="") as fh:
         key = list(csv.DictReader(fh))
     rows = compare(timeline, key, a.window)
