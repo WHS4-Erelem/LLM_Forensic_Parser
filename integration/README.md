@@ -57,9 +57,15 @@ provenance 열 (병합 CSV·DB 공통, 원본 열을 덮어쓰지 않고 덧붙�
 | `NORMALIZATION_ERROR` | normalization_error | 통합 쪽 정규화 계산 실패 |
 | `DB_ERROR` | db_error | DB 열기·초기화·적재·조회 실패 |
 | `OUTPUT_WRITE_ERROR` | — | 병합 CSV·보고서 쓰기 실패 (엑셀 등이 파일을 열고 있는 경우 등) |
+| `UNKNOWN_USER_BEHAVIOR` | warning (success 유지) | `user_behaviors.txt` 에 없는 행위명. 적재는 하고 파서 담당자에게 알린다 |
 
 콘솔에는 통합이 만든 요약(`[Evidence] [DB] [Runner] [Timeline] [Report] [Summary]`)만 나온다. 파서 stdout/stderr 는 콘솔에 섞지 않고 `<파서명>\run.log` 에만 남긴다.
 실패 시 `[Runner]` 아래에 첫 오류 한 줄과 `detail:` (실행 실패는 run.log, 계약 위반은 integration_report.json) 경로를 보여 준다.
+
+행위 분류 체계 (`user_behaviors.txt`)
+- timeline 의 `User_behavior` 에 허용되는 이름 목록. 파서 6개가 같은 행위를 같은 이름으로 부르게 하는 팀 스펙이며, 배포본에 포함된다 (정답지 `scenario_keys\` 는 검증 전용).
+- 목록 밖 이름은 `UNKNOWN_USER_BEHAVIOR` **경고**로 `integration_report.json` 과 콘솔에 파서·행·값을 남기되 적재는 한다. 파서 담당자가 이름을 맞추거나, 새 행위면 팀 합의 후 목록에 추가한다.
+- 파서들이 이름을 다 맞춘 뒤에는 `ERROR_STATUS["UNKNOWN_USER_BEHAVIOR"]` 를 `contract_violation` 으로 바꿔 위반으로 승격한다.
 
 정답지 대조
 

@@ -48,6 +48,18 @@ CONV_FIELDS = [canonical_header(c) for c in CONV_COLUMNS]
 EXTRA_COLUMNS = ["source_parser", "parser_version", "source_file", "parse_time_utc",
                  "artifact_path_normalized", "volume_ref", "evidence_id", "evidence_sha256"]
 VERDICTS = {"확정", "의심"}
+USER_BEHAVIORS_FILE = os.path.join(HERE, "user_behaviors.txt")
+
+
+def load_user_behaviors(path=USER_BEHAVIORS_FILE):
+    """팀 행위 분류 체계 (한 줄에 하나, # 주석). 파일이 없으면 None → 검사 안 함."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return {ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")}
+
+
+USER_BEHAVIORS = load_user_behaviors()
 VERDICT_RULE = "확정 | 의심"
 EMPTY = "-"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST$")
@@ -70,7 +82,9 @@ ERROR_STATUS = {
     "NORMALIZATION_ERROR": "normalization_error",    # 통합 쪽 정규화 계산 실패
     "DB_ERROR": "db_error",
     "OUTPUT_WRITE_ERROR": "output_error",            # 병합 CSV·보고서 쓰기 실패 (다른 프로그램이 파일을 연 경우 등)
+    "UNKNOWN_USER_BEHAVIOR": "warning",              # user_behaviors.txt 에 없는 행위명. 경고만 하고 적재는 한다 (파서 담당자가 이름을 맞춘다)
 }
+# ponytail: 경고는 상태에 영향 없음. 파서들이 이름을 다 맞추면 "warning" → "contract_violation" 으로 바꿔 승격한다
 _STATUS_ORDER = ["failed", "contract_violation", "normalization_error", "db_error", "output_error"]
 REPORT_ERROR_LIMIT = 100                             # 보고서에는 파서당 앞 100건만 (전체는 DB runs.violations)
 
@@ -342,7 +356,7 @@ def normalize(run, evidence, run_volume=None):
     """파서 결과 CSV 2개 → (events, messages, errors, source_rows).
     원본 헤더 계약을 먼저 검사하고, 통과한 행만 canonical 열 이름으로 옮긴다. 값은 고치지 않고 provenance·정규화 열만 덧붙인다.
     source_rows: 파일별 데이터 행 수 (헤더 제외, 못 읽으면 None)."""
-    parser, errors, source_rows = run["parser"], [], {}
+    parser, errors, warnings, source_rows = run["parser"], [], [], {}
     prov = {"source_parser": parser, "parser_version": run["parser_version"], "parse_time_utc": run["parse_time_utc"],
             "evidence_id": evidence["evidence_id"], "evidence_sha256": evidence["evidence_sha256"]}
     out = {"timeline": [], "conversations": []}
@@ -382,10 +396,13 @@ def normalize(run, evidence, run_volume=None):
                                              file=name, row=i, field=src, actual=r[src]))
             if len(errors) > before:
                 continue
+            if kind == "timeline" and USER_BEHAVIORS is not None and r["user_behavior"] not in USER_BEHAVIORS:
+                warnings.append(make_error(parser, "UNKNOWN_USER_BEHAVIOR", "팀 행위 분류 체계에 없는 행위명 (적재는 함)", file=name, row=i,
+                                           field="user_behavior", actual=r["user_behavior"], expected=os.path.basename(USER_BEHAVIORS_FILE)))
             raw = dict(zip(columns, values))           # row_hash 는 파서 원본 헤더·값 기준 (이전 버전과 같은 값)
             row_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
             out[kind].append({**r, **prov, **derived, "source_file": name, "row_hash": row_hash})
-    return out["timeline"], out["conversations"], errors, source_rows
+    return out["timeline"], out["conversations"], errors + warnings, source_rows
 
 
 # ---------------------------------------------------------------- 4. Unified DB
@@ -822,7 +839,7 @@ def _self_test_contract(td):
                                       ["m", ts, "a"]])
     _write_csv(cv, CONV_COLUMNS, [["m", ts, "c", "t", "u", "-", "1", "user", "hi", "-"]])
     events, messages, errors, source_rows = normalize(run, ev)
-    got = [(e["type"], e["file"], e["row"], e["field"], e["actual"], e["expected"]) for e in errors]
+    got = [(e["type"], e["file"], e["row"], e["field"], e["actual"], e["expected"]) for e in errors if e["type"] != "UNKNOWN_USER_BEHAVIOR"]
     assert got == [("EMPTY_CELL", "timeline.csv", 3, "behavior_details", "", "값 또는 '-'"),
                    ("INVALID_VERDICT", "timeline.csv", 3, "verdict", "추정", "확정 | 의심"),
                    ("INVALID_TIMESTAMP", "timeline.csv", 4, "timestamp", "2026-09-15 13:20:41 KST", TS_RULE),
@@ -940,7 +957,11 @@ def _self_test_end_to_end(td, image, evidence_id):
     assert p["beta"]["status"] == "contract_violation" and p["beta"]["timeline_rows"] == 0
     assert {"type": "INVALID_VERDICT", "file": "timeline.csv", "row": 4, "field": "verdict", "actual": "추정",
             "expected": "확정 | 의심"}.items() <= next(e for e in p["beta"]["errors"] if e["type"] == "INVALID_VERDICT").items()
-    assert set(p["beta"]["error_types"]) == {"EMPTY_CELL", "INVALID_VERDICT", "INVALID_TIMESTAMP"}
+    assert set(p["beta"]["error_types"]) - {"UNKNOWN_USER_BEHAVIOR"} == {"EMPTY_CELL", "INVALID_VERDICT", "INVALID_TIMESTAMP"}
+    # 행위명 경고: alpha 의 '프롬프트 전송'·'파일 다운로드' 는 목록 밖 → 경고 2건, 그래도 success 이고 2행 다 적재
+    assert p["alpha"]["error_types"] == {"UNKNOWN_USER_BEHAVIOR": 2} and p["alpha"]["status"] == "success"
+    assert {(e["row"], e["actual"]) for e in p["alpha"]["errors"]} == {(2, "프롬프트 전송"), (3, "파일 다운로드")}
+    assert "UNKNOWN_USER_BEHAVIOR x2" in console
     assert p["gamma"]["status"] == "failed" and [e["type"] for e in p["gamma"]["errors"]] == [
         "PARSER_EXECUTION_ERROR", "OUTPUT_MISSING", "OUTPUT_MISSING"]
     assert rep["summary"] == {"parsers_run": 3, "success": 1, "failed": 1, "contract_violation": 1,
