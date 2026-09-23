@@ -136,7 +136,7 @@ def _fold_prompt_history(rows):
     return out, {k: "; ".join(v) for k, v in notes.items()}
 
 
-_RUN_FOLD_SEC = 60
+_RUN_FOLD_SEC = 120   # ponytail: 표본에서 Prefetch 시각이 첫 로그보다 10~70초 앞섬 (첫 실행은 초기화가 길다). 표본 늘면 조정
 
 
 def _fold_app_runs(rows, notes):
