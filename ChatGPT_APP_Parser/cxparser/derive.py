@@ -137,8 +137,32 @@ def _uploads(records, rb):
     return out
 
 
+SESSION_MARGIN_SEC = 120
+
+
+def _demote_saves_outside_sessions(records):
+    """최근 항목 바로가기로 추정한 문서 저장(E05-05)은 앱 프로세스 구간(E08-01 시작~E08-02 끝, ±120s) 안에 있을 때만 유지.
+    구간 밖이면 다른 프로그램이 저장한 문서일 가능성이 커 미확정으로 내린다 (레코드는 남기고 판정만 바꿈).
+    로그가 없어 구간을 전혀 모르면 그대로 둔다."""
+    spans = []
+    for r in records:
+        d = _det(r)
+        if d.get("artifact") == "codex_sqlite" and d.get("session_first_utc") and d.get("session_last_utc") and r["event"]["event_id"] == "E08-01":
+            spans.append((_secs(d["session_first_utc"]) - SESSION_MARGIN_SEC, _secs(d["session_last_utc"]) + SESSION_MARGIN_SEC))
+    if not spans:
+        return
+    for r in records:
+        if r["event"]["event_id"] == "E05-05" and _det(r).get("artifact") == "recent_lnk" and _utc(r):
+            t = _secs(_utc(r))
+            if not any(a <= t <= b for a, b in spans):
+                r["user_action"]["confidence"] = model.CONF_UNKNOWN
+                r["user_action"]["rationale"] = (r["user_action"].get("rationale") or "") + " — 앱 프로세스 구간 밖이라 미확정으로 내림"
+                r["parse"]["notes"].append("앱 로그 프로세스 구간(±%ds) 밖 → 미확정" % SESSION_MARGIN_SEC)
+
+
 def derive(records, rb):
-    """records 를 읽어 파생 레코드 목록을 돌려준다 (호출 쪽에서 extend)."""
+    """records 를 읽어 파생 레코드 목록을 돌려준다 (호출 쪽에서 extend). 판정 조정은 제자리에서 한다."""
+    _demote_saves_outside_sessions(records)
     return _login(records, rb) + _account_switch(records, rb) + _uploads(records, rb)
 
 

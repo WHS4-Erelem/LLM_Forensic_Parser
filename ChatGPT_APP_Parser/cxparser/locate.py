@@ -22,6 +22,8 @@ SCAN_ROOTS = (
     "Users/*/AppData/Local/Packages/" + PACKAGE_FAMILY,
     "Program Files/WindowsApps/openai.codex_*",
     "ProgramData/Packages/" + PACKAGE_FAMILY,
+    "Windows/Prefetch",                                   # CODEX.EXE-*.pf : 실행 기록 (E08-01)
+    "Users/*/AppData/Roaming/Microsoft/Windows/Recent",   # *.lnk : 앱이 저장한 파일의 바로가기 (E05-05 / E06-02)
 )
 
 # (kind, 정규식) — 경로는 소문자·슬래시 정규화 후 매칭
@@ -40,6 +42,8 @@ _PATTERNS = [
     ("package_userdata", re.compile(r"/users/(?P<user>[^/]+)/appdata/local/packages/" + PACKAGE_FAMILY + r"/(?P<rest>.+)$")),
     ("package_binary",  re.compile(r"/program files/windowsapps/openai\.codex_(?P<ver>[^/]+)/(?P<rest>.+)$")),
     ("package_registration", re.compile(r"/programdata/packages/" + PACKAGE_FAMILY + r"(/(?P<rest>.+))?$")),
+    ("prefetch",       re.compile(r"/windows/prefetch/codex\.exe-[0-9a-f]{8}\.pf$")),
+    ("recent_lnk",     re.compile(r"/users/(?P<user>[^/]+)/appdata/roaming/microsoft/windows/recent/(?P<fn>[^/]+\.lnk)$")),
 ]
 
 # 대화 내용 파싱 대상(1차 MVP)

@@ -6,6 +6,8 @@ import time
 from . import derive, locate, timeline, usn as usn_mod
 from .artifacts import auth as auth_art
 from .artifacts import global_state as gs_art
+from .artifacts import prefetch as prefetch_art
+from .artifacts import recent_lnk as lnk_art
 from .artifacts import rollout as rollout_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
@@ -21,10 +23,12 @@ PARSERS = {
     "global_state": gs_art.parse,
     "auth": auth_art.parse,
     "sqlite": sqlite_art.parse,
+    "prefetch": prefetch_art.parse,
+    "recent_lnk": lnk_art.parse,
 }
 
 DEFAULT_KINDS = ("rollout", "rollout_loose", "session_index", "global_state", "auth",
-                 "sqlite")
+                 "sqlite", "prefetch", "recent_lnk")
 
 
 class Result(dict):
@@ -150,7 +154,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.5",
+        "tool": {"name": "cxparser", "version": "0.3.6",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

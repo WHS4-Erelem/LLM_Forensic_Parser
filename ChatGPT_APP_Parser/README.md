@@ -91,10 +91,17 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `auth` | `~/.codex/auth.json` | E01-01/02/03 (토큰 값은 출력하지 않음) |
 | `sqlite` | `~/.codex/state_5.sqlite`(threads) · `thread_history_1.sqlite`(thread_items) · `logs_2.sqlite`(logs) | E03-01/02 대화 생성·보관, E04-01 프롬프트 — **행마다 시각이 있음**, E01-02 `account/logout` 로그 |
 | (이미지 전용) | `$Extend/$UsnJrnl:$J` | 파일 생성·삭제 시각 — 분석표의 "로그아웃 지문 = auth.json FILE_DELETE" 등 |
+| `prefetch` (0.3.6) | `Windows/Prefetch/CODEX.EXE-*.pf` | E08-01 애플리케이션 실행 — OS 가 기록한 최근 8회 실행 시각. MAM 압축 해제는 Windows 에서만 |
+| `recent_lnk` (0.3.6) | `Users/*/AppData/Roaming/Microsoft/Windows/Recent/*.lnk` | E06-02 생성 이미지 다운로드(대상이 `Codex 이미지 …`), E05-05 문서 다운로드(문서 확장자 + 대상이 같은 시각에 새로 생김) |
+
+0.3.5~0.3.6 에 추가된 파생 규칙(`derive.py`, `sqlitedb._logs`): 로그인 = 앱 로그 `Reloaded auth, changed: true` + USN `auth.json FILE_CREATE`(±120s) / 계정 전환 = auth.json 삭제→재생성 + 계정 UUID 2개 이상 /
+첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
+로컬 흔적이 없어 못 잡는 것: 모델 변경·공유 링크·임시 채팅·계정 이름 변경 (채팅창 Chromium 저장소가 앱 삭제와 함께 사라짐), 설치·삭제 (USN 저널이 그 구간을 덮을 때만 가능).
 
 탐색 디렉터리(`locate.SCAN_ROOTS`): `Users/*/.codex`, `Users/*/Documents/Codex`,
 `Users/*/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
-`Program Files/WindowsApps/OpenAI.Codex_*`, `ProgramData/Packages/OpenAI.Codex_2p2nqsd0c76g0`.
+`Program Files/WindowsApps/OpenAI.Codex_*`, `ProgramData/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
+`Windows/Prefetch`, `Users/*/AppData/Roaming/Microsoft/Windows/Recent`.
 위 표 이외 파일(SQLite, 채팅창 Chromium 저장소, Helium 하이브 등)은
 **발견 목록(`artifact_inventory`)에만 기록**하고 아직 파싱하지 않는다.
 

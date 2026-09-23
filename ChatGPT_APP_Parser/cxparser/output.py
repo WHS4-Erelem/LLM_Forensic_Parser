@@ -30,6 +30,7 @@ CSV_VERDICTS = ("확정", "의심")
 _ROLE = {"user": "user", "assistant": "assistant",
          "userMessage": "user", "agentMessage": "assistant"}
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
+        "prefetch": "Prefetch", "recent_lnk": "Recent",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
 # Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
 _CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")
@@ -135,6 +136,25 @@ def _fold_prompt_history(rows):
     return out, {k: "; ".join(v) for k, v in notes.items()}
 
 
+_RUN_FOLD_SEC = 60
+
+
+def _fold_app_runs(rows, notes):
+    """E08-01 실행: 같은 실행이 앱 로그(프로세스 시작)와 Prefetch 양쪽에 남는다. 60초 안에 겹치면 로그 행 하나만 두고
+    Prefetch 시각을 그 행의 근거로 접는다. 짝이 없는 Prefetch 실행(로그가 순환·삭제된 경우)은 그대로 남긴다."""
+    runs = [r for r in rows if r["event"]["event_id"] == "E08-01" and (r.get("timestamp") or {}).get("utc")]
+    logs = [r for r in runs if (r.get("details") or {}).get("artifact") == "codex_sqlite"]
+    drop = set()
+    for pf in (r for r in runs if (r.get("details") or {}).get("artifact") == "prefetch"):
+        near = [lg for lg in logs if abs(_secs(lg["timestamp"]["utc"]) - _secs(pf["timestamp"]["utc"])) <= _RUN_FOLD_SEC]
+        if near:
+            lg = min(near, key=lambda x: abs(_secs(x["timestamp"]["utc"]) - _secs(pf["timestamp"]["utc"])))
+            drop.add(pf["record_id"])
+            notes.setdefault(lg["record_id"], [])
+            notes[lg["record_id"]].append("Prefetch 실행 기록 %s 와 일치" % to_kst(pf["timestamp"]["utc"])[:19])
+    return [r for r in rows if r["record_id"] not in drop]
+
+
 def _artifact_details(r, titles, fold_note=None):
     det, ev = r.get("details") or {}, r.get("evidence") or {}
     loc = ev.get("location") or {}
@@ -169,6 +189,9 @@ def write_timeline_csv(path, records):
     rows = [r for r in records if r["event"]["event_id"] != "NA-00"
             and VERDICT.get(r["user_action"].get("confidence")) in CSV_VERDICTS]
     rows, fold_notes = _fold_prompt_history(rows)
+    raw_notes = {k: v.split("; ") for k, v in fold_notes.items()}
+    rows = _fold_app_runs(rows, raw_notes)
+    fold_notes = {k: "; ".join(v) for k, v in raw_notes.items()}
     rows.sort(key=lambda r: (r["timestamp"].get("utc") is None,
                              r["timestamp"].get("utc") or "", r["record_id"]))
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:

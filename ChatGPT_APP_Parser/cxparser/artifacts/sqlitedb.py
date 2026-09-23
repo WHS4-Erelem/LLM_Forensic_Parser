@@ -323,4 +323,35 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
         status="ok",
         details={"artifact": "codex_sqlite", "db": "logs_2.sqlite", "table": "logs",
                  "row_count": n, "first_ts_utc": lo_iso, "last_ts_utc": hi_iso}))
+    # --- 프로세스 구간 → 실행(E08-01)·종료(E08-02) ----------------------------------------------
+    # 조사(2026-09-23): process_uuid 는 앱 프로세스마다 새로 붙는다. 평서문 표본 세 구간의 시작이 Prefetch 실행 시각·
+    # 재실행과 초 단위로 일치했고, 강제 종료 4초 전에 마지막 줄이 찍혔다. 앱은 종료 로그를 남기지 않아 정상/강제는 구분 못 한다.
+    if "process_uuid" in cols:
+        for row in conn.execute("select process_uuid, min(ts) lo, max(ts) hi, count(*) n from logs "
+                                "group by process_uuid order by lo"):
+            if row["lo"] is None:
+                continue
+            pid = row["process_uuid"] or "-"
+            lo_iso, hi_iso = parse_any_time(row["lo"])[0], parse_any_time(row["hi"])[0]
+            det = {"artifact": "codex_sqlite", "db": "logs_2.sqlite", "table": "logs", "process_uuid": pid,
+                   "key": "프로세스 %s (로그 %d줄)" % (pid[:12], row["n"]),        # Behavior_details 의 <핵심 내용>
+                   "session_first_utc": lo_iso, "session_last_utc": hi_iso, "row_count": row["n"]}
+            records.append(model.Record(
+                rb.next_id(), "E08-01", events.name("E08-01"),
+                model.timestamp(utc=lo_iso, original=row["lo"], fmt="epoch_seconds", meaning="이 프로세스의 첫 로그 기록 시각",
+                                source=model.TS_SOURCE_CONTENT),
+                model.user_action(action="애플리케이션 실행(프로세스 시작)", confidence=model.CONF_CONFIRMED,
+                                  rationale=("logs 의 process_uuid=%s 첫 기록 — 앱 프로세스마다 새 ID 가 붙으므로 구간 하나가 "
+                                             "실행 한 번이다. 앱이 켜지며 수 초 안에 첫 줄을 남긴다") % pid[:12]),
+                _db_evidence(image_desc, vfile, "logs", "process_uuid=%s first" % pid, sha), status="ok", details=det))
+            records.append(model.Record(
+                rb.next_id(), "E08-02", events.name("E08-02"),
+                model.timestamp(utc=hi_iso, original=row["hi"], fmt="epoch_seconds", meaning="이 프로세스의 마지막 로그 기록 시각",
+                                source=model.TS_SOURCE_CONTENT),
+                model.user_action(action="애플리케이션 종료(프로세스 로그 끝)", confidence=model.CONF_INFERRED,
+                                  rationale=("같은 process_uuid 의 마지막 기록 — 이후 기록이 없으니 프로세스가 끝난 것. 앱이 종료 로그를 "
+                                             "남기지 않아 정상 종료와 강제 종료를 구분하지 못함 (팀 규칙: 강제 종료 근거 없으면 정상 종료·의심). "
+                                             "강제 종료 표본에서는 마지막 줄이 종료 4초 전이었다")),
+                _db_evidence(image_desc, vfile, "logs", "process_uuid=%s last" % pid, sha), status="ok",
+                notes=["정상/강제 종료 구분 불가 — 창 닫기(트레이 상주)는 프로세스 종료가 아니라 여기 잡히지 않음"], details=det))
     return records
