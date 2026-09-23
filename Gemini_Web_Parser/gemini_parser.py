@@ -84,7 +84,7 @@ TIMELINE_FIELDS = ("Model", "Timestamp", "User_behavior", "Behavior_details ", "
 CONVERSATION_FIELDS = ("Model", "timestamp", "conversation_uuid", "conversation_title",
                        "message_uuid", "parent_message_uuid", "message order", "role",
                        "content", "Artifact_path")
-PARSER_VERSION = "1.1.2-all-actions-verified"
+PARSER_VERSION = "1.1.3-split-raw-integration-verified"
 OUTPUT_CONTRACT_VERSION = "2026-09-team-v1"
 COVERAGE_FIELDS = ("Model", "Scope", "Item", "Status", "Reason", "Artifact_path", "Artifact_details")
 TEAM_VERDICTS = {"확정", "의심"}
@@ -93,19 +93,20 @@ TEAM_VERDICTS = {"확정", "의심"}
 PROJECT_ACTIONS = (
     "로그인", "로그아웃", "계정 전환", "새로운 대화 생성", "기존 대화 삭제",
     "대화 수정", "대화 재시도", "사용자 프롬프트 입력/전송", "사용자 프롬프트 삭제",
-    "이미지 업로드", "이미지/문서 업로드 삭제", "문서 업로드", "문서 다운로드",
+    "이미지 업로드", "이미지 업로드 삭제", "문서 업로드", "문서 업로드 삭제", "문서 다운로드",
     "이미지 생성 요청", "생성 이미지 다운로드", "생성 이미지 다운로드 삭제",
     "대화 데이터 Export", "공유 링크 생성",
     "모델 변경", "계정 이름 변경", "임시 채팅 사용", "브라우저 시크릿 모드",
     "방문기록 삭제", "캐시 삭제",
 )
+# Timeline User_behavior values are restricted to the team's integration/user_behaviors.txt names.
+# Service-specific/raw helper labels stay in JSON/Behavior_details and never leak into timeline.csv.
 TEAM_BEHAVIORS = set(PROJECT_ACTIONS) | {
-    "서비스 접속", "대화 접근", "이미지 다운로드", "파일 다운로드",
+    "서비스 접속", "파일 다운로드",
 }
 # Artifact families inspected for each action. Used only for optional coverage/debug output.
 ACTION_COVERAGE_ARTIFACTS = {
     "서비스 접속": {"Chrome History"},
-    "대화 접근": {"Chrome History", "Chrome Sessions"},
     "로그인": {"Chrome History", "Chrome Cookies", "Chrome Preferences"},
     "로그아웃": {"Chrome History", "Chrome Local Storage", "Chrome Session Storage"},
     "계정 전환": {"Chrome History", "Chrome Preferences", "Chrome Local Storage"},
@@ -117,7 +118,8 @@ ACTION_COVERAGE_ARTIFACTS = {
     "사용자 프롬프트 삭제": {"Chrome History", "Chrome Cookies", "Chrome Local Storage"},
     "이미지 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage"},
     "문서 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage"},
-    "이미지/문서 업로드 삭제": {"Chrome Cache", "Chrome Local Storage"},
+    "이미지 업로드 삭제": {"Chrome Cache", "Chrome Local Storage"},
+    "문서 업로드 삭제": {"Chrome Cache", "Chrome Local Storage"},
     "문서 다운로드": {"Chrome History", "Zone.Identifier"},
     "이미지 생성 요청": {"Chrome Cache", "Chrome Session Storage", "Chrome Sessions"},
     "생성 이미지 다운로드": {"Chrome History", "Zone.Identifier"},
@@ -145,7 +147,8 @@ DOMAIN_RE = re.compile(r"(?<![a-z0-9_.-])gemini\.google\.com(?![a-z0-9_.-])", re
 APP_RE = re.compile(r"/app/([A-Za-z0-9_-]{1,256})(?=[/?#\s\x00\"'<>]|$)")
 PREF_RE = re.compile(r"gemini|google|account|cache|clear_data|content_settings|site_engagement", re.I)
 SECRET_RE = re.compile(r"password|secret|token|credential|encrypted|cookie_value", re.I)
-IMAGE_SUFFIXES = {".dd", ".img", ".raw", ".e01"}
+IMAGE_SUFFIXES = {".dd", ".img", ".raw", ".e01", ".001"}
+SPLIT_RAW_RE = re.compile(r"^(?P<stem>.+)\.(?P<num>\d{3})$")
 
 # Conservative semantic signatures. They are evaluated only on Gemini-scoped bounded
 # context, explicit History URLs, or structured preference fields. A keyword match is
@@ -2822,7 +2825,6 @@ class GeminiParser:
             "image_upload_candidate": "이미지 업로드",
             "document_upload": "문서 업로드",
             "document_upload_candidate": "문서 업로드",
-            "attachment_remove": "이미지/문서 업로드 삭제",
             "document_download": "문서 다운로드",
             "document_download_candidate": "문서 다운로드",
             "image_generation": "이미지 생성 요청",
@@ -2842,8 +2844,8 @@ class GeminiParser:
             "incognito_mode_candidate": "브라우저 시크릿 모드",
             "history_clear_candidate": "방문기록 삭제",
             "cache_clear_candidate": "캐시 삭제",
-            "gemini_access_candidate": "서비스 접속",          # 팀 행위 분류 체계: 서비스명 없는 이름. 근거(Gemini URL 방문)는 Behavior_details 에
-            "conversation_access": "대화 접근",
+            "gemini_access_candidate": "서비스 접속",
+            "conversation_access": "서비스 접속",
             "conversation_candidate": "대화 관련 흔적",
             "cached_image_candidate": "이미지 생성 관련 흔적",
         }
@@ -2856,6 +2858,16 @@ class GeminiParser:
                 return "로그인"
             return "계정 활동 접근"
 
+        if action == "attachment_remove":
+            filename = detail.get("filename") or detail.get("original_filename") or ""
+            if IMAGE_FILE_RE.search(str(filename)):
+                return "이미지 업로드 삭제"
+            if DOCUMENT_FILE_RE.search(str(filename)):
+                return "문서 업로드 삭제"
+            # The team taxonomy has no generic upload-delete label. Keep an
+            # unclassified removal only in JSON/coverage instead of inventing one.
+            return "업로드 삭제 관련 흔적"
+
         if action == "file_delete_candidate" and cls._looks_like_gemini_generated_image(detail):
             return "생성 이미지 다운로드 삭제"
 
@@ -2863,8 +2875,9 @@ class GeminiParser:
             kind = cls._download_media_kind(detail)
             if kind == "document":
                 return "문서 다운로드"
-            if kind == "image":
-                return "이미지 다운로드"
+            # The shared taxonomy distinguishes generated-image downloads, but has
+            # no generic '이미지 다운로드' action. Non-generated images use the
+            # agreed upper-level '파일 다운로드' label.
             return "파일 다운로드"
 
         if not action:
@@ -3158,7 +3171,7 @@ class GeminiParser:
             low = rendered.lower()
             # Never use the E01/DD container itself as Artifact_path when an internal
             # filesystem artifact is known.
-            if low.endswith((".e01", ".dd", ".img", ".raw")):
+            if low.endswith((".e01", ".dd", ".img", ".raw", ".001")):
                 return
             if rendered not in paths:
                 paths.append(rendered)
@@ -3530,34 +3543,41 @@ class GeminiParser:
 
     @classmethod
     def _timestamp_value_for_display(cls, value):
-        """Normalize an explicit message timestamp into the team KST display string.
+        """Return a timestamp only when it can satisfy the team CSV contract.
 
-        Accepts the parser timestamp dict (raw/utc/kst) or an ISO/string value.  This helper
-        exists separately from _display_timestamp because structured message records may carry
-        their own message_timestamp/message_time independent of the enclosing artifact row.
+        The integration runner accepts only ``YYYY-MM-DD HH:MM:SS.ffffff KST`` or ``-``.
+        Structured message timestamps may be independent of the enclosing artifact row, so
+        timezone-less, numeric-without-format, or otherwise ambiguous values are not guessed.
+        They are returned as an empty value and become ``-`` only at CSV rendering time.
         """
         if value in (None, ""):
             return ""
         if isinstance(value, dict):
-            candidate = value.get("kst") or value.get("utc") or value.get("raw")
+            candidate = value.get("kst") or value.get("utc")
+            if not candidate:
+                return ""
         else:
             candidate = value
-        if candidate in (None, ""):
-            return ""
+
+        # A bare number has no trustworthy unit/epoch here.  Do not manufacture a time.
         if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-            # Prefer Chrome/WebKit conversion for large microsecond values; otherwise Unix time.
-            kind = "chrome" if abs(candidate) >= 10**12 else "unix"
-            normalized = normalize_timestamp(candidate, kind=kind)
-            candidate = normalized.get("kst") or normalized.get("utc") or normalized.get("raw")
+            return ""
+        text = str(candidate).strip()
+        if not text:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST", text):
+            return text
+        # Digit-only strings are equally ambiguous (seconds/ms/WebKit/FILETIME, etc.).
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            return ""
         try:
-            parsed = datetime.fromisoformat(str(candidate).replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                # A timezone-less structured timestamp is preserved rather than silently assumed.
-                return str(candidate)
+                return ""
             parsed = parsed.astimezone(KST)
             return parsed.strftime("%Y-%m-%d %H:%M:%S") + f".{parsed.microsecond:06d} KST"
         except (TypeError, ValueError, OverflowError):
-            return str(candidate)
+            return ""
 
     @classmethod
     def _structured_message_from_row(cls, row):
@@ -3910,7 +3930,12 @@ class ImageReadError(OSError):
 
 
 class ForensicImageReader:
-    """Read-only RAW -> pytsk3 / EWF -> pyewf -> pytsk3 adapter.
+    """Read-only RAW/split-RAW -> pytsk3 / EWF -> pyewf -> pytsk3 adapter.
+
+    Split RAW images are accepted as ``name.001, name.002, ...``.  Only the
+    first ``.001`` segment is supplied by the caller; following segments are
+    discovered in the same directory and exposed to pytsk3 as one continuous
+    read-only image.  No temporary merged DD is created.
 
     No OS mount, filesystem repair, raw MFT decoder, or write API is used.
     Imports are lazy so --help and the original --profile mode stay usable.
@@ -3921,25 +3946,92 @@ class ForensicImageReader:
         self.image_type = None
         self.segments = []
         self.tsk = self.image = self.ewf = None
+        self.raw_handles = []
         self.size = 0
         self.initial_stats = {}
+
+    @staticmethod
+    def _split_raw_match(path):
+        return SPLIT_RAW_RE.fullmatch(Path(path).name)
+
+    def _discover_split_raw_segments(self):
+        """Return a validated contiguous ``.001/.002/...`` RAW segment set."""
+        match = self._split_raw_match(self.path)
+        if not match:
+            raise ImageReadError("Split RAW input does not use a numeric .001 segment name")
+        if int(match.group("num")) != 1:
+            raise ImageReadError("Split RAW input must start with the first .001 segment")
+
+        parent = self.path.parent
+        stem = match.group("stem")
+        found = {}
+        try:
+            entries = list(parent.iterdir())
+        except OSError as exc:
+            raise ImageReadError("Unable to enumerate split RAW segment directory: " + error_text(exc)) from exc
+
+        for entry in entries:
+            candidate = SPLIT_RAW_RE.fullmatch(entry.name)
+            if not candidate or candidate.group("stem").casefold() != stem.casefold():
+                continue
+            number = int(candidate.group("num"))
+            if number < 1:
+                continue
+            if number in found:
+                raise ImageReadError(f"Duplicate split RAW segment number .{number:03d}")
+            found[number] = entry.absolute()
+
+        if 1 not in found:
+            raise ImageReadError("Split RAW first segment .001 was not found")
+        highest = max(found)
+        missing = [number for number in range(1, highest + 1) if number not in found]
+        if missing:
+            rendered = ", ".join(f".{number:03d}" for number in missing[:20])
+            if len(missing) > 20:
+                rendered += f", ... (+{len(missing) - 20} more)"
+            raise ImageReadError("Split RAW segment sequence has a gap; missing: " + rendered)
+
+        segments = [found[number] for number in range(1, highest + 1)]
+        for segment in segments:
+            try:
+                info = segment.stat()
+            except OSError as exc:
+                raise ImageReadError("Unable to stat split RAW segment: " + str(segment) + ": " + error_text(exc)) from exc
+            if not within(segment, parent) or is_link(segment) or not stat.S_ISREG(info.st_mode):
+                raise ImageReadError("Invalid or linked split RAW segment: " + str(segment))
+            if info.st_size <= 0:
+                raise ImageReadError("Split RAW segment is empty: " + str(segment))
+        return segments
 
     def identify(self):
         info = self.path.stat()
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Image input must be a regular file")
-        if self.path.suffix.lower() not in IMAGE_SUFFIXES:
-            raise ValueError("Unsupported image extension; use .dd, .img, .raw, or the first .E01 segment")
-        with self.path.open("rb") as stream:
-            signature = stream.read(16)
-        if signature.startswith((b"EVF\x09\x0d\x0a\xff\x00", b"EVF2\x0d\x0a\x81\x00")):
-            self.image_type = "EWF"
-        elif self.path.suffix.lower() == ".e01":
-            raise ValueError(".E01 input has no supported physical EWF signature")
-        else:
-            self.image_type = "RAW"
         if not info.st_size:
             raise ValueError("Image file is empty")
+
+        # Inspect the physical header before relying on the filename.  This keeps
+        # genuine EWF data from being silently treated as RAW solely by extension.
+        with self.path.open("rb") as stream:
+            signature = stream.read(16)
+        suffix = self.path.suffix.lower()
+        split_match = self._split_raw_match(self.path)
+        is_ewf = signature.startswith((b"EVF\x09\x0d\x0a\xff\x00", b"EVF2\x0d\x0a\x81\x00"))
+
+        if is_ewf:
+            if suffix != ".e01":
+                raise ValueError("EWF signature detected; supply the first .E01 segment")
+            self.image_type = "EWF"
+        elif suffix == ".e01":
+            raise ValueError(".E01 input has no supported physical EWF signature")
+        elif split_match:
+            if int(split_match.group("num")) != 1:
+                raise ValueError("Split RAW input must start with the first .001 segment")
+            self.image_type = "SPLIT_RAW"
+        elif suffix in {".dd", ".img", ".raw"}:
+            self.image_type = "RAW"
+        else:
+            raise ValueError("Unsupported image extension; use .dd, .img, .raw, first .001 split-RAW segment, or first .E01 segment")
         return self.image_type
 
     def __enter__(self):
@@ -3980,6 +4072,77 @@ class ForensicImageReader:
                         return None
 
                 self.image = EwfImage()
+            elif self.image_type == "SPLIT_RAW":
+                self.segments = self._discover_split_raw_segments()
+                sizes = [int(segment.stat().st_size) for segment in self.segments]
+                starts = []
+                total = 0
+                for size in sizes:
+                    starts.append(total)
+                    total += size
+
+                self.raw_handles = []
+                try:
+                    for segment in self.segments:
+                        self.raw_handles.append(segment.open("rb"))
+                except Exception:
+                    for handle in self.raw_handles:
+                        try:
+                            handle.close()
+                        except Exception:
+                            pass
+                    self.raw_handles = []
+                    raise
+
+                handles, tsk = self.raw_handles, self.tsk
+
+                class SplitRawImage(tsk.Img_Info):
+                    def __init__(self):
+                        super().__init__(url="", type=tsk.TSK_IMG_TYPE_EXTERNAL)
+
+                    def read(self, offset, size):
+                        offset, size = int(offset), int(size)
+                        if offset < 0 or size < 0:
+                            raise ImageReadError("Negative split RAW read offset/size")
+                        if size == 0 or offset >= total:
+                            return b""
+                        end = min(total, offset + size)
+                        index = bisect.bisect_right(starts, offset) - 1
+                        if index < 0:
+                            index = 0
+                        position = offset
+                        output = bytearray()
+                        while position < end and index < len(handles):
+                            local_offset = position - starts[index]
+                            available = sizes[index] - local_offset
+                            if available <= 0:
+                                index += 1
+                                continue
+                            wanted = min(end - position, available)
+                            handles[index].seek(local_offset)
+                            block = handles[index].read(wanted)
+                            if len(block) != wanted:
+                                raise ImageReadError(
+                                    f"Short read in split RAW segment {self_path(index)}: "
+                                    f"wanted {wanted}, got {len(block)}"
+                                )
+                            output.extend(block)
+                            position += len(block)
+                            index += 1
+                        return bytes(output)
+
+                    def get_size(self):
+                        return total
+
+                    def close(self):
+                        # The outer ForensicImageReader owns the segment handles.
+                        return None
+
+                segment_paths = self.segments
+                def self_path(index):
+                    return str(segment_paths[index]) if 0 <= index < len(segment_paths) else "?"
+
+                self.image = SplitRawImage()
             else:
                 self.segments = [self.path]
                 self.image = self.tsk.Img_Info(str(self.path), type=self.tsk.TSK_IMG_TYPE_RAW)
@@ -4002,6 +4165,12 @@ class ForensicImageReader:
             if self.ewf is not None:
                 handle, self.ewf = self.ewf, None
                 handle.close()
+            handles, self.raw_handles = self.raw_handles, []
+            for handle in handles:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -4628,7 +4797,8 @@ class GeminiImageParser(GeminiParser):
                 self._source_files.update(str(p).casefold() for p in reader.segments)
                 self._image_record("Image opened read-only", detail={"record_type": "image_status", "image_size": reader.size,
                                    "image_segments": [str(p) for p in reader.segments],
-                                   "reader_pipeline": "pyewf -> pytsk3" if self.image_type == "EWF" else "pytsk3"})
+                                   "reader_pipeline": ("pyewf -> pytsk3" if self.image_type == "EWF" else
+                                                       "split-raw -> pytsk3" if self.image_type == "SPLIT_RAW" else "pytsk3")})
                 filesystems = []
                 for metadata, fs, error in reader.filesystems():
                     self._image_record("Partition/filesystem probe", self._context(**metadata),
@@ -4708,7 +4878,7 @@ def _clean_console_path(value):
 def _prompt_image_path():
     """Interactive image-path prompt used only when no CLI image/profile was supplied."""
     print("\n[입력]")
-    print("분석할 이미지 파일 경로를 입력하세요 (.dd / .img / .raw / .E01)")
+    print("분석할 이미지 파일 경로를 입력하세요 (.dd / .img / .raw / .001 / .E01)")
     print(r"예: C:\Users\me\Desktop\gemini_parser\victim.E01")
     while True:
         raw = _clean_console_path(input("> "))
@@ -4727,7 +4897,7 @@ def _prompt_image_path():
             print("파일 경로가 아닙니다. 다시 입력해 주세요.")
             continue
         if path.suffix.lower() not in IMAGE_SUFFIXES:
-            print("지원하지 않는 형식입니다. .dd, .img, .raw, .E01 중 하나를 입력해 주세요.")
+            print("지원하지 않는 형식입니다. .dd, .img, .raw, 첫 .001, .E01 중 하나를 입력해 주세요.")
             continue
         return str(path)
 
@@ -4772,7 +4942,7 @@ def _apply_interactive_image_input(args):
 
 
 def analyze_image(image_path, **options):
-    """Integration-friendly API: parse one DD/RAW/E01 image and validate final output contract.
+    """Integration-friendly API: parse one DD/RAW/split-RAW/E01 image and validate final output contract.
 
     Returns the configured GeminiImageParser instance so a controller can consume:
       parser.results
@@ -4798,8 +4968,8 @@ def analyze_image_with_baseline(image_path, baseline_image_path, **options):
 
 
 def main(argv=None):
-    cli = argparse.ArgumentParser(description="Gemini Web forensic image parser: RAW/DD via pytsk3; E01 via pyewf + pytsk3")
-    cli.add_argument("image", nargs="?", help="Primary input: .dd / .img / .raw / first .E01 segment")
+    cli = argparse.ArgumentParser(description="Gemini Web forensic image parser: RAW/DD/split-RAW via pytsk3; E01 via pyewf + pytsk3")
+    cli.add_argument("image", nargs="?", help="Primary input: .dd / .img / .raw / first .001 split-RAW segment / first .E01 segment")
     cli.add_argument("--profile", help="Development/debug input: extracted Chrome Profile directory")
     cli.add_argument("--baseline-image", help="Optional BEFORE image for state-difference rules (conversation/history/cache deletion/edit)")
     cli.add_argument("--user-root", help="Acquired user directory (also accepts a Users/drive evidence tree)")
