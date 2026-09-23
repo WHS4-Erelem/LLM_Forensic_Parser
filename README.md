@@ -36,7 +36,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 cd integration
 powershell -ExecutionPolicy Bypass -File setup.ps1        # 최초 1회: .venv312 / .venv314 생성
 python llm_forensic.py -i <이미지.E01|.dd> -o out          # 파서 6개 실행 → out\<evidence_id>\
-python verify_merged.py --timeline out\<evidence_id>\timeline.csv --key scenario_keys\plain_2026-09-15.csv
+python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --key validation\scenario_keys\plain_2026-09-15.csv   # 개발 검증 전용 (정답 시트가 있을 때만)
 ```
 
 결과는 `out\<evidence_id>\` 에 병합 `timeline.csv` · `recovered_conversations.csv` · `unified.db`(SQLite) ·

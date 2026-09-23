@@ -63,16 +63,18 @@ provenance 열 (병합 CSV·DB 공통, 원본 열을 덮어쓰지 않고 덧붙�
 실패 시 `[Runner]` 아래에 첫 오류 한 줄과 `detail:` (실행 실패는 run.log, 계약 위반은 integration_report.json) 경로를 보여 준다.
 
 행위 분류 체계 (`user_behaviors.txt`)
-- timeline 의 `User_behavior` 에 허용되는 이름 목록. 파서 6개가 같은 행위를 같은 이름으로 부르게 하는 팀 스펙이며, 배포본에 포함된다 (정답지 `scenario_keys\` 는 검증 전용).
+- timeline 의 `User_behavior` 에 허용되는 이름 목록. 파서 6개가 같은 행위를 같은 이름으로 부르게 하는 팀 스펙이며, 배포본에 포함된다 (정답지 `validation\scenario_keys\` 는 검증 전용).
 - 목록 밖 이름은 `UNKNOWN_USER_BEHAVIOR` **경고**로 `integration_report.json` 과 콘솔에 파서·행·값을 남기되 적재는 한다. 파서 담당자가 이름을 맞추거나, 새 행위면 팀 합의 후 목록에 추가한다.
 - 파서들이 이름을 다 맞춘 뒤에는 `ERROR_STATUS["UNKNOWN_USER_BEHAVIOR"]` 를 `contract_violation` 으로 바꿔 위반으로 승격한다.
 
-정답지 대조
+정답지 대조 (개발·검증 전용, `validation\`)
+
+실제 분석에서는 쓰지 않는다. 실험 이미지처럼 정답 시트가 있을 때 파서 탐지력을 재는 도구이며, `llm_forensic.py` 는 이 폴더를 읽지 않는다.
 
 ```
-python verify_merged.py --timeline out\<evidence_id>\timeline.csv --key scenario_keys\plain_2026-09-15.csv
+python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --key validation\scenario_keys\plain_2026-09-15.csv
 ```
-서비스별 정답지(시트 export, `scenario_keys\*.csv`: model, event_id, action, kst)와 병합 타임라인을 ±120초 창으로 대조해 `verify_report.md` 를 만든다.
+서비스별 정답지(시트 export, `validation\scenario_keys\*.csv`: model, event_id, action, kst)와 병합 타임라인을 ±120초 창으로 대조해 `verify_report.md` 를 만든다.
 
 규칙
 - 파서는 손대지 않는다. 실행 방법은 `parsers.json` 레지스트리에만 적는다.

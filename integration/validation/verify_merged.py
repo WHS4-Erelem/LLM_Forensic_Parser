@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""병합 timeline.csv ↔ 시나리오 정답지 대조.
+"""병합 timeline.csv ↔ 시나리오 정답지 대조. 개발·검증 전용 — 실제 분석(llm_forensic.py)에서는 쓰지 않는다.
 
-    python verify_merged.py --timeline out/<id>/timeline.csv --key scenario_keys/plain_2026-09-15.csv [--window 120] [--out report.md]
+    python validation/verify_merged.py --timeline out/<id>/timeline.csv --key validation/scenario_keys/plain_2026-09-15.csv [--window 120] [--out report.md]
 
 정답지 행(model, event_id, action, kst)마다:
   일치      같은 Model 에 같은 행위명이 표 시각 ±window 초 안에 있음
@@ -12,11 +12,16 @@
 import argparse
 import csv
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime
 
-from llm_forensic import canonical_header
+
+
+def canonical_header(name):
+    """llm_forensic.canonical_header 와 같은 규칙 (개발 검증 도구라 통합기를 import 하지 않고 복사해 둠)."""
+    return re.sub(r"\s+", "_", str(name).strip()).lower()
 
 # 정답지 이름과 파서 이름이 뜻은 같지만 표기가 다른 경우만 (파서 쪽 수정이 끝나면 비워도 됨)
 ALIASES = {
