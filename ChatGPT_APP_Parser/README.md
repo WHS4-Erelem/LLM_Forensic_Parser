@@ -98,7 +98,8 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 0.3.5~0.3.6 에 추가된 파생 규칙(`derive.py`, `sqlitedb._logs`): 로그인 = 앱 로그 `Reloaded auth, changed: true` + USN `auth.json FILE_CREATE`(±120s) / 계정 전환 = auth.json 삭제→재생성 + 계정 UUID 2개 이상 /
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
-타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 뺀다(JSON 에는 남음).
+타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.8 (2026-09-23, 팀원 E01 '삭제 제외 시나리오' 검증): 에이전트 모드 모델 변경 = rollout `turn_context.model` 이 직전 turn 과 달라지는 지점(확인). 이미지 생성 요청 = rollout custom_tool_call 입력에 imagegen/image_gen 도구 탐색·호출(확인). 첨부 업로드 파싱은 `## 파일명: 경로` 줄만 (경로 `/`·`\` 모두). 최근 항목 문서 저장은 Codex 대화·도구 호출에 파일명이 언급될 때만 추정, 아니면 미확정 (다른 앱 다운로드 오귀속 방지 — Claude Desktop PDF 표본).
 로컬 흔적이 없어 못 잡는 것: 공유 링크·대화 공유·계정 이름 변경 (POST 요청은 캐시되지 않음), 강제 종료(정상 종료와 구분 불가), 설치·삭제 (USN 저널이 그 구간을 덮을 때만 가능). 앱을 삭제한 이미지에서는 채팅 모드 전체(webcache)가 사라진다.
 
 탐색 디렉터리(`locate.SCAN_ROOTS`): `Users/*/.codex`, `Users/*/Documents/Codex`,

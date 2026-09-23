@@ -170,6 +170,17 @@ def _fold_app_runs(rows, notes):
             notes[lg["record_id"]].append("Prefetch 실행 기록 %s 와 일치" % to_kst(pf["timestamp"]["utc"])[:19])
         elif any(a <= t <= b for a, b in spans):
             drop.add(pf["record_id"])                      # 실행 중 구간 안의 보조 프로세스 기동 — JSON 에는 남고 타임라인에서만 뺀다
+    # 남은 Prefetch 실행이 60초 안에 여러 개(여러 .pf = 같은 실행이 띄운 프로세스들)면 가장 이른 것 하나만
+    rest = sorted((r for r in runs if (r.get("details") or {}).get("artifact") == "prefetch" and r["record_id"] not in drop),
+                  key=lambda r: _secs(r["timestamp"]["utc"]))
+    head = None
+    for pf in rest:
+        t = _secs(pf["timestamp"]["utc"])
+        if head is not None and t - _secs(head["timestamp"]["utc"]) <= _RUN_FOLD_SEC:
+            drop.add(pf["record_id"])
+            notes.setdefault(head["record_id"], []).append("같은 실행의 다른 프로세스 Prefetch %s" % to_kst(pf["timestamp"]["utc"])[11:19])
+        else:
+            head = pf
     return [r for r in rows if r["record_id"] not in drop]
 
 

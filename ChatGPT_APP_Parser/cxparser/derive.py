@@ -20,7 +20,8 @@ LOGIN_WINDOW_SEC = 120
 AUTH_CHANGED = "Reloaded auth, changed: true"
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff", ".svg"}
 _FILES_HEADER = "# Files mentioned by the user"
-_FILE_LINE_RE = re.compile(r"^##\s+(?P<name>[^\r\n]+?)(?:\s*:\s*(?P<path>[A-Za-z]:\\[^\r\n]*|/[^\r\n]*))?\s*$", re.M)
+# '## <파일명>: <경로>' 줄만. 경로는 'C:/…' 'C:\…' '/…' 어느 표기든 (표본: C:/Users/에레렘/Downloads/x.png). 경로 없는 '## My request:' 는 제목 줄이라 제외
+_FILE_LINE_RE = re.compile(r"^##\s+(?P<name>[^\r\n:]+?)\s*:\s*(?P<path>[A-Za-z]:[\\/][^\r\n]*|/[^\r\n]*)\s*$", re.M)
 
 
 def _det(r):
@@ -149,15 +150,26 @@ def _demote_saves_outside_sessions(records):
         d = _det(r)
         if d.get("artifact") == "codex_sqlite" and d.get("session_first_utc") and d.get("session_last_utc") and r["event"]["event_id"] == "E08-01":
             spans.append((_secs(d["session_first_utc"]) - SESSION_MARGIN_SEC, _secs(d["session_last_utc"]) + SESSION_MARGIN_SEC))
-    if not spans:
-        return
+    # Codex 가 다룬 파일명 모음: 프롬프트·응답·도구 호출 본문에 나온 이름만 Codex 의 저장으로 본다.
+    # (표본 2026-09-23: Claude Desktop 이 내려받은 PDF 가 Codex 실행 구간 안이라 오귀속됨 → 언급 검사 추가)
+    corpus = " ".join(str(v).lower() for r in records for v in (
+        _det(r).get("text"), _det(r).get("prompt_text"), r["user_action"].get("observed_artifact"),
+        (r.get("evidence") or {}).get("excerpt")) if v)
     for r in records:
         if r["event"]["event_id"] == "E05-05" and _det(r).get("artifact") == "recent_lnk" and _utc(r):
             t = _secs(_utc(r))
-            if not any(a <= t <= b for a, b in spans):
+            stem = str(_det(r).get("file_name") or "").rsplit(".", 1)[0].lower()
+            why = None
+            if spans and not any(a <= t <= b for a, b in spans):
+                why = "앱 로그 프로세스 구간(±%ds) 밖" % SESSION_MARGIN_SEC
+            elif stem and stem not in corpus:
+                why = "Codex 대화·도구 호출 어디에도 파일명이 없음 — 다른 프로그램이 저장한 문서일 수 있음"
+            if why:
                 r["user_action"]["confidence"] = model.CONF_UNKNOWN
-                r["user_action"]["rationale"] = (r["user_action"].get("rationale") or "") + " — 앱 프로세스 구간 밖이라 미확정으로 내림"
-                r["parse"]["notes"].append("앱 로그 프로세스 구간(±%ds) 밖 → 미확정" % SESSION_MARGIN_SEC)
+                r["user_action"]["rationale"] = (r["user_action"].get("rationale") or "") + " — %s → 미확정" % why
+                r["parse"]["notes"].append(why + " → 미확정")
+            elif stem:
+                r["user_action"]["rationale"] = (r["user_action"].get("rationale") or "") + " — Codex 대화에 같은 파일명이 언급됨"
 
 
 def derive(records, rb):
