@@ -753,7 +753,7 @@ CV = ["Model", "timestamp", "conversation_uuid", "conversation_title", "message_
 ts = "2026-09-15 13:20:41.807000 KST"
 tl = [[name, ts, "프롬프트 전송", "v=" + mode, "확정",
        r"C:\Users\A\Downloads\x.pdf|C:\Users\A\Downloads\x.pdf:Zone.Identifier", "volume=ntfs@5"],
-      [name, "-", "파일 다운로드", "b", "의심", r"volume0:\Users\A\y.txt | D:/img.E01::NTFS@7/Users/A/z", "-"]]
+      [name, "-", "테스트용 비표준 행위", "b", "의심", r"volume0:\Users\A\y.txt | D:/img.E01::NTFS@7/Users/A/z", "-"]]
 cv = [[name, ts, "c1", "t", "m1", "-", "1", "user", "hello " + mode, r"C:\Users\A\conv.json"]]
 if mode == "bad":
     TL = TL[:3] + ["Behavior_details"] + TL[4:] if os.environ.get("FAKE_BAD_HEADER") else TL
@@ -958,9 +958,9 @@ def _self_test_end_to_end(td, image, evidence_id):
     assert {"type": "INVALID_VERDICT", "file": "timeline.csv", "row": 4, "field": "verdict", "actual": "추정",
             "expected": "확정 | 의심"}.items() <= next(e for e in p["beta"]["errors"] if e["type"] == "INVALID_VERDICT").items()
     assert set(p["beta"]["error_types"]) - {"UNKNOWN_USER_BEHAVIOR"} == {"EMPTY_CELL", "INVALID_VERDICT", "INVALID_TIMESTAMP"}
-    # 행위명 경고: alpha 의 '프롬프트 전송'·'파일 다운로드' 는 목록 밖 → 경고 2건, 그래도 success 이고 2행 다 적재
+    # 행위명 경고: alpha 의 '프롬프트 전송'·'테스트용 비표준 행위' 는 목록에 없는 이름 → 경고 2건, 그래도 success 이고 2행 다 적재
     assert p["alpha"]["error_types"] == {"UNKNOWN_USER_BEHAVIOR": 2} and p["alpha"]["status"] == "success"
-    assert {(e["row"], e["actual"]) for e in p["alpha"]["errors"]} == {(2, "프롬프트 전송"), (3, "파일 다운로드")}
+    assert {(e["row"], e["actual"]) for e in p["alpha"]["errors"]} == {(2, "프롬프트 전송"), (3, "테스트용 비표준 행위")}
     assert "UNKNOWN_USER_BEHAVIOR x2" in console
     assert p["gamma"]["status"] == "failed" and [e["type"] for e in p["gamma"]["errors"]] == [
         "PARSER_EXECUTION_ERROR", "OUTPUT_MISSING", "OUTPUT_MISSING"]
