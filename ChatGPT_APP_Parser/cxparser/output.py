@@ -92,7 +92,50 @@ def _behavior_details(r, titles):
     return "%s_%s" % (r["user_action"].get("action"), _one_line(core))
 
 
-def _artifact_details(r, titles):
+_PH_GLOBAL_KEYS = ("prompt-history.global", "prompt-history.chatgpt-global")
+
+
+def _is_live(r):
+    return ((r.get("evidence") or {}).get("location") or {}).get("allocated") is not False
+
+
+def _fold_prompt_history(rows):
+    """global-state 의 프롬프트 이력은 같은 프롬프트가 (1) 현존 파일과 삭제된 이전 버전(원자적 재작성 잔여) 양쪽,
+    (2) 대화별 목록과 global/chatgpt-global 목록 양쪽에 중복으로 실린다. 타임라인에는 프롬프트당 대화별 1행만 두고
+    나머지는 그 행의 Artifact_details 에 근거로 접는다. 삭제본에만 있거나 global 에만 있는 프롬프트는 그대로 남긴다.
+    반환: (행 목록, {record_id: 병합 메모})."""
+    groups, others = {}, []
+    for r in rows:
+        det = r.get("details") or {}
+        if det.get("artifact") == "codex_global_state" and str(det.get("key", "")).startswith("prompt-history") and det.get("prompt_text"):
+            groups.setdefault(" ".join(det["prompt_text"].split()), []).append(r)
+        else:
+            others.append(r)
+    out, notes = list(others), {}
+    for rs in groups.values():
+        is_global = lambda r: r["details"]["key"] in _PH_GLOBAL_KEYS
+        reps = {}                                                  # 대화(key)마다 대표 1행, 현존 파일 우선
+        for r in sorted(rs, key=lambda r: (is_global(r), not _is_live(r), r["record_id"])):
+            k = "_global" if is_global(r) else r["details"]["key"]
+            if not reps or (k != "_global" and k not in reps):
+                reps[k] = r
+        first = next(iter(reps.values()))
+        for r in rs:
+            if any(r is x for x in reps.values()):
+                continue
+            target = reps.get(r["details"]["key"]) or first           # 같은 대화의 삭제본은 그 대화 행에, global 항목은 첫 행에
+            mft = ((r.get("evidence") or {}).get("location") or {}).get("mft_record")
+            note = ("삭제된 이전 버전(MFT %s)에도 동일" % mft) if not _is_live(r) else "%s 목록에도 기록" % r["details"]["key"].split(".")[-1]
+            if is_global(r) and not _is_live(r):
+                note = "삭제된 이전 버전(MFT %s)의 %s 목록에도 동일" % (mft, r["details"]["key"].split(".")[-1])
+            notes.setdefault(target["record_id"], [])
+            if note not in notes[target["record_id"]]:
+                notes[target["record_id"]].append(note)
+        out.extend(reps.values())
+    return out, {k: "; ".join(v) for k, v in notes.items()}
+
+
+def _artifact_details(r, titles, fold_note=None):
     det, ev = r.get("details") or {}, r.get("evidence") or {}
     loc = ev.get("location") or {}
     tag = _TAG.get(det.get("artifact"), det.get("artifact") or "Artifact")
@@ -105,6 +148,7 @@ def _artifact_details(r, titles):
           ("MFT", loc.get("mft_record")),
           ("volume", "ntfs@%s" % loc["partition_offset_bytes"] if loc.get("partition_offset_bytes") is not None else None),
           ("삭제 엔트리", "True" if loc.get("allocated") is False else None),
+          ("중복 병합", fold_note),
           ("규칙", r["event"]["event_id"]),
           ("패키지", PACKAGE_NAME)]
     return "[%s] " % tag + ", ".join("%s=%s" % (k, _one_line(v, 120)) for k, v in kv if v not in (None, ""))
@@ -124,6 +168,7 @@ def write_timeline_csv(path, records):
     titles = _titles(records)
     rows = [r for r in records if r["event"]["event_id"] != "NA-00"
             and VERDICT.get(r["user_action"].get("confidence")) in CSV_VERDICTS]
+    rows, fold_notes = _fold_prompt_history(rows)
     rows.sort(key=lambda r: (r["timestamp"].get("utc") is None,
                              r["timestamp"].get("utc") or "", r["record_id"]))
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
@@ -134,7 +179,7 @@ def write_timeline_csv(path, records):
                events.name(r["event"]["event_id"]),          # 팀 카탈로그 행위명
                _behavior_details(r, titles),
                VERDICT[r["user_action"].get("confidence")],
-               _winpath(r), _artifact_details(r, titles)])
+               _winpath(r), _artifact_details(r, titles, fold_notes.get(r["record_id"]))])
     return path
 
 
@@ -169,3 +214,20 @@ def write_conversations_csv(path, records):
                role, det["text"], _winpath(r)])
             prev_uuid = uuid
     return path
+
+
+if __name__ == "__main__":  # python -m cxparser.output — 프롬프트 이력 중복 병합 자체 검사
+    def _rec(rid, key, text, live=True, mft=1):
+        return {"record_id": rid, "details": {"artifact": "codex_global_state", "key": key, "prompt_text": text},
+                "evidence": {"location": {"allocated": live, "mft_record": mft}}}
+    rows, notes = _fold_prompt_history([
+        _rec("r1", "prompt-history.T1", "hello"), _rec("r2", "prompt-history.T1", "hello", live=False, mft=9),
+        _rec("r3", "prompt-history.global", "hello"), _rec("r4", "prompt-history.global", "hello", live=False, mft=9),
+        _rec("r5", "prompt-history.global", "only-global"), _rec("r6", "prompt-history.global", "only-global", live=False, mft=9),
+        _rec("r7", "prompt-history.T2", "only-deleted", live=False, mft=9),
+        {"record_id": "r8", "details": {"artifact": "rollout"}, "evidence": {}}])
+    ids = sorted(r["record_id"] for r in rows)
+    assert ids == ["r1", "r5", "r7", "r8"], ids                       # 대화행 1 + global 만 1 + 삭제본만 1 + 무관 1
+    assert notes["r1"] == "삭제된 이전 버전(MFT 9)에도 동일; global 목록에도 기록; 삭제된 이전 버전(MFT 9)의 global 목록에도 동일", notes["r1"]
+    assert notes["r5"] == "삭제된 이전 버전(MFT 9)의 global 목록에도 동일" and "r7" not in notes, notes.get("r5")
+    print("output self-check ok")
