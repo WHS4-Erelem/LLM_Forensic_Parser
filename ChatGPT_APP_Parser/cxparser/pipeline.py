@@ -3,7 +3,7 @@
 import os
 import time
 
-from . import locate, timeline, usn as usn_mod
+from . import derive, locate, timeline, usn as usn_mod
 from .artifacts import auth as auth_art
 from .artifacts import global_state as gs_art
 from .artifacts import rollout as rollout_art
@@ -140,6 +140,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                                               max_excerpt=max_excerpt))
             usn_summary.append({**loc, "status": "ok", **info})
 
+    # --- 3c. 파생 규칙: 관찰 레코드끼리 대조해 로그인·계정 전환·첨부 업로드를 올린다 --------
+    records.extend(derive.derive(records, rb))
+
     tl = timeline.build(records)
     status_counts = {}
     for r in records:
@@ -147,7 +150,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.4",
+        "tool": {"name": "cxparser", "version": "0.3.5",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
