@@ -26,6 +26,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 - `timeline.csv` 7열: `Model, Timestamp, User_behavior, Behavior_details, Verdict, Artifact_path, Artifact_details`
 - `recovered_conversations.csv` 10열: `Model, timestamp, conversation_uuid, conversation_title, message_uuid, parent_message_uuid, message order, role, content, Artifact_path`
 - `Verdict` 는 `확정` 또는 `의심`, 시각은 `YYYY-MM-DD HH:MM:SS.ffffff KST`, 빈 값은 `-`
+- `User_behavior` 는 팀 행위 분류 체계 `integration/user_behaviors.txt` 의 이름만 쓴다 (서비스명 없이). 목록 밖 이름은 통합기가 경고로 보고한다
 
 ## 빠른 시작 (통합 실행)
 
@@ -39,8 +40,8 @@ python verify_merged.py --timeline out\<evidence_id>\timeline.csv --key scenario
 ```
 
 결과는 `out\<evidence_id>\` 에 병합 `timeline.csv` · `recovered_conversations.csv` · `unified.db`(SQLite) ·
-`evidence_manifest.json`(세그먼트별 SHA-256) · 파서별 원본 결과 폴더로 남는다.
-종료코드 0 전부 성공 / 1 일부 파서 실패·계약 위반 / 2 입력 실패. 자세한 내용은 `integration/README.md`.
+`evidence_manifest.json`(세그먼트별 SHA-256) · `integration_report.json`(파서별 상태·오류 목록) · 파서별 원본 결과 폴더로 남는다.
+종료코드 0 전부 성공 / 1 일부 파서 실패·계약 위반 / 2 입력 실패 / 3 통합 DB·출력 오류. 자세한 내용은 `integration/README.md`.
 
 ## 규칙
 
