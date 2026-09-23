@@ -12,6 +12,7 @@ python llm_forensic.py --self-test
 
 결과: `out\<evidence_id>\`
 - `<파서명>\` 파서별 원본 결과(그대로 보존, 같은 이미지로 재실행하면 그 파서 폴더만 새 결과로 교체) + `run.log`(파서 버전·python·명령·시작 시각·stdout/stderr·종료코드)
+  - 통합 대상은 계약 CSV 2개(`timeline.csv`, `recovered_conversations.csv`)와 `run.log` 만이다. `result.json`, `cx_result.json`, `gemini_results.json` 같은 그 외 파일은 파서 담당자가 남기는 고유 부산물(원본 레코드·규칙 판정 상세)로, 파서마다 있거나 없고 형식도 다르다. 통합기는 읽지 않는다 (예외: 레지스트리 `volume_json` 으로 지정한 파서의 JSON 에서 볼륨 오프셋만 꺼낸다).
 - `timeline.csv`, `recovered_conversations.csv` 병합본 — 팀 7열/10열은 헤더·값 모두 파서가 쓴 그대로, 그 뒤에 provenance 열
 - `unified.db` — evidence / runs / events / messages
 - `integration_report.json` — 파서별 상태(`success` / `failed` / `contract_violation` / `normalization_error` / `db_error`), 적재 행 수, 오류 목록
