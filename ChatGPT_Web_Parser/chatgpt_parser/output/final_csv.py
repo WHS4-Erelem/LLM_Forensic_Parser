@@ -53,7 +53,7 @@ CSV_USER_BEHAVIOR_LABELS = {
     "CONVERSATION_RETRY": "대화 재시도",
     "CONVERSATION_REMOVED_FROM_LIST": "대화 목록에서 사라짐",
     "CONVERSATION_DELETE": "대화 삭제",
-    "PROMPT_DRAFT": "사용자 프롬프트 초안 작성",
+    "PROMPT_DRAFT": "사용자 프롬프트 입력/전송",  # 팀 행위 분류 체계: 초안은 별도 행위가 아니라 전송 미확인(의심) 으로 표기 (2026-09-23)
     "PROMPT_SEND": "사용자 프롬프트 입력/전송",
     "FILE_UPLOAD": "파일 업로드",
     "FILE_UPLOAD_DELETE": "업로드한 파일 삭제",
@@ -146,6 +146,8 @@ def _timeline_row(event: Event) -> dict[str, Any]:
             record_detail = redact_url_query(evidence.record_location)[0]
     conversation_id = _timeline_conversation_id(event)
     behavior = [_timeline_summary(event, evidence)]  # 무엇을 했는가
+    if event.action == "PROMPT_DRAFT":  # 초안 저장만 확인됨 — 전송은 미확인이라 Verdict 도 의심으로 고정
+        behavior.append("전송 미확인(입력창 초안 저장만)")
     if conversation_id:
         behavior.append(f"conversation_id={conversation_id}")
     # 무엇을 근거로 판정했는가 — confidence·rule_id·artifact_type 은 최종 CSV 에서 이 칸에만 남는다.
@@ -159,7 +161,7 @@ def _timeline_row(event: Event) -> dict[str, Any]:
         "Timestamp": csv_final_timestamp(event.timestamp_kst),  # 없으면 빈 cell — 시각을 만들어 내지 않는다
         "User_behavior": CSV_USER_BEHAVIOR_LABELS.get(event.action, event.action),
         "Behavior_details ": " | ".join(behavior),
-        "Verdict": CSV_VERDICT_LABELS.get(event.action_status, event.action_status),
+        "Verdict": "의심" if event.action == "PROMPT_DRAFT" else CSV_VERDICT_LABELS.get(event.action_status, event.action_status),
         "Artifact_path": location,
         "Artifact_details ": " | ".join(details),
     })

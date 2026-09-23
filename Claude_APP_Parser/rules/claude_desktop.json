@@ -457,7 +457,7 @@
     },
     {
       "id": "account_log",
-      "name": "계정 식별자 확인",
+      "name": "로그인",
       "category": "account",
       "evidence_level": "supporting",
       "summary": "앱 로그에 계정 식별자",
@@ -469,12 +469,12 @@
         }
       ],
       "time_from": "log_account",
-      "explain": "로그에 찍힌 계정 UUID다. 어느 계정이 이 PC를 썼는지의 근거.",
+      "explain": "로그에 찍힌 계정 UUID다. 어느 계정이 이 PC를 썼는지의 근거. 사용자 행위가 아닌 증거라 행위명은 로그인(의심)으로 두고 식별자는 상세에 남긴다 (팀 합의 2026-09-23).",
       "per_record": true
     },
     {
       "id": "org_log",
-      "name": "조직 식별자 확인",
+      "name": "로그인",
       "category": "account",
       "evidence_level": "supporting",
       "summary": "앱 로그에 조직 식별자",
@@ -486,12 +486,12 @@
         }
       ],
       "time_from": "log_org",
-      "explain": "계정이 속한 조직 UUID다.",
+      "explain": "계정이 속한 조직 UUID다. 계정 식별자와 같은 이유로 행위명은 로그인(의심).",
       "per_record": true
     },
     {
       "id": "app_exit_log",
-      "name": "애플리케이션 종료",
+      "name": "정상 종료",
       "category": "runtime",
       "evidence_level": "supporting",
       "summary": "앱 로그에 종료 기록",
@@ -540,7 +540,7 @@
     },
     {
       "id": "prefetch_run",
-      "name": "프로그램 실행(프리패치)",
+      "name": "애플리케이션 실행",
       "category": "runtime",
       "evidence_level": "direct",
       "summary": "윈도 프리패치에 실행 기록",
@@ -572,7 +572,7 @@
     },
     {
       "id": "login_state_log",
-      "name": "로그인 상태 확인",
+      "name": "로그인",
       "category": "account",
       "evidence_level": "supporting",
       "summary": "앱 로그에 로그인 상태가 찍힘",
