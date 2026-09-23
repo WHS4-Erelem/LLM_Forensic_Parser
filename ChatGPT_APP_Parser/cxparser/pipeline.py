@@ -11,6 +11,7 @@ from .artifacts import recent_lnk as lnk_art
 from .artifacts import rollout as rollout_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
+from .artifacts import webcache_conv as webcache_art
 from .errors import ArtifactNotFoundError, CxError
 from .image import open_image
 from .model import RecordBuilder
@@ -25,10 +26,11 @@ PARSERS = {
     "sqlite": sqlite_art.parse,
     "prefetch": prefetch_art.parse,
     "recent_lnk": lnk_art.parse,
+    "webcache": webcache_art.parse,
 }
 
 DEFAULT_KINDS = ("rollout", "rollout_loose", "session_index", "global_state", "auth",
-                 "sqlite", "prefetch", "recent_lnk")
+                 "sqlite", "prefetch", "recent_lnk", "webcache")
 
 
 class Result(dict):
@@ -63,6 +65,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     targets = []
     inventory = []
     sqlite_siblings = {}     # -wal/-shm 은 본 DB 와 함께 열어야 최신 트랜잭션이 보인다
+    cache_parts = {}         # 채팅창 HTTP 캐시: Cache_Data 폴더별 {data_N / f_xxxxxx: vfile} — index 파서가 함께 연다
     scanned = 0
     for vfile in vfs.iter_files():
         scanned += 1
@@ -72,6 +75,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         inventory.append({"kind": kind, **vfile.location()})
         if kind == "sqlite" and (vfile.path.endswith("-wal") or vfile.path.endswith("-shm")):
             sqlite_siblings[vfile.path] = vfile
+            continue
+        if kind == "webcache_part":
+            cache_parts.setdefault(vfile.path.rsplit("/", 1)[0].lower(), {})[meta["fn"]] = vfile
             continue
         if kind == "sqlite" and not sqlite_art.is_main_db(vfile.path):
             continue          # 처리 대상 아닌 DB 는 발견 목록에만
@@ -107,6 +113,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             elif kind == "sqlite":
                 recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt,
                               siblings=sqlite_siblings)
+            elif kind == "webcache":
+                recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt,
+                              siblings=cache_parts.get(vfile.path.rsplit("/", 1)[0].lower(), {}))
             else:
                 recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt)
             records.extend(recs)
@@ -154,7 +163,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.6",
+        "tool": {"name": "cxparser", "version": "0.3.7",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

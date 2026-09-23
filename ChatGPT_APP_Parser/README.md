@@ -93,10 +93,13 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | (이미지 전용) | `$Extend/$UsnJrnl:$J` | 파일 생성·삭제 시각 — 분석표의 "로그아웃 지문 = auth.json FILE_DELETE" 등 |
 | `prefetch` (0.3.6) | `Windows/Prefetch/CODEX.EXE-*.pf` | E08-01 애플리케이션 실행 — OS 가 기록한 최근 8회 실행 시각. MAM 압축 해제는 Windows 에서만 |
 | `recent_lnk` (0.3.6) | `Users/*/AppData/Roaming/Microsoft/Windows/Recent/*.lnk` | E06-02 생성 이미지 다운로드(대상이 `Codex 이미지 …`), E05-05 문서 다운로드(문서 확장자 + 대상이 같은 시각에 새로 생김) |
+| `webcache` (0.3.7) | `…\Packages\OpenAI.Codex_…\LocalCache\Roaming\Codex\web\Codex\Default\Cache\Cache_Data\` (index·data_0~3·f_*) | **채팅 모드** 대화 전체 — conversation 응답 JSON: E03-01 대화 생성, E04-01 프롬프트(본문·시각), E05-01/03 첨부 업로드(metadata.attachments 파일명·MIME), E06-01 이미지 생성(image_asset_pointer·image_gen_title), E03-03/04 분기(대화 수정·재시도), E10-01 임시 채팅(is_temporary_chat), E09-01 모델 변경(default_model_slug 변화, 추정), `estuary/content?…&fn=` 요청 = E05-05/E06-02 파일 내려받기. assistant 응답은 recovered_conversations 로. Chrome Blockfile Cache Reader 는 팀 ChatGPT Web 파서(cache.py)를 옮겨 온 것 (`webcache.py`). **앱을 삭제하면 통째로 사라진다** |
 
 0.3.5~0.3.6 에 추가된 파생 규칙(`derive.py`, `sqlitedb._logs`): 로그인 = 앱 로그 `Reloaded auth, changed: true` + USN `auth.json FILE_CREATE`(±120s) / 계정 전환 = auth.json 삭제→재생성 + 계정 UUID 2개 이상 /
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
-로컬 흔적이 없어 못 잡는 것: 모델 변경·공유 링크·임시 채팅·계정 이름 변경 (채팅창 Chromium 저장소가 앱 삭제와 함께 사라짐), 설치·삭제 (USN 저널이 그 구간을 덮을 때만 가능).
+2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
+타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 뺀다(JSON 에는 남음).
+로컬 흔적이 없어 못 잡는 것: 공유 링크·대화 공유·계정 이름 변경 (POST 요청은 캐시되지 않음), 강제 종료(정상 종료와 구분 불가), 설치·삭제 (USN 저널이 그 구간을 덮을 때만 가능). 앱을 삭제한 이미지에서는 채팅 모드 전체(webcache)가 사라진다.
 
 탐색 디렉터리(`locate.SCAN_ROOTS`): `Users/*/.codex`, `Users/*/Documents/Codex`,
 `Users/*/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0`,

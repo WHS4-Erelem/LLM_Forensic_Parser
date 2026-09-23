@@ -30,7 +30,7 @@ CSV_VERDICTS = ("확정", "의심")
 _ROLE = {"user": "user", "assistant": "assistant",
          "userMessage": "user", "agentMessage": "assistant"}
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
-        "prefetch": "Prefetch", "recent_lnk": "Recent",
+        "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
 # Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
 _CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")
@@ -113,6 +113,18 @@ def _fold_prompt_history(rows):
         else:
             others.append(r)
     out, notes = list(others), {}
+    # 시각이 있는 같은 프롬프트(rollout·SQLite·채팅창 캐시)가 있으면 global-state 행은 전부 그 행의 근거로 접는다
+    timed = {}
+    for r in others:
+        det = r.get("details") or {}
+        if (r.get("event") or {}).get("event_id") == "E04-01" and (r.get("timestamp") or {}).get("utc") and det.get("text"):
+            timed.setdefault(" ".join(str(det["text"]).split()), r)
+    for text in list(groups):
+        rep = timed.get(text)
+        if rep is not None:
+            rs = groups.pop(text)
+            notes.setdefault(rep["record_id"], []).append("global-state prompt-history 에도 기록 (%d건%s)" % (
+                len(rs), ", 삭제된 이전 버전 포함" if any(not _is_live(r) for r in rs) else ""))
     for rs in groups.values():
         is_global = lambda r: r["details"]["key"] in _PH_GLOBAL_KEYS
         reps = {}                                                  # 대화(key)마다 대표 1행, 현존 파일 우선
@@ -144,14 +156,20 @@ def _fold_app_runs(rows, notes):
     Prefetch 시각을 그 행의 근거로 접는다. 짝이 없는 Prefetch 실행(로그가 순환·삭제된 경우)은 그대로 남긴다."""
     runs = [r for r in rows if r["event"]["event_id"] == "E08-01" and (r.get("timestamp") or {}).get("utc")]
     logs = [r for r in runs if (r.get("details") or {}).get("artifact") == "codex_sqlite"]
+    # 앱 프로세스 구간: 구간 안에서 뜬 Prefetch 실행은 앱이 띄운 보조 프로세스(codex.exe app-server 등)라 사용자 실행이 아니다
+    spans = [(_secs(lg["details"]["session_first_utc"]) - _RUN_FOLD_SEC, _secs(lg["details"]["session_last_utc"]))
+             for lg in logs if lg["details"].get("session_first_utc") and lg["details"].get("session_last_utc")]
     drop = set()
     for pf in (r for r in runs if (r.get("details") or {}).get("artifact") == "prefetch"):
-        near = [lg for lg in logs if abs(_secs(lg["timestamp"]["utc"]) - _secs(pf["timestamp"]["utc"])) <= _RUN_FOLD_SEC]
+        t = _secs(pf["timestamp"]["utc"])
+        near = [lg for lg in logs if abs(_secs(lg["timestamp"]["utc"]) - t) <= _RUN_FOLD_SEC]
         if near:
-            lg = min(near, key=lambda x: abs(_secs(x["timestamp"]["utc"]) - _secs(pf["timestamp"]["utc"])))
+            lg = min(near, key=lambda x: abs(_secs(x["timestamp"]["utc"]) - t))
             drop.add(pf["record_id"])
             notes.setdefault(lg["record_id"], [])
             notes[lg["record_id"]].append("Prefetch 실행 기록 %s 와 일치" % to_kst(pf["timestamp"]["utc"])[:19])
+        elif any(a <= t <= b for a, b in spans):
+            drop.add(pf["record_id"])                      # 실행 중 구간 안의 보조 프로세스 기동 — JSON 에는 남고 타임라인에서만 뺀다
     return [r for r in rows if r["record_id"] not in drop]
 
 
