@@ -78,7 +78,7 @@ TIMELINE_FIELDS = ("Model", "Timestamp", "User_behavior", "Behavior_details ", "
 CONVERSATION_FIELDS = ("Model", "timestamp", "conversation_uuid", "conversation_title",
                        "message_uuid", "parent_message_uuid", "message order", "role",
                        "content", "Artifact_path")
-PARSER_VERSION = "1.4.3-freeze-candidate-timeline-gate"
+PARSER_VERSION = "1.4.6-freeze-candidate-edgecase-fix"
 OUTPUT_CONTRACT_VERSION = "2026-09-team-v1"
 COVERAGE_FIELDS = ("Model", "Scope", "Item", "Status", "Reason", "Artifact_path", "Artifact_details")
 TEAM_VERDICTS = {"확정", "의심"}
@@ -163,6 +163,22 @@ EXPLICIT_SEMANTIC_RULES = (
     ("image_generation", re.compile(r"(?i)(?:image[_ -]?generation|generate[_ -]?image|generated[_ -]?image|imagegen(?:eration)?|imagen[_ -]?(?:request|result))")),
     ("temporary_chat", re.compile(r"(?i)(?:is[_ -]?temporary\s*[:=]\s*true|temporary[_ -]?chat|temp[_ -]?chat|ephemeral[_ -]?chat)")),
 )
+
+# Findings produced from raw/static/browser-state heuristics remain useful analyst clues, but
+# they are not final user-behavior events.  Keep them in gemini_results.json / coverage and
+# require event-specific or protocol-structured evidence before Timeline promotion.
+SUPPORTING_ONLY_ACTIONS = {
+    "prompt_send_candidate",
+    "conversation_delete_candidate", "conversation_edit_candidate",
+    "conversation_retry_candidate", "temporary_chat_candidate",
+    "attachment_remove_candidate", "image_generation_candidate",
+    "image_upload_candidate", "document_upload_candidate",
+    "model_change_candidate", "document_download_candidate",
+    "generated_image_download_candidate", "share_link_candidate",
+    "prompt_delete_candidate", "data_export_candidate",
+    "account_name_change_candidate", "incognito_mode_candidate",
+    "history_clear_candidate", "cache_clear_candidate",
+}
 # Browser-level privacy/cleanup actions are intentionally NOT derived from generic raw keywords.
 # A Session/Tabs file can contain multiple tabs (e.g. Gemini + chrome://settings/clearBrowserData)
 # in one bounded byte window, which proves neither that history/cache deletion executed nor that
@@ -776,8 +792,10 @@ class GeminiParser:
                                "limitations": limitations}, status=state, level="unconfirmed",
                        error=self._discovery_errors.get(key))
             self._say(f"[{'+' if findings else '-'}] {self.ARTIFACTS[key]}: {findings} findings ({state})")
-        self._emit_conversation_scope_summaries()
+        # Semantic/correlation derivation must finish before recovery summaries are frozen.
+        # This prevents JSON summary counts from describing an earlier view than the final CSV.
         self._derive_semantic_actions()
+        self._emit_conversation_scope_summaries()
         return self.results
 
     def get_results(self) -> list[dict]:
@@ -1920,47 +1938,31 @@ class GeminiParser:
 
     @classmethod
     def _stream_request_prompts(cls, value, limit=8):
-        """Extract prompt candidates from known Gemini StreamGenerate/message-submit shapes.
-
-        This intentionally looks only at the leading request-message slot of decoded payloads.
-        It avoids the old "longest natural string anywhere" behavior, which could mistake
-        model metadata, prior context or UI strings for the newly submitted user prompt.
-        """
-        found = []
-        seen = set()
-        stack = [value]
-        visited = 0
-        while stack and visited < 4000 and len(found) < limit:
-            node = stack.pop()
-            visited += 1
-            if isinstance(node, dict):
-                stack.extend(reversed(list(node.values())))
-                continue
-            if not isinstance(node, list):
-                continue
-
-            # Current/legacy StreamGenerate inner request shapes both put the new prompt in
-            # the first list slot: [prompt, ...] or [[prompt], None, [continuation ids...]].
-            if node and isinstance(node[0], list) and node[0]:
-                first = node[0]
-                # Google batchexecute wrapper: [rpcId, payloadString, null, "generic"].
-                # The rpcId is transport metadata, never a user prompt.
-                is_rpc_wrapper = (
-                    len(first) >= 4 and str(first[-1]).lower() == "generic"
-                    and isinstance(first[0], str) and isinstance(first[1], str)
-                )
-                if not is_rpc_wrapper and isinstance(first[0], str):
-                    prompt = cls._normalize_message_content(first[0])
-                    if prompt:
-                        ident = prompt.casefold()
-                        if ident not in seen:
-                            seen.add(ident)
-                            found.append(prompt)
-
-            # Do not recursively treat every ordinary child string as a prompt.  Only lists
-            # are traversed to reach another decoded request container.
-            stack.extend(reversed([child for child in node if isinstance(child, (list, dict))]))
-        return found
+        """Read only the StreamGenerate request slot, never arbitrary nested settings."""
+        if limit < 1 or not isinstance(value, list):
+            return []
+        # StreamGenerate f.req envelope: [null, JSON-encoded inner request].
+        if len(value) == 2 and value[0] is None and isinstance(value[1], str):
+            try:
+                value = json.loads(value[1])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return []
+        # Inner request: [[prompt, ...], null/[language], [continuation ids...], ...].
+        if not (isinstance(value, list) and len(value) >= 3
+                and isinstance(value[0], list) and value[0]
+                and isinstance(value[0][0], str)
+                and isinstance(value[2], list) and len(value[2]) >= 3
+                and all(isinstance(item, str) for item in value[2][:3])):
+            return []
+        language = value[1]
+        if language is not None and not (
+            isinstance(language, list) and len(language) == 1
+            and isinstance(language[0], str)
+            and re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z]{2,4})?", language[0])
+        ):
+            return []
+        prompt = cls._normalize_message_content(value[0][0])
+        return [prompt] if prompt else []
 
     @classmethod
     def _iter_wrb_entries(cls, value):
@@ -2281,9 +2283,8 @@ class GeminiParser:
     def _f_req_messages_from_text(cls, text, absolute_base=0):
         """Recover submitted user text from Gemini f.req payloads.
 
-        Prefer the known StreamGenerate/message-submit request slot over a free-form string scan.
-        The fallback is retained only for protocol drift and is deliberately marked heuristic so
-        a cid-less result still requires unique History-title correlation before CSV export.
+        Only the known StreamGenerate request envelope and positional prompt slot qualify.
+        Unknown layouts remain unrecovered rather than promoting settings/UI strings.
         """
         if not isinstance(text, str) or "f.req" not in text:
             return []
@@ -2332,28 +2333,10 @@ class GeminiParser:
                     if cid:
                         break
 
-            structured_prompts = []
-            for decoded in decoded_values:
-                for prompt in cls._stream_request_prompts(decoded):
-                    if prompt not in structured_prompts:
-                        structured_prompts.append(prompt)
+            structured_prompts = cls._stream_request_prompts(payload)
             basis = "gemini_f_req_structured"
 
-            # Drift fallback: only if the known request slot was not found.  Keep one strongest
-            # natural-language candidate.  Without an explicit cid it cannot reach the final
-            # conversation CSV unless it uniquely matches a Gemini History title.
             prompts = structured_prompts
-            if not prompts:
-                strings = []
-                for decoded in decoded_values:
-                    for value in cls._walk_json_strings(decoded, max_nodes=12000):
-                        normalized = cls._normalize_message_content(value)
-                        if normalized and normalized not in strings and not normalized.startswith(("http://", "https://")):
-                            strings.append(normalized)
-                strings = [x for x in strings if len(x) >= 4]
-                strings.sort(key=lambda x: (len(re.findall(r"[가-힣]", x)), len(x)), reverse=True)
-                prompts = strings[:1]
-                basis = "gemini_f_req_heuristic"
 
             for prompt in prompts[:1]:
                 key = (cid, prompt, absolute_base + match.start())
@@ -2850,6 +2833,8 @@ class GeminiParser:
         return output
 
     def _emit_deep_message(self, key, path, message, *, locator=None, extra=None):
+        basis = str(message.get("recovery_basis") or "ccl_native")
+        qualified = self._qualified_message_recovery_basis(basis)
         detail = {
             "record_type": "finding",
             "conversation_id": message.get("conversation_id"),
@@ -2863,18 +2848,29 @@ class GeminiParser:
             "choice_id": message.get("choice_id"),
             "candidate_rank": message.get("candidate_rank"),
             "message_timestamp": message.get("message_timestamp") or "",
-            "recovery_basis": message.get("recovery_basis") or "ccl_native",
+            "recovery_basis": basis,
             "protocol": message.get("protocol") or "ccl-native",
             "protocol_offset": message.get("protocol_offset"),
             "protocol_sequence": message.get("protocol_sequence"),
             "native_chromium_structure_decoded": True,
+            "message_semantics_verified": qualified,
             "container_decoder": "ccl_chromium_reader",
+            "limitation": (
+                "Container/native structure was decoded, but this candidate did not pass the "
+                "allowlist for message semantics and is retained only as supporting evidence."
+                if not qualified else None
+            ),
             **(extra or {}),
         }
         timestamp = normalize_team_kst_timestamp(message.get("message_timestamp"))
-        return self._emit(key, "Native Chromium Gemini message recovered", path=path,
-                          detail=detail, locator=locator or {}, timestamp=timestamp,
-                          level="direct", status="success")
+        return self._emit(
+            key,
+            "Native Chromium Gemini message recovered" if qualified else
+            "Gemini message candidate preserved; message semantics not verified",
+            path=path, detail=detail, locator=locator or {}, timestamp=timestamp,
+            level="direct" if qualified else "support",
+            status="success" if qualified else "partial",
+        )
 
     def _parse_ccl_artifact(self, key):
         modules = _load_ccl_modules()
@@ -4660,21 +4656,31 @@ class GeminiParser:
                     if not pattern.search(text):
                         continue
                     filename_for_rule = self._extract_filename(text)
-                    # Generic UI/static strings are common in raw browser artifacts.  Require
-                    # an event-scoped anchor before promoting them to a Timeline candidate.
+                    # Raw/static UI labels are common in browser state and scripts.  Even when
+                    # a conversation/file anchor is nearby they do not prove that the action ran.
+                    # Preserve them as supporting candidates only; a future native event decoder
+                    # may emit the non-candidate action when event-specific structure is present.
                     if action in {"conversation_delete", "conversation_edit", "conversation_retry", "temporary_chat"} and not cid:
                         continue
                     if action == "attachment_remove" and not (cid or filename_for_rule):
                         continue
                     if action == "image_generation" and not cid:
                         continue
-                    derived_action = "image_generation_candidate" if action == "image_generation" else action
+                    candidate_map = {
+                        "conversation_delete": "conversation_delete_candidate",
+                        "conversation_edit": "conversation_edit_candidate",
+                        "conversation_retry": "conversation_retry_candidate",
+                        "temporary_chat": "temporary_chat_candidate",
+                        "attachment_remove": "attachment_remove_candidate",
+                        "image_generation": "image_generation_candidate",
+                    }
+                    derived_action = candidate_map.get(action, action + "_candidate")
                     add(self._copy_as_derived(source, derived_action,
                         "GEM-SEM-" + derived_action.upper().replace("_", "-") + "-001",
-                        "Explicit Gemini-scoped semantic marker observed with an event-scoped anchor",
+                        "Gemini-scoped semantic/UI marker preserved as supporting finding",
                         detail_extra={"conversation_id": cid, "filename": filename_for_rule,
-                        "semantic_marker": pattern.pattern,
-                        "limitation": "A Gemini-scoped marker plus conversation/file anchor is present; event-specific native decoding remains stronger evidence."},
+                        "semantic_marker": pattern.pattern, "supporting_finding": True,
+                        "limitation": "A nearby Gemini conversation/file anchor plus a semantic/UI label does not prove that the user executed the action."},
                         level="support", status="partial"))
 
                 # Upload preparation / attachment trace with recoverable filename.
@@ -4698,10 +4704,11 @@ class GeminiParser:
                             continue
                         prompt = self._normalize_recovered_text(candidate.get("text"))
                         if prompt:
-                            add(self._copy_as_derived(source, "prompt_send", "GEM-PROMPT-SEND-001",
-                                "User prompt text and explicit send marker observed in one bounded Gemini context",
+                            add(self._copy_as_derived(source, "prompt_send_candidate", "GEM-PROMPT-SEND-001",
+                                "Prompt text and send-like label co-occur in bounded Gemini raw context",
                                 detail_extra={"prompt_text": prompt, "conversation_id": cid,
-                                "limitation": "Raw context associates text with a send marker; native Gemini message decoding is still unavailable."},
+                                "supporting_finding": True,
+                                "limitation": "Raw co-occurrence does not establish a submitted Gemini message; native/structured message semantics are required for Timeline or Conversation promotion."},
                                 level="support", status="partial"))
 
                 # Model selection/change trace.
@@ -4712,11 +4719,12 @@ class GeminiParser:
                         if model and model.casefold() not in {m.casefold() for m in models}:
                             models.append(model)
                     if models:
-                        add(self._copy_as_derived(source, "model_change", "GEM-MODEL-001",
-                            "Explicit Gemini model selection/change trace observed",
+                        add(self._copy_as_derived(source, "model_change_candidate", "GEM-MODEL-001",
+                            "Gemini model selection/change marker preserved as supporting finding",
                             detail_extra={"previous_model": models[-2] if len(models) >= 2 else None,
                                           "new_model": models[-1], "conversation_id": cid,
-                                          "limitation": "If only one model value is recovered, the previous model is unknown."},
+                                          "supporting_finding": True,
+                                          "limitation": "Raw/state model labels do not prove an executed model change; event-specific structure is required for Timeline promotion."},
                             level="support", status="partial"))
 
             # Structured message -> prompt send / recovered conversation.
@@ -4955,12 +4963,16 @@ class GeminiParser:
             removed = before_ids - after_ids if after_ids else set()
             for cid in sorted(removed):
                 source = bstate[(profile, cid)][2]
-                derived = self._copy_as_derived(source, "conversation_delete", "GEM-CONV-DELETE-CMP-001",
-                    "Conversation ID present in baseline but absent after action window",
+                baseline_observed = self._display_timestamp(source)
+                derived = self._copy_as_derived(source, "conversation_delete_candidate", "GEM-CONV-DELETE-CMP-001",
+                    "Conversation ID present in baseline History but absent after comparison",
                     detail_extra={"conversation_id": cid, "comparison_mode": "before_after",
                                   "baseline_present": True, "after_present": False,
-                                  "limitation": "Absence after comparison supports deletion only when other conversations remain; deleted content is not recovered."},
+                                  "baseline_observed_time": baseline_observed,
+                                  "event_timestamp_known": False, "supporting_finding": True,
+                                  "limitation": "A History-state difference does not distinguish browser-history removal from server-side Gemini conversation deletion; no deletion time is inferred."},
                     level="support", status="partial")
+                derived["timestamp"] = normalize_timestamp(None)
                 additions.append(derived)
             common = before_ids & after_ids
             for cid in sorted(common):
@@ -4968,12 +4980,16 @@ class GeminiParser:
                 atitle = astate[(profile, cid)][1]
                 if btitle and atitle and btitle != atitle:
                     source = astate[(profile, cid)][2]
-                    additions.append(self._copy_as_derived(source, "conversation_edit", "GEM-CONV-EDIT-CMP-001",
-                        "Conversation title changed across baseline comparison",
+                    after_observed = self._display_timestamp(source)
+                    derived = self._copy_as_derived(source, "conversation_edit_candidate", "GEM-CONV-EDIT-CMP-001",
+                        "Conversation title differs across baseline History comparison",
                         detail_extra={"conversation_id": cid, "previous_title": btitle, "conversation_title": atitle,
-                                      "comparison_mode": "before_after",
-                                      "limitation": "Title change is consistent with conversation modification but does not identify the exact edited message."},
-                        level="support", status="partial"))
+                                      "comparison_mode": "before_after", "after_observed_time": after_observed,
+                                      "event_timestamp_known": False, "supporting_finding": True,
+                                      "limitation": "A History title difference does not identify a user message edit or its execution time."},
+                        level="support", status="partial")
+                    derived["timestamp"] = normalize_timestamp(None)
+                    additions.append(derived)
 
         # History clear candidate from table-cardinality decrease. Requires the new inventory rows.
         b_hist = self._inventory_by_profile(before, "Chrome History")
@@ -5186,6 +5202,33 @@ class GeminiParser:
             return "CheckCookie"
         return "login-related URL"
 
+    @staticmethod
+    def _forensic_scope(row):
+        """Keep correlation inside one evidence partition and Windows/Chrome profile."""
+        detail = row.get("detail") or {}
+        locator = row.get("source_locator") or {}
+        evidence = detail.get("image_path") or locator.get("image_path")
+        if not evidence:
+            # Profile-mode rows carry artifact paths instead of image provenance. Strip only
+            # known artifact suffixes so History and Cache share their original profile root.
+            source = str(row.get("source_path") or "").replace("\\", "/")
+            profile_path = re.match(
+                r"^(.*)/(?:History(?:-wal|-shm|-journal)?|Cache|Code Cache|Sessions|Local Storage|"
+                r"Session Storage|IndexedDB|Service Worker)(?:/.*)?$", source, re.I,
+            )
+            evidence = profile_path.group(1) if profile_path else source
+        if not evidence:
+            # Missing provenance is not proof that two independent rows share evidence.
+            evidence = f"unscoped:{id(row)}"
+        partition = detail.get("profile_partition_offset")
+        if partition is None:
+            partition = detail.get("partition_offset")
+        if partition is None:
+            partition = locator.get("partition_offset")
+        return (str(evidence or "").replace("\\", "/").casefold(),
+                str(partition) if partition is not None else "",
+                str(detail.get("windows_user") or ""), str(detail.get("chrome_profile") or ""))
+
     @classmethod
     def _aggregate_login_flows(cls, rows, gap_seconds=180):
         """Collapse a burst of login-navigation URLs into one analyst timeline event.
@@ -5198,17 +5241,22 @@ class GeminiParser:
         if not traces:
             return []
 
+        scoped_traces = {}
+        for row in traces:
+            scoped_traces.setdefault(cls._forensic_scope(row), []).append(row)
         groups = []
-        current = [traces[0]]
-        for row in traces[1:]:
-            prev_dt = cls._row_timestamp_dt(current[-1])
-            cur_dt = cls._row_timestamp_dt(row)
-            if prev_dt is not None and cur_dt is not None and (cur_dt - prev_dt).total_seconds() <= gap_seconds:
-                current.append(row)
-            else:
-                groups.append(current)
-                current = [row]
-        groups.append(current)
+        for scoped_rows in scoped_traces.values():
+            current = [scoped_rows[0]]
+            for row in scoped_rows[1:]:
+                prev_dt = cls._row_timestamp_dt(current[-1])
+                cur_dt = cls._row_timestamp_dt(row)
+                if prev_dt is not None and cur_dt is not None and (cur_dt - prev_dt).total_seconds() <= gap_seconds:
+                    current.append(row)
+                else:
+                    groups.append(current)
+                    current = [row]
+            groups.append(current)
+        groups.sort(key=lambda group: cls._row_timestamp_dt(group[0]))
 
         summaries = []
         for group in groups:
@@ -5241,6 +5289,8 @@ class GeminiParser:
                 "windows_user": first_detail.get("windows_user"),
                 "chrome_profile": first_detail.get("chrome_profile"),
                 "filesystem_type": first_detail.get("filesystem_type"),
+                "image_path": first_detail.get("image_path"),
+                "partition_offset": first_detail.get("partition_offset"),
                 "limitation": (
                     "Google/Gemini login-related navigation was observed as one URL flow. "
                     "URL navigation alone does not prove that authentication completed successfully."
@@ -5253,6 +5303,7 @@ class GeminiParser:
                 detail, first.get("source_path"),
                 {"table": "visits", "id": ids[0] if ids else None,
                  "flow_visit_ids": ids[:50],
+                 "partition_offset": (first.get("source_locator") or {}).get("partition_offset"),
                  "filesystem_path": (first.get("source_locator") or {}).get("filesystem_path")},
                 "support", "success", None
             ])))
@@ -5298,13 +5349,7 @@ class GeminiParser:
             return False
         if action == "account_switch" and detail.get("account_switch_order_known") is False:
             return False
-        if action in {
-            "prompt_delete_candidate",
-            "data_export_candidate",
-            "account_name_change_candidate",
-            "image_upload_candidate",
-            "document_upload_candidate",
-        }:
+        if action in SUPPORTING_ONLY_ACTIONS:
             return False
 
         if action in {
@@ -5312,11 +5357,10 @@ class GeminiParser:
             "login", "logout", "account_switch", "conversation_create", "conversation_delete",
             "conversation_edit", "conversation_retry", "prompt_send", "prompt_draft", "image_upload",
             "document_upload", "attachment_remove",
-            "document_download", "document_download_candidate", "image_generation", "image_generation_candidate",
-            "generated_image_download", "generated_image_download_candidate", "generated_image_delete",
-            "data_export", "share_link_create", "share_link_candidate", "model_change",
+            "document_download", "image_generation",
+            "generated_image_download", "generated_image_delete",
+            "data_export", "share_link_create", "model_change",
             "account_name_change", "temporary_chat", "temporary_chat_url",
-            "incognito_mode_candidate", "history_clear_candidate", "cache_clear_candidate",
         }:
             return True
 
@@ -5520,11 +5564,13 @@ class GeminiParser:
                 return tagged("신규 대화 후보(History 최초 관찰, 생성 직접 증거 미확인)", title or cid)
             return tagged("대화 생성 기록", title or cid)
         if action == "conversation_delete":
-            return tagged("대화 삭제 요청/이벤트", title or cid)
+            return tagged("대화 삭제 이벤트/요청 근거", title or cid)
         if action == "conversation_edit":
-            return tagged("동일 부모 아래 사용자 메시지 분기", title or cid)
+            return tagged("대화 수정 이벤트/메시지 관계 근거", title or cid)
         if action == "conversation_retry":
-            return tagged("동일 사용자 메시지 아래 응답 분기", title or cid)
+            return tagged("응답 재시도/재생성 이벤트 근거", title or cid)
+        if action in {"conversation_delete_candidate", "conversation_edit_candidate", "conversation_retry_candidate"}:
+            return tagged("대화 관련 semantic/UI marker(행위 실행 미확인)", title or cid)
         if action == "prompt_send":
             prompt = detail.get("prompt_text") or detail.get("message_content") or detail.get("message_text") or ""
             first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
@@ -5533,6 +5579,10 @@ class GeminiParser:
             prompt = detail.get("prompt_text") or detail.get("draft_text") or ""
             first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
             return tagged("프롬프트 작성 흔적(전송 미확인)", first)
+        if action == "prompt_send_candidate":
+            prompt = detail.get("prompt_text") or detail.get("message_content") or ""
+            first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
+            return tagged("프롬프트/전송 라벨 공존 흔적(실제 전송 미확인)", first)
         if action == "prompt_delete_candidate":
             return tagged("Gemini 활동/프롬프트 삭제 관련 페이지 접근(삭제 내용 미확인)", url or title)
         if action in {"image_upload", "document_upload"}:
@@ -5544,6 +5594,8 @@ class GeminiParser:
         if action == "attachment_remove":
             summary = detail.get("summary") or row.get("observation") or filename
             return tagged("첨부 제거 이벤트", summary)
+        if action == "attachment_remove_candidate":
+            return tagged("첨부 제거 관련 marker(실행 미확인)", filename or title or cid)
         if action in {"document_download", "generated_image_download"}:
             return tagged("다운로드 완료 기록", filename)
         if action in {"document_download_candidate", "generated_image_download_candidate"}:
@@ -5569,6 +5621,10 @@ class GeminiParser:
             after = detail.get("new_model") or detail.get("model") or "?"
             prefix = "대화 내 모델 변경" if cid else "모델 선택 이벤트"
             return f"{prefix}_{before} → {after}"
+        if action == "model_change_candidate":
+            before = detail.get("previous_model") or "?"
+            after = detail.get("new_model") or detail.get("model") or "?"
+            return f"모델 관련 상태/라벨 흔적(변경 실행 미확인)_{before} → {after}"
         if action == "account_name_change":
             before = detail.get("previous_name") or "?"
             after = detail.get("new_name") or "?"
@@ -5576,7 +5632,9 @@ class GeminiParser:
         if action == "account_name_change_candidate":
             return tagged("계정 이름 변경 화면 접근(변경 완료 미확인)", url or title)
         if action == "temporary_chat":
-            return tagged("임시 대화 객체(is_temporary=true)", title or cid)
+            return tagged("임시 채팅 상태/이벤트 근거", title or cid)
+        if action == "temporary_chat_candidate":
+            return tagged("임시 채팅 관련 semantic/UI marker(사용 실행 미확인)", title or cid)
         if action == "temporary_chat_url":
             return tagged("임시 채팅 URL 접근 흔적(대화 미확인)", url)
         if action == "incognito_mode_candidate":
@@ -6166,6 +6224,38 @@ class GeminiParser:
         except (TypeError, ValueError, OverflowError):
             return ""
 
+    @staticmethod
+    def _qualified_message_recovery_basis(basis):
+        """Allow only protocol/native structures that explicitly encode message semantics.
+
+        Raw/heuristic text may remain valuable supporting evidence in JSON, but must never be
+        re-used as recovered conversation content or a confirmed prompt-send event.
+        """
+        value = str(basis or "").strip().casefold()
+        if not value:
+            return False
+        rejected = (
+            "aggressive_raw_prompt", "gemini_f_req_heuristic",
+            "labeled_string_in_bounded_raw_context", "structured_artifact_fields",
+        )
+        if any(token in value for token in rejected):
+            return False
+        exact = {
+            "structured_stream_query", "structured_stream_choice",
+            "history_rpc_user_prompt", "history_rpc_assistant_candidate",
+            "gemini_f_req_structured",
+        }
+        if value in exact:
+            return True
+        # CCL/native storage wrappers prepend an artifact namespace to the same qualified
+        # protocol basis. Explicit deserialized message objects are also allowed because
+        # _structured_messages_from_json_value() requires role + content + conversation id.
+        if any(value.endswith("_" + suffix) for suffix in exact):
+            return True
+        if "structured_object" in value and value.startswith("ccl_"):
+            return True
+        return False
+
     @classmethod
     def _structured_message_from_row(cls, row):
         """Extract a message only when the record already contains explicit structured message fields.
@@ -6173,6 +6263,9 @@ class GeminiParser:
         Raw Session/Cache/LevelDB context is deliberately NOT promoted to message content.
         """
         detail = row.get("detail") or {}
+        recovery_basis = str(detail.get("recovery_basis") or "")
+        if detail.get("message_semantics_verified") is False or not cls._qualified_message_recovery_basis(recovery_basis):
+            return None
         cids = cls._conversation_ids_for_row(row)
         cid = cids[0] if cids else None
         content = None
@@ -6213,7 +6306,7 @@ class GeminiParser:
             "artifact": row.get("artifact") or "",
             "artifact_path": cls._team_artifact_path(row),
             "artifact_detail": cls._timeline_artifact_detail(row),
-            "recovery_basis": detail.get("recovery_basis") or "structured_artifact_fields",
+            "recovery_basis": recovery_basis,
             "protocol": detail.get("protocol"),
             "protocol_offset": detail.get("protocol_offset"),
             "protocol_sequence": detail.get("protocol_sequence"),
@@ -6285,9 +6378,10 @@ class GeminiParser:
             if not cid or not title:
                 continue
             cid = str(cid)
-            history_titles.setdefault(cid, title)
+            scope = self._forensic_scope(row)
+            history_titles.setdefault((scope, cid), title)
             canonical = re.sub(r"\s+", " ", title).strip().casefold()
-            title_index.setdefault(canonical, set()).add(cid)
+            title_index.setdefault(scope, {}).setdefault(canonical, set()).add(cid)
 
 
 
@@ -6297,8 +6391,8 @@ class GeminiParser:
             if detail.get("record_type") not in {"finding", "finding_summary"}:
                 continue
             recovery_basis = str(detail.get("recovery_basis") or "")
-            if recovery_basis.startswith("aggressive_raw_prompt"):
-                # Raw context may support a timeline candidate, but it is not a recovered message body.
+            if not self._qualified_message_recovery_basis(recovery_basis):
+                # Raw/heuristic/derived text remains JSON supporting evidence only.
                 continue
             msg = self._structured_message_from_row(row)
             if not msg:
@@ -6308,6 +6402,7 @@ class GeminiParser:
             content = self._normalize_message_content(msg.get("content"))
             if not content:
                 continue
+            scope = self._forensic_scope(row)
             role = str(msg.get("role") or "UNKNOWN").strip().lower()
             if role == "human":
                 role = "user"
@@ -6323,9 +6418,10 @@ class GeminiParser:
                 # Generic Gemini landing/new-chat titles are not message semantics.  Reject
                 # them before both exact and prefix correlation so an exact title match cannot
                 # accidentally assign a cid-less request to an arbitrary conversation.
-                matches = set() if canonical in generic_titles else set(title_index.get(canonical, set()))
+                scoped_titles = title_index.get(scope, {})
+                matches = set() if canonical in generic_titles else set(scoped_titles.get(canonical, set()))
                 if not matches and canonical not in generic_titles:
-                    for candidate_title, candidate_cids in title_index.items():
+                    for candidate_title, candidate_cids in scoped_titles.items():
                         if candidate_title in generic_titles:
                             continue
                         shorter = min(len(canonical), len(candidate_title))
@@ -6339,7 +6435,7 @@ class GeminiParser:
             if not cid:
                 continue
 
-            title = self._clean_title(msg.get("title") or "") or history_titles.get(cid, "")
+            title = self._clean_title(msg.get("title") or "") or history_titles.get((scope, cid), "")
             candidates.append({
                 "Model": msg.get("model_name") or "gemini-web",
                 "timestamp": msg.get("message_time") or "",
@@ -6352,6 +6448,7 @@ class GeminiParser:
                 "content": content,
                 "Artifact_path": msg.get("artifact_path") or "",
                 "_source_index": source_index,
+                "_scope": scope,
                 "_protocol_offset": msg.get("protocol_offset"),
                 "_protocol_sequence": msg.get("protocol_sequence"),
                 "_basis": msg.get("recovery_basis") or "",
@@ -6488,13 +6585,17 @@ class GeminiParser:
         for row in output:
             by_cid.setdefault(str(row["conversation_uuid"]), []).append(row)
         for cid, group in by_cid.items():
-            # Preserve explicit order when present. Otherwise use the first observed byte/source
-            # position of the response turn, placing the user query before its assistant answer.
+            # Preserve explicit order and timestamps. Untimed READ_CHAT turns use their
+            # chronological protocol sequence before byte/source position.
             group.sort(key=lambda r: (
                 0 if str(r.get("message order") or "").isdigit() else 1,
                 int(r["message order"]) if str(r.get("message order") or "").isdigit() else 10**9,
                 0 if r.get("timestamp") not in (None, "", "-") else 1,
                 str(r.get("timestamp") or ""),
+                (int(r["_protocol_sequence"])
+                 if r.get("timestamp") in (None, "", "-")
+                 and "history_rpc_" in str(r.get("_basis") or "")
+                 and r.get("_protocol_sequence") is not None else 0),
                 int(r.get("_turn_source_index") or 0),
                 int(r.get("_turn_offset") or 0),
                 int(r.get("_protocol_sequence") or 0),
@@ -6510,7 +6611,7 @@ class GeminiParser:
                     used.add(nxt)
                     nxt += 1
                 if not row.get("conversation_title"):
-                    row["conversation_title"] = history_titles.get(cid, "")
+                    row["conversation_title"] = history_titles.get((row["_scope"], cid), "")
 
         output.sort(key=lambda r: (
             str(r.get("conversation_uuid") or ""),
@@ -6546,11 +6647,16 @@ class GeminiParser:
             # candidates remain useful support evidence but are not conversation-body findings.
             basis = str(detail.get("recovery_basis") or "")
             if (detail.get("record_type") in {"finding", "finding_summary"}
-                    and not basis.startswith("aggressive_raw_prompt")
+                    and self._qualified_message_recovery_basis(basis)
                     and self._structured_message_from_row(row) is not None):
                 structured_by_artifact[artifact] += 1
 
             if artifact not in {"Chrome History", "Chrome Sessions"} or detail.get("record_type") != "finding":
+                continue
+            # Metadata summaries describe primary History/SNSS observations only. Semantic
+            # action rows are derived copies of those observations and must not be counted again
+            # as additional History/Session records after semantic derivation has completed.
+            if detail.get("derived_rule_id"):
                 continue
             for cid in self._conversation_ids_for_row(row):
                 if not cid:
@@ -6669,7 +6775,36 @@ class GeminiParser:
         return states
 
     def _weak_action_support(self, behavior):
-        """Return a conservative reason when evidence exists but cannot prove the behavior."""
+        """Return a conservative reason when supporting evidence exists but cannot prove the behavior."""
+        action_map = {
+            "계정 전환": {"account_switch"},
+            "새로운 대화 생성": {"conversation_create"},
+            "기존 대화 삭제": {"conversation_delete_candidate"},
+            "대화 수정": {"conversation_edit_candidate"},
+            "대화 재시도": {"conversation_retry_candidate"},
+            "사용자 프롬프트 입력/전송": {"prompt_send_candidate"},
+            "사용자 프롬프트 삭제": {"prompt_delete_candidate"},
+            "이미지 업로드": {"image_upload_candidate"},
+            "문서 업로드": {"document_upload_candidate"},
+            "이미지 생성 요청": {"image_generation_candidate", "cached_image_candidate"},
+            "대화 데이터 Export": {"data_export_candidate"},
+            "공유 링크 생성": {"share_link_candidate"},
+            "모델 변경": {"model_change_candidate"},
+            "계정 이름 변경": {"account_name_change_candidate"},
+            "임시 채팅 사용": {"temporary_chat_candidate", "temporary_chat_url"},
+            "브라우저 시크릿 모드": {"incognito_mode_candidate"},
+            "방문기록 삭제": {"history_clear_candidate"},
+            "캐시 삭제": {"cache_clear_candidate"},
+        }
+        actions = action_map.get(behavior, set())
+        supporting = [
+            row for row in self.results
+            if row.get("action_candidate") in actions
+            and (row.get("detail") or {}).get("record_type") in {"finding", "finding_summary"}
+        ]
+        if supporting:
+            return f"Supporting Finding {len(supporting)}건 확인; 최종 사용자 행위로 승격할 직접/구조적 근거는 부족함"
+
         if behavior == "사용자 프롬프트 입력/전송":
             drafts = self._raw_prompt_draft_rows()
             if drafts:
@@ -6693,7 +6828,7 @@ class GeminiParser:
         if behavior == "캐시 삭제":
             pref = [r for r in self.results if r.get("artifact") in {"Chrome Preferences", "Chrome Secure Preferences"} and "clear_data.cache" in str((r.get("detail") or {}).get("key_path") or "").lower()]
             if pref:
-                return "clear_data.cache 설정 흔적은 확인했지만 설정값만으로 실제 캐시 삭제 실행을 확정할 수 없음; USN/전후 비교 필요"
+                return "clear_data.cache 설정 흔적은 확인했지만 설정값만으로 실제 캐시 삭제 실행을 확정할 수 없음; 직접 삭제 증거 필요"
         if behavior == "브라우저 시크릿 모드":
             return "일반 Profile의 비잔존만으로 시크릿 모드 사용을 증명할 수 없음; 명시적 OTR/incognito 흔적이 없으면 판단 보류"
         return None
@@ -6711,7 +6846,7 @@ class GeminiParser:
         for behavior, artifacts in ACTION_COVERAGE_ARTIFACTS.items():
             if detected.get(behavior):
                 status = "DETECTED"
-                reason = f"timeline event/candidate {detected[behavior]}건"
+                reason = f"timeline event {detected[behavior]}건"
             else:
                 weak = self._weak_action_support(behavior)
                 relevant_states = [state for artifact in artifacts for state in states.get(artifact, [])]
@@ -6791,7 +6926,7 @@ class GeminiParser:
             row for row in self.results
             if (row.get("detail") or {}).get("record_type") == "finding"
             and not (row.get("detail") or {}).get("derived_rule_id")
-            and (row.get("detail") or {}).get("recovery_basis")
+            and self._qualified_message_recovery_basis((row.get("detail") or {}).get("recovery_basis"))
             and (row.get("detail") or {}).get("message_content")
             and str((row.get("detail") or {}).get("role") or "").lower() in {"user", "human", "assistant", "model"}
         ]
