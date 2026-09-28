@@ -30,7 +30,7 @@ CSV_VERDICTS = ("확정", "의심")
 _ROLE = {"user": "user", "assistant": "assistant",
          "userMessage": "user", "agentMessage": "assistant"}
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
-        "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache",
+        "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache", "package_dir": "PackageDir",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
 # Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
 _CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")

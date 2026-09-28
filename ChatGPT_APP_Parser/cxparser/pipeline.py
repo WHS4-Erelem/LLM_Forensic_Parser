@@ -6,6 +6,7 @@ import time
 from . import derive, locate, timeline, usn as usn_mod
 from .artifacts import auth as auth_art
 from .artifacts import global_state as gs_art
+from .artifacts import package_install as pkg_art
 from .artifacts import prefetch as prefetch_art
 from .artifacts import recent_lnk as lnk_art
 from .artifacts import rollout as rollout_art
@@ -153,6 +154,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                                               max_excerpt=max_excerpt))
             usn_summary.append({**loc, "status": "ok", **info})
 
+    # --- 3b'. 패키지 폴더 생성 시각 → 설치 (폴더는 iter_files 에 안 나오므로 발견 목록에서 루트를 찾아 직접 연다) --------
+    records.extend(pkg_art.records_from_inventory(vfs, inventory, image_desc, rb))
+
     # --- 3c. 파생 규칙: 관찰 레코드끼리 대조해 로그인·계정 전환·첨부 업로드를 올린다 --------
     records.extend(derive.derive(records, rb))
 
@@ -163,7 +167,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.8",
+        "tool": {"name": "cxparser", "version": "0.3.9",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

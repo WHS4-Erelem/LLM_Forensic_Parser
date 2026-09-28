@@ -156,9 +156,11 @@ def _demote_saves_outside_sessions(records):
         _det(r).get("text"), _det(r).get("prompt_text"), r["user_action"].get("observed_artifact"),
         (r.get("evidence") or {}).get("excerpt")) if v)
     for r in records:
-        if r["event"]["event_id"] == "E05-05" and _det(r).get("artifact") == "recent_lnk" and _utc(r):
+        if r["event"]["event_id"] in ("E05-05", "E05-06") and _det(r).get("artifact") == "recent_lnk" and _utc(r):
             t = _secs(_utc(r))
-            stem = str(_det(r).get("file_name") or "").rsplit(".", 1)[0].lower()
+            fname = str(_det(r).get("file_name") or "")
+            stem = (fname.rsplit(".", 1)[0] if "." in fname and len(fname.rsplit(".", 1)[-1]) <= 5 else fname).lower()
+            stem = re.sub(r"\s*\(\d+\)$", "", stem)            # 윈도가 중복 저장에 붙인 ' (4)' 는 떼고 비교
             why = None
             if spans and not any(a <= t <= b for a, b in spans):
                 why = "앱 로그 프로세스 구간(±%ds) 밖" % SESSION_MARGIN_SEC
