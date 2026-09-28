@@ -78,7 +78,7 @@ TIMELINE_FIELDS = ("Model", "Timestamp", "User_behavior", "Behavior_details ", "
 CONVERSATION_FIELDS = ("Model", "timestamp", "conversation_uuid", "conversation_title",
                        "message_uuid", "parent_message_uuid", "message order", "role",
                        "content", "Artifact_path")
-PARSER_VERSION = "1.4.2-persistent-scope-image-status-fix"
+PARSER_VERSION = "1.4.3-freeze-candidate-timeline-gate"
 OUTPUT_CONTRACT_VERSION = "2026-09-team-v1"
 COVERAGE_FIELDS = ("Model", "Scope", "Item", "Status", "Reason", "Artifact_path", "Artifact_details")
 TEAM_VERDICTS = {"확정", "의심"}
@@ -1012,9 +1012,11 @@ class GeminiParser:
                 self._download_record(path, download, chain, columns, chain_status)
             except Exception as exc:
                 self._issue("history", path, error_text(exc), locator={"table": "downloads", "id": download["id"]})
+        # Only explicit URL/Zone linkage counts as Gemini-associated.  Pure temporal
+        # proximity remains a supporting clue in JSON and is not counted as service attribution.
         associated_count = sum(
             1 for r in self._downloads
-            if (r.get("detail") or {}).get("gemini_attribution") in {"url_associated_candidate", "temporal_candidate"}
+            if (r.get("detail") or {}).get("gemini_attribution") == "url_associated_candidate"
         )
         self._emit("history", "Chrome download records examined and preserved", path=path, level="unconfirmed",
                    detail={"record_type": "inventory", "downloads_examined": examined,
@@ -1057,10 +1059,12 @@ class GeminiParser:
                        "nearby_gemini_visits": nearby, "nearby_visit_count": nearby_count,
                        "correlation_window_seconds": self.correlation_seconds,
                        "gemini_attribution": attribution,
-                       "service_attribution": "candidate" if attribution != "unlinked_chrome_download" else "unconfirmed",
+                       "service_attribution": "candidate" if attribution == "url_associated_candidate" else "unconfirmed",
                        "limitation": (
+                           "Temporal proximity to a Gemini visit is only a supporting clue and is not sufficient for Gemini service attribution."
+                           if attribution == "temporal_candidate" else
                            "Association does not prove Gemini generated the file. A missing file does not prove deletion."
-                           if attribution != "unlinked_chrome_download" else
+                           if attribution == "url_associated_candidate" else
                            "Chrome download record is preserved, but no Gemini-specific linkage was established from the examined local artifacts."
                        ),
                        **resolution})
@@ -1096,9 +1100,15 @@ class GeminiParser:
         if direct:
             level = "direct"
             action = "file_download"
-        elif attribution in {"url_associated_candidate", "temporal_candidate"}:
+        elif attribution == "url_associated_candidate":
+            # Explicit Gemini URL/Zone linkage exists, but the local file proof is incomplete.
             level = "support"
             action = "file_download"
+        elif attribution == "temporal_candidate":
+            # Time proximity alone must never become a Gemini user-action Timeline event.
+            # Preserve the Chrome record in JSON as a supporting candidate only.
+            level = "support"
+            action = "file_download_candidate"
         else:
             level = "unconfirmed"
             action = "file_download_candidate"
@@ -4308,15 +4318,14 @@ class GeminiParser:
             return True
         if isinstance(basis, str) and basis in {"gemini_url", "google_account_url_with_gemini_reference"}:
             return True
-        if isinstance(basis, list) and any(isinstance(x, dict) and
-                                           (is_gemini_url(x.get("url")) or x.get("type") == "temporal_proximity_only")
+        if isinstance(basis, list) and any(isinstance(x, dict) and is_gemini_url(x.get("url"))
                                            for x in basis):
             return True
         if detail.get("relevance_scope") in {"gemini", "gemini_host"}:
             return True
         if detail.get("matched_string") or detail.get("origin_namespace_matches_gemini"):
             return True
-        if detail.get("gemini_attribution") in {"url_associated_candidate", "temporal_candidate", "linked_download_candidate"}:
+        if detail.get("gemini_attribution") in {"url_associated_candidate", "linked_download_candidate"}:
             return True
         action = row.get("action_candidate")
         if action == "file_delete_candidate":
@@ -5282,15 +5291,31 @@ class GeminiParser:
         if row.get("status") not in {"success", "partial"}:
             return False
 
+        # The final team Timeline is for user actions, not every supporting clue.
+        # Keep weak/ambiguous candidates in gemini_results.json, but do not promote them
+        # to timeline.csv without event-specific evidence.
+        if action == "conversation_create" and detail.get("creation_basis") == "first_observed_local_history_visit":
+            return False
+        if action == "account_switch" and detail.get("account_switch_order_known") is False:
+            return False
+        if action in {
+            "prompt_delete_candidate",
+            "data_export_candidate",
+            "account_name_change_candidate",
+            "image_upload_candidate",
+            "document_upload_candidate",
+        }:
+            return False
+
         if action in {
             "conversation_access", "file_download",
             "login", "logout", "account_switch", "conversation_create", "conversation_delete",
             "conversation_edit", "conversation_retry", "prompt_send", "prompt_draft", "image_upload",
-            "image_upload_candidate", "document_upload", "document_upload_candidate", "attachment_remove",
+            "document_upload", "attachment_remove",
             "document_download", "document_download_candidate", "image_generation", "image_generation_candidate",
             "generated_image_download", "generated_image_download_candidate", "generated_image_delete",
-            "data_export", "data_export_candidate", "share_link_create", "share_link_candidate", "model_change",
-            "account_name_change", "account_name_change_candidate", "temporary_chat", "temporary_chat_url", "prompt_delete_candidate",
+            "data_export", "share_link_create", "share_link_candidate", "model_change",
+            "account_name_change", "temporary_chat", "temporary_chat_url",
             "incognito_mode_candidate", "history_clear_candidate", "cache_clear_candidate",
         }:
             return True
@@ -7695,8 +7720,9 @@ class GeminiImageParser(GeminiParser):
                     row["status"] = "parse_error" if row["status"] == "artifact_not_found" else "partial"
                     if row["evidence_level"] == "direct":
                         row["evidence_level"] = "support"
-                if row["detail"].get("drive_letter_mapping") and row["evidence_level"] == "direct":
-                    row["evidence_level"] = "support"
+                # An unknown original drive letter is a path/provenance limitation, not
+                # evidence that the user action itself is weaker.  Preserve direct evidence
+                # when History + target file + hash/size checks establish the download.
                 row.update(collector.rewrite(row))
                 row["source_path"] = str(self.image_path)
                 row["detail"].update(context)
