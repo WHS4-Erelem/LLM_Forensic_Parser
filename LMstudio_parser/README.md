@@ -4,7 +4,7 @@ Windows LM Studio Evidence를 읽기 전용으로 분석하여 사용자 행위�
 
 ## 실행 환경과 라이브러리
 
-Python 3.14 환경에서 검증했습니다. 알려진 JSON 구조의 기준은 LM Studio 0.4.21 Build 2이며, 모든 버전/로그 형식을 지원한다는 의미는 아닙니다.
+Python 3.12 환경에서 검증했습니다. 알려진 JSON 구조의 기준은 LM Studio 0.4.21 Build 2이며, 모든 버전/로그 형식을 지원한다는 의미는 아닙니다.
 
 Directory 분석은 Python 표준 라이브러리(json, csv, sqlite3, pathlib, datetime 등)를 사용합니다. 이미지/standalone MFT 분석에는 low-level Dissect를 사용하며 dissect.target은 사용하지 않습니다.
 
@@ -17,24 +17,30 @@ python -m pip install dissect.evidence==3.13 dissect.ntfs==3.16 dissect.volume==
 - 추출된 .lmstudio directory
 - Windows User Profile
 - 추출된 Windows filesystem root
-- DD / RAW / IMG
-- E01 및 reader가 지원하는 segmented EWF 입력
+- 단일 DD (`.dd`) / RAW (`.raw`) / IMG (`.img`)
+- 분할 RAW/DD (`.001`, `.002`, `.003` ...): 첫 segment인 `.001`을 입력
+- EWF (`.e01`, `.ex01`, `.s01`, `.l01`) 및 `find_files()`가 찾는 segmented EWF 입력
 - 관련 JSON, listing, MFTECmd/FileSystem CSV, LogTracker SQLite, standalone MFT가 포함된 추출 directory
 
-최종 실행 위치는 프로젝트 root입니다.
+분할 RAW/DD는 `.001`과 동일한 basename을 가진 정확한 3자리 숫자형 최종 suffix만 자동 탐색합니다. `.001.txt` 같은 sidecar는 제외하고 숫자 순서로 처리하며, 중간 segment가 누락되면 예상 번호를 표시하고 분석을 거부합니다. `.002` 같은 중간 segment를 직접 입력해도 거부합니다. 각 segment는 읽기 전용 `SegmentedRawStream`으로 연결하며 logical size는 segment 크기의 합입니다. 합본 DD나 전체 segment의 메모리 join을 만들지 않고, 마지막 segment 크기가 다른 경우도 허용합니다.
+
+최종 실행 위치는 `LMstudio_parser` directory입니다.
 
 ```powershell
 # Parser가 있는 프로젝트 폴더에서 실행합니다.
-cd "C:\path\to\LM_Studio Parser"
+cd "C:\path\to\project\LMstudio_parser"
 
-# DD/E01 등 이미지 Evidence
+# DD/RAW/IMG/EWF 등 이미지 Evidence
 python lmstudio_parser.py "C:\path\to\evidence\disk-image.dd" --output ".\test_output\analysis"
+
+# 분할 RAW/DD Evidence: .001만 지정하며 후속 segment는 자동 탐색합니다.
+python lmstudio_parser.py "C:\path\to\evidence\disk-image.001" --output ".\test_output\split-analysis"
 
 # 추출된 LM Studio Evidence
 python lmstudio_parser.py "C:\path\to\evidence\.lmstudio" --output "C:\path\to\output\LMStudio"
 ```
 
-동일 대상의 실제 이전 snapshot이 있으면 선택적으로 --before를 지정할 수 있습니다. 단일 DD/E01 분석에 필수인 인자가 아닙니다.
+동일 대상의 실제 이전 snapshot이 있으면 선택적으로 --before를 지정할 수 있습니다. 단일·분할 image 분석에 필수인 인자가 아닙니다.
 
 ```powershell
 python lmstudio_parser.py "C:\path\to\evidence\After" --before "C:\path\to\evidence\Before" --output "C:\path\to\output\comparison"
@@ -46,9 +52,9 @@ Before/After의 시간 순서와 동일 사용자/대상 여부는 분석자가 
 
 이미지와 raw NTFS 파일은 읽기 전용 stream으로 열며 mount-write하지 않습니다. SQLite는 URI mode=ro로 엽니다. Evidence 안에 분석 결과를 쓰지 않습니다.
 
-입력 Evidence directory 내부와 Evidence 보존용 directory 내부에는 출력할 수 없습니다. 출력 파일의 symlink/외부 경로/hardlink도 거부합니다. 기존 출력 파일은 같은 이름만 덮어쓰며, 다른 파일은 지우지 않습니다.
+입력이 directory이면 그 Evidence directory 내부에는 출력할 수 없습니다. 또한 코드가 보호 경로로 지정한 `C:\WHS\DiskImages`, `C:\WHS\LMStudio_Research_Evidence` 및 `LMStudio_Research_Evidence` root 내부 출력을 거부합니다. 출력 파일의 symlink/외부 경로/hardlink도 거부합니다. 기존 출력 파일은 같은 이름만 덮어쓰며, 다른 파일은 지우지 않습니다.
 
-`--validate`는 분석 전후 DD/E01의 size·mtime을 비교하고, CSV 계약과 반복 분석 결과를 검사합니다. 전체 이미지 SHA-256이나 별도의 Research directory manifest를 자동 계산하는 기능은 아닙니다.
+`--validate`는 분석 전후 단일 image의 size·mtime을 비교하며, 분할 RAW/DD는 모든 segment의 size·mtime을 비교합니다. 또한 CSV 계약과 반복 분석 결과를 검사합니다. 전체 이미지 SHA-256이나 별도의 Research directory manifest를 자동 계산하는 기능은 아닙니다.
 
 ## NTFS 및 Windows Artifact 수집
 
@@ -70,7 +76,7 @@ conversations/*.conversation.json, conversation-config.json, window/global state
 
 명시적 edited marker, assistant versions/currentlySelected, 실제 user text, generation metadata, attachment link를 구분합니다. non-empty 대화도 원본 NTFS creation/history와 같은 profile의 config 연결이 있으면 생성 후보를 만들 수 있습니다. 파일 존재나 empty 대화 하나만으로 생성 확정은 하지 않습니다.
 
-실제 user/assistant/tool 및 기타 role의 문자열을 복구합니다. 모든 retry version과 text/step 부분을 보존하고 원본 message/version/content 배열 순서에 따라 message_order를 1부터 결정적으로 부여합니다. message_order는 순서일 뿐 message_id가 아닙니다.
+실제 user/assistant/tool 및 기타 role의 문자열을 복구합니다. 모든 retry version과 text/step 부분을 보존하고 원본 message/version/content 배열 순서에 따라 `message order`를 1부터 결정적으로 부여합니다. `message order`는 순서일 뿐 `message_uuid`가 아닙니다.
 
 Prompt 삭제는 실제 Before user 내용, After 제거, 정확히 연결된 rewrite가 있으면 강한 근거로 사용합니다. 단일 이미지의 assistant residual + 과거 user activity + write context는 삭제를 확정하지 않고 미확정으로 유지할 수 있습니다. Assistant-only/현재 파일 부재만으로 삭제하지 않습니다.
 
@@ -84,7 +90,7 @@ local-identity.json, user-profile.json, lmstudio-hub.json의 실제 key object/n
 
 user-files/*.metadata.json의 originalName, fileIdentifier, MIME/type, size/hash와 conversation attachment link를 연결합니다. 실제 image 타입과 문서 타입을 구분합니다. preview.data는 출력하지 않습니다.
 
-업로드 발생 시각은 원본 DD/E01 NTFS creation 또는 정확히 연결된 단일 creation history에서 얻습니다. 이 시각 추가로 판정 상태를 승격하지 않습니다. 삭제에는 실제 delete history가 필요합니다.
+업로드 발생 시각은 원본 DD/RAW/IMG/EWF/Split RAW의 NTFS creation 또는 정확히 연결된 단일 creation history에서 얻습니다. 이 시각 추가로 판정 상태를 승격하지 않습니다. 삭제에는 실제 delete history가 필요합니다.
 
 ### Model / Download
 
@@ -127,7 +133,7 @@ CSV에서는 confirmed → 확정, suspected → 의심만 출력합니다 (팀 
 | E02-01 설치 | 검증된 installer 완료 schema 없음; 실제 설치 구조/생성 교차 검증 |
 | E02-02 삭제 | 실제 core 삭제 + corroboration; uninstaller create/open을 execution으로 취급하지 않음 |
 | E03-01 대화 생성 | 파일 존재 단독 불허; create와 config 연결 |
-| E03-02 대화 삭제 | 실제 delete/rename history; 보수적 추정, 부재 단독 불허 |
+| E03-02 대화 삭제 | 실제 delete/rename history; 보수적 의심 판정, 부재 단독 불허 |
 | E03-03 대화 수정 | 실제 explicit edited marker 허용 |
 | E03-04 재시도 | version count 단독 확정 불허 |
 | E04-01 Prompt 입력/전송 | 실제 user text; ID-linked inference 보강. 일반 inference 문구 단독 Direct tag 미발급 |
@@ -166,8 +172,10 @@ Artifact/ObservedFact/Candidate 수, volume/JSON/USN 통계, fatal/non-fatal Ana
 ## timeline.csv — 정확히 7 columns
 
 ```text
-Model,Timestamp,User_behavior,"Behavior_details ",Verdict,Artifact_path,"Artifact_details "
+Model,Timestamp,User_behavior,Behavior_details ,Verdict,Artifact_path,Artifact_details 
 ```
+
+`Behavior_details `와 `Artifact_details ` header에는 코드 계약상 끝 공백이 정확히 1개씩 있습니다.
 
 사용자가 어떤 행동을 수행했고 어떤 포렌식 증거가 이를 지지하는지 보여줍니다.
 
@@ -176,12 +184,14 @@ Model,Timestamp,User_behavior,"Behavior_details ",Verdict,Artifact_path,"Artifac
 | Model | lmstudio |
 | Timestamp | 행위 시각, `YYYY-MM-DD HH:MM:SS.ffffff KST` (팀 공통 표기) 또는 - |
 | User_behavior | 21개 Rule의 한국어 행위명 |
-| Behavior_details | 실제 Prompt/수정 메시지, 원본 파일명, 모델 identifier, 대화/응답 정보 또는 안전한 상태 설명 |
+| Behavior_details | `<발견 근거>_<핵심 내용>` 형식의 사용자 친화적 설명. Prompt/수정 메시지는 식별에 필요한 첫 줄만 표시 |
 | Verdict | 확정 / 의심 |
 | Artifact_path | 실제 원본 Artifact 경로를 정렬하여 path1 \| path2로 결합 |
-| Artifact_details | Rule, Evidence Family, Direct 여부, conversation_id, JSON pointer/log line/USN offset/MFT locator, Fact 유형, timestamp 출처, limitation |
+| Artifact_details | `[아티팩트명] 핵심 내용` 형식. 여러 근거는 ` | `로 구분하며 JSON pointer/log line/USN offset/MFT locator 등 실제 위치를 표시 |
 
-Behavior_details는 decision_reason을 그대로 복사하지 않습니다. 실제 user_message/수정 메시지 본문은 요약·절삭하지 않습니다. Artifact_details는 관련 provenance이며 전체 JSON이나 credential dump가 아닙니다. 전송 확인 근거가 없는 Prompt는 전송 여부 미확인을 표시합니다.
+Behavior_details는 decision_reason을 그대로 복사하지 않으며 Rule ID, Evidence Family, Direct/Supporting, confidence 같은 내부 판정값을 넣지 않습니다. 전송 보강 근거가 있는 Prompt는 `사용자 메시지 전송_<첫 줄>`, 없는 Prompt는 `프롬프트 작성 흔적(전송 미확인)_<첫 줄>`로 구분합니다. 전체 user/assistant 본문은 아래 recovered_conversations.csv에 그대로 보존합니다.
+
+Artifact_details는 `[Conversation Config]`, `[Conversation]`, `[Account]`, `[Attachment Metadata]`, `[Model Data]`, `[Download Record]`, `[Server Log]`, `[Prefetch]`, `[Runtime]`, `[Zone.Identifier]`, `[GGUF]`, `[Export]`, `[Program File]`, `[Shortcut]`, `[Installer]`, `[$UsnJrnl]`, `[$MFT]`, `[History]` 및 fallback `[Artifact]`처럼 실제 Fact provenance에 맞는 이름을 사용합니다. 동일 설명은 제거하고 결정적인 순서로 출력합니다. Rule, Evidence Family, Direct Evidence, 내부 Fact type, confidence, limitation은 최종 CSV에 노출하지 않지만 Candidate 및 터미널 진단에는 계속 보존합니다. credential/token/password/private key/secret/API key/Bearer token과 preview Base64는 출력하지 않습니다.
 
 ## recovered_conversations.csv — 정확히 10 columns
 
@@ -195,20 +205,20 @@ conversation_uuid, message order, role, message_uuid, parent_message_uuid를 통
 |---|---|
 | Model | lmstudio |
 | timestamp | 메시지/버전/해당 text에 연결된 시각(`… KST`), 없으면 - |
-| conversation_uuid | 명시적 conversationId/conversationIdentifier → scoped config/UI identifier → 실제 전체 conversation 파일 basename → - |
+| conversation_uuid | 명시적 conversationId/conversationIdentifier → scoped config/UI identifier → 실제 전체 conversation 파일 basename의 `.conversation.json` suffix 제거 → - |
 | conversation_title | 실제 제목 또는 검증된 동일 대화 보완값 |
 | message_uuid / parent_message_uuid | Artifact에 실제 존재하는 식별자만 사용 |
-| message_order | 원본 message/version/content 순서의 결정적 1-based 순번 |
+| message order | 원본 message/version/content 순서의 결정적 1-based 순번 |
 | role | 실제 role 보존 |
 | content | Prompt/Response 원문; metadata-only이면 - |
 | Artifact_path | 해당 메시지를 복구한 실제 Conversation Artifact 경로 |
 
-실제 basename fallback은 CSV 표현용이며 cross-snapshot correlation의 임의 ID로 사용하지 않습니다. 숫자 stem/hash/array index로 message ID나 parent ID를 생성하지 않습니다.
+실제 basename fallback은 CSV 표현용이며 cross-snapshot correlation의 임의 ID로 사용하지 않습니다. 최종 CSV의 `conversation_uuid` 표시값은 출처와 무관하게 정확히 `.conversation.json` suffix만 제거하며 일반 `.json` suffix는 제거하지 않습니다. `Artifact_path`에는 `.conversation.json`을 포함한 원본 파일명을 유지합니다. 숫자 stem/hash/array index로 `message_uuid`나 `parent_message_uuid`를 생성하지 않습니다.
 
 ## Timestamp와 CSV 안전 계약
 
 - UTC absolute/명시적 timezone이 있는 시각만 KST UTC+09:00으로 정규화합니다.
-- YYYY-MM-DD HH:MM:SS, 소수초 절삭, 반올림 금지입니다.
+- 출력은 `YYYY-MM-DD HH:MM:SS.ffffff KST`이며 microsecond 6자리를 유지하고 절삭하거나 반올림하지 않습니다.
 - timezone 불명 값은 UTC로 가정하지 않고 -를 출력합니다.
 - filename 숫자, nearest timestamp, Ground Truth 시각으로 채우지 않습니다.
 - Conversation createdAt이나 filesystem mtime을 메시지 시각으로 복사하지 않습니다. 검증된 role-last fallback은 마지막 해당 role의 단일 version에만 제한합니다.
@@ -220,33 +230,34 @@ conversation_uuid, message order, role, message_uuid, parent_message_uuid를 통
 
 ## 민감정보 정책
 
-Credential, access/refresh token, private key, passkey, secret, preview.data, raw Base64 image는 비대화 출력과 터미널에 노출하지 않습니다. 로그는 raw line 대신 의미가 확인된 Fact와 locator를 저장합니다. 계정 식별자는 필요한 경우 fingerprint로 표시합니다.
+Credential, access/refresh token, private key, passkey, password, secret, API key, Bearer token, preview.data, raw Base64 image는 비대화 출력과 터미널에 노출하지 않습니다. 로그는 raw line 대신 의미가 확인된 Fact와 locator를 저장합니다. 계정 식별자는 필요한 경우 fingerprint로 표시합니다.
 
 실제 User Prompt/Assistant Response는 포렌식 원문 예외입니다. recovered content 및 해당 실제 Prompt/수정 내용은 요약·번역·keyword redaction하지 않습니다. Formula 방어는 직렬화 시점에만 적용합니다.
 
 ## 검증
 
 ```powershell
-cd "C:\path\to\LM_Studio Parser"
+cd "C:\path\to\project\LMstudio_parser"
 python -c "import lmstudio_parser; print(lmstudio_parser.__file__)"
 python -m py_compile lmstudio_parser.py
 python lmstudio_parser.py --self-test
 python lmstudio_parser.py "C:\path\to\evidence\disk-image.dd" --output ".\test_output\validated" --validate
+python lmstudio_parser.py "C:\path\to\evidence\disk-image.001" --output ".\test_output\split-validated" --validate
 ```
 
-검증 기능과 152개 회귀 테스트는 `lmstudio_parser.py`에 내장되어 있습니다. 별도의 validator/test Python 파일은 필요하지 않습니다.
+검증 기능과 171개 회귀 테스트는 `lmstudio_parser.py`에 내장되어 있습니다. 별도의 validator/test Python 파일은 필요하지 않습니다.
 
 `--self-test`는 detector, Direct Evidence, Source Lineage, timestamp, CSV, 민감정보 및 오탐 방지 회귀 테스트를 실행합니다. `--validate`는 정상 분석 후 같은 Evidence를 다시 분석하여 두 CSV의 byte equality를 확인하고 다음을 검사합니다.
 
 - 정확한 7/10-column schema
 - 빈 cell 0개와 `-` 결측값
-- Verdict `확정`/`추정` 제한 및 미확정 터미널 유지
+- Verdict `확정`/`의심` 제한 및 미확정 터미널 유지
 - UTF-8-SIG, CRLF, formula injection 방어
-- credential/preview 비노출
-- DD/E01 size·mtime 불변
-- USN 통계와 AnalysisIssue
+- `lmstudio-hub.json` key 및 preview 값의 비대화 영역·터미널 비노출
+- 단일 image의 size·mtime 및 Split RAW 모든 segment의 size·mtime 불변
+- USN 통계와 AnalysisIssue를 검증 결과에 기록
 
-검증 결과는 지정한 출력 directory의 `validation.json`에 저장합니다.
+검증 결과는 지정한 출력 directory의 `validation.json`에 저장합니다. 현재 field는 `status`, `parser`, `input`, `output`, `timeline_rows`, `recovered_rows`, `verdict_counts`, `candidate_count`, `excluded_indeterminate`, `empty_cells`, `sensitive_values_checked`, `sensitive_leaks`, `usn_stats`, `issues`, `sha256`, `repeat_byte_identical`, `protected_rules`, `image_stat_unchanged`입니다.
 
 서로 다른 출력 directory를 지정하면 기존 분석 결과를 덮어쓰지 않습니다. DD와 E01이 동일 획득본이라는 확인 없이 두 이미지의 equality를 요구하지 않습니다.
 
@@ -265,7 +276,7 @@ python lmstudio_parser.py "C:\path\to\evidence\disk-image.dd" --output ".\test_o
 ## 최종 프로젝트 구조
 
 ```text
-<project-directory>\LM_Studio Parser
+<project-directory>\LMstudio_parser
 ├── lmstudio_parser.py
 ├── README.md
 └── test_output
