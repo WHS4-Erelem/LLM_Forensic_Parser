@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ..artifacts.history import redact_url_query
+from ..artifacts.preferences import PREFERENCES_CLEAR_DATA_KEY
 from ..discovery import _join_source_path
 
 
@@ -138,26 +139,229 @@ def _timeline_evidence(event: Event) -> EvidenceItem | None:
     return candidates[0] if candidates else None
 
 
-def _timeline_conversation_id(event: Event) -> str | None:
-    """Evidence 가 실제로 관찰한 대화 ID. 없으면 None — 추정해서 채우지 않는다."""
-    for item in list(event.primary_evidence) + list(event.supporting_evidence):
-        for key in ("conversation_id", "url_conversation_id"):
-            value = item.observed.get(key) if isinstance(item.observed, dict) else None
-            if isinstance(value, str) and value:
-                return value
+# --- 최종 timeline.csv 의 사람이 읽는 두 칸 -------------------------------------
+# 팀 요구(2026-10-01): 최종 CSV 에는 Parser 내부 표현을 내지 않는다.
+#   Behavior_details  = "<발견 근거>_<핵심 내용>"  — 이 칸 하나만 보고 왜 그 행위로 판단했는지 알 수 있어야 한다
+#   Artifact_details  = "[아티팩트명] 핵심 내용"   — Event 하나가 여러 artifact 를 썼으면 " | " 로 잇는다
+# action · evidence_level(DIRECT/SUPPORTING) · rule_id · confidence · rule_verification · artifact_type ·
+# signal 코드는 최종 CSV 에서 빼되 **지우지 않는다** — events.csv / records.csv / result.json 에 그대로 남는다
+# (표현만 바꾸는 것이고 판정 근거를 없애는 것이 아니다).
+# 핵심 내용은 Evidence·Record 가 실제로 가진 값만 쓴다. 관찰되지 않은 파일명·UUID·제목·URL·계정은 만들어 내지
+# 않고, 값이 없으면 발견 근거만 적는다.
+CSV_BEHAVIOR_REASONS = {
+    "LOGIN": "로그인 URL 방문 흔적",
+    "LOGOUT": "로그아웃 URL 방문",
+    "ACCOUNT_SWITCH": "재인증/계정 전환 흔적",
+    "ACCOUNT_NAME_CHANGE": "계정 이름 변경 흔적",
+    "CONVERSATION_CREATE": "대화 생성 기록",
+    "CONVERSATION_DELETE": "대화 삭제 요청/이벤트",
+    "CONVERSATION_RETRY": "동일 사용자 메시지 아래 응답 분기",
+    "PROMPT_SEND": "사용자 메시지 전송",
+    "PROMPT_DRAFT": "프롬프트 작성 흔적(전송 미확인)",
+    "FILE_DOWNLOAD": "다운로드 완료 기록",
+    "IMAGE_GENERATION_REQUEST": "이미지 생성 요청 기록",
+    "SHARE_LINK": "공유 링크 생성 기록",
+    "MODEL_CHANGE": "모델 선택 값 변경",
+    "TEMPORARY_CHAT": "임시 대화 객체",
+    "INCOGNITO": "시크릿 창 표식",
+    "DATA_EXPORT_REQUEST": "대화 데이터 Export 요청 기록",
+    "HISTORY_DELETE": "방문 기록 결손 흔적",
+    "CACHE_DELETE": "캐시 삭제 설정 흔적",
+    # 아래 5개는 최종 timeline.csv 에 나가지 않는다 (CSV_NON_TEAM_ACTIONS). _timeline_row 를 직접 부르는
+    # 쪽에서도 내부 표현이 보이지 않게 같은 형식으로 적어 둔다.
+    "CONVERSATION_ACCESS": "대화 화면 방문 기록",
+    "CONVERSATION_REMOVED_FROM_LIST": "대화 목록에서 사라진 대화",
+    "PROFILE_ACCESS": "프로필 화면 방문 기록",
+    "FILE_UPLOAD": "업로드 첨부 기록",
+    "FILE_UPLOAD_DELETE": "업로드 첨부 삭제 기록",
+}
+# 같은 행위를 서로 다른 아티팩트에서 찾는 Rule 이 있으면 Rule 마다 근거 문장이 달라야 한다 — 관찰하지 않은 근거를
+# 적지 않기 위한 것이다. (LOGIN 은 인증 URL 방문(CHATGPT_LOGIN_001) 과 계정 세션 목록의 lastLoggedInAt
+# (CHATGPT_ACCOUNT_SESSION_001) 두 경로로 나온다. Rule 이름 자체는 최종 CSV 에 적지 않는다.)
+CSV_BEHAVIOR_REASONS_BY_RULE = {
+    "CHATGPT_ACCOUNT_SESSION_001": "세션 목록의 최근 로그인 기록",
+}
+# 핵심 내용으로 쓸 observed key (앞에 있는 것 우선). 어느 것도 없으면 관찰된 대화 ID 를 본다.
+CSV_BEHAVIOR_CORE_KEYS = {
+    "LOGIN": ("url",),
+    "LOGOUT": ("url",),
+    "ACCOUNT_SWITCH": ("url",),
+    "ACCOUNT_NAME_CHANGE": ("url",),
+    "CONVERSATION_CREATE": ("title", "client_conversation_id"),
+    "CONVERSATION_DELETE": ("title", "removed_conversation_id"),
+    "CONVERSATION_RETRY": ("title",),
+    "PROMPT_SEND": ("message_id",),
+    "FILE_DOWNLOAD": ("filename", "target_path"),
+    "FILE_UPLOAD": ("file_name",),
+    "FILE_UPLOAD_DELETE": ("file_name",),
+    "TEMPORARY_CHAT": ("url", "title"),
+    "INCOGNITO": ("url",),
+    "SHARE_LINK": ("url",),
+    "MODEL_CHANGE": ("model_after", "model"),
+    "CONVERSATION_ACCESS": ("title",),
+    "PROFILE_ACCESS": ("url",),
+}
+CSV_BEHAVIOR_ID_KEYS = ("conversation_id", "url_conversation_id")
+# "이전 → 이후" 로 보여 줄 행위: (이전 값 key, 이후 값 key). 두 값은 **같은 Evidence 안**에 있는 것만 짝으로 쓴다
+# (다른 Evidence 의 값을 섞으면 관찰하지 않은 전이를 만들어 내게 된다).
+CSV_BEHAVIOR_TRANSITIONS = {
+    "ACCOUNT_SWITCH": ("user_id_sha256_prefix_before", "user_id_sha256_prefix"),
+    "ACCOUNT_NAME_CHANGE": ("account_name_sha256_prefix_before", "account_name_sha256_prefix_after"),
+}
+CSV_ARTIFACT_LABELS = {
+    "history": "History", "local_storage": "Local Storage", "session_storage": "Session Storage",
+    "sessions": "Sessions", "cache": "Cache", "preferences": "Preferences", "cookies": "Cookies",
+    "favicons": "Favicons", "indexeddb": "IndexedDB", "local_state": "Local State",
+    "shared_proto_db": "Shared Proto DB", "ntfs": "NTFS",
+}
+# artifact 별로 최종 CSV 에 낼 observed key: (observed key, 사람이 읽는 이름, 단위)
+CSV_ARTIFACT_DETAIL_FIELDS = {
+    "history": (("url", "URL", ""), ("title", "제목", ""), ("state", "다운로드 상태", ""),
+                ("filename", "파일명", ""), ("current_path", "저장 경로", ""), ("mime_type", "파일 형식", "")),
+    "local_storage": (("key", "저장 key", ""), ("conversation_count", "대화 항목", "건"),
+                      ("draft_count", "초안", "건"), ("session_count", "계정 세션", "개"),
+                      ("removed_conversation_id", "사라진 대화", "")),
+    "session_storage": (("key", "저장 key", ""),),
+    "sessions": (("url", "URL", ""), ("title", "제목", "")),
+    "cache": (("conversation_id", "대화 ID", ""), ("message_id", "메시지 ID", ""),
+              ("file_name", "파일명", ""), ("mime_type", "파일 형식", "")),
+    "shared_proto_db": (("file_name", "파일명", ""), ("filename", "파일명", "")),
+}
+# 관찰 값 뒤에 붙이는 한 마디. Preferences 는 값 자체가 설명이라 붙이지 않는다.
+CSV_ARTIFACT_SUMMARIES = {
+    "history": "방문 기록 확인", "cache": "응답 데이터 확인", "local_storage": "저장 값 확인",
+    "session_storage": "저장 값 확인", "sessions": "세션 복원 기록 확인",
+    "shared_proto_db": "다운로드 메타데이터 확인",
+}
+# Chrome downloads.state 값 이름 (표기만 바꾼다 — 판정에 쓰지 않는다).
+CSV_DOWNLOAD_STATES = {0: "IN_PROGRESS", 1: "COMPLETE", 2: "CANCELLED", 3: "INTERRUPTED"}
+CSV_PROMPT_LINE_LIMIT = 120  # 프롬프트 첫 줄이 이보다 길면 잘랐다는 것을 "…" 로 알린다
+
+
+def _evidence_items(event: Event) -> list[EvidenceItem]:
+    """Event 가 실제로 쓴 Evidence (primary 먼저, 그다음 supporting)."""
+    return list(event.primary_evidence) + list(event.supporting_evidence)
+
+
+def _observed_value(event: Event, key: str) -> Any:
+    """Evidence 가 실제로 관찰한 값. 없으면 None — 추정해서 채우지 않는다."""
+    for item in _evidence_items(event):
+        observed = item.observed if isinstance(item.observed, dict) else {}
+        value = observed.get(key)
+        if value not in (None, "", [], {}) and not isinstance(value, bool):
+            return value
     return None
 
 
-def _timeline_summary(event: Event, evidence: EvidenceItem | None) -> str:
-    """사람이 읽는 한 줄 요약. action 으로 시작하고 Evidence Level 과 관찰 note 를 잇는다."""
-    parts = [event.action]
-    if evidence is not None:
-        parts.append(evidence.evidence_level)
-        if evidence.note:
-            parts.append(evidence.note)
-    if event.warnings:
-        parts.append("warnings=" + ",".join(event.warnings))
-    return " | ".join(redact_url_query(part)[0] for part in parts)  # note 에 URL 이 섞여도 인증 값을 남기지 않는다
+def _first_line(text: str) -> str:
+    """여러 줄 값의 첫 줄만. 자를 때는 자른 것을 "…" 로 알린다 (내용을 바꾸지 않는다)."""
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    return line if len(line) <= CSV_PROMPT_LINE_LIMIT else line[:CSV_PROMPT_LINE_LIMIT] + "…"
+
+
+def timeline_prompt_texts(result: ParseResult) -> dict[str, str]:
+    """
+    프롬프트 원문 첫 줄 찾아보기 표: message_id / record_id → 첫 줄.
+    **이미 복구된** 사용자 메시지(conversations[]) 와 입력창 초안(records[] 의 drafts[]) 에 있는 값만 모은다.
+    없는 대화 내용을 만들어 내지 않으며, 못 찾으면 Behavior_details 는 발견 근거만 적는다.
+    """
+    texts: dict[str, str] = {}
+    for conversation in result.conversations:
+        for message in conversation.messages:
+            if (message.role == "user" and message.message_id
+                    and isinstance(message.content, str) and message.content.strip()):
+                texts.setdefault(message.message_id, _first_line(message.content))
+    for record in result.records:
+        drafts = record.observed.get("drafts") if isinstance(record.observed, dict) else None
+        for draft in drafts or ():
+            content = draft.get("content") if isinstance(draft, dict) else None
+            if isinstance(content, str) and content.strip():
+                texts.setdefault(record.record_id, _first_line(content))
+                break
+    return texts
+
+
+def _behavior_core(event: Event, prompt_texts: dict[str, str]) -> str | None:
+    """Behavior_details 의 "_<핵심 내용>". 관찰된 값이 없으면 None (발견 근거만 남는다)."""
+    if event.action == "CACHE_DELETE":  # 삭제 대화상자의 선택 상태가 유일한 값이다 (시각은 없다)
+        selected = _observed_value(event, "clear_data")
+        return (f"{PREFERENCES_CLEAR_DATA_KEY}.cache=true"
+                if isinstance(selected, dict) and selected.get("cache") is True else None)
+    transition = CSV_BEHAVIOR_TRANSITIONS.get(event.action)
+    if transition is not None:
+        for item in _evidence_items(event):
+            observed = item.observed if isinstance(item.observed, dict) else {}
+            before, after = observed.get(transition[0]), observed.get(transition[1])
+            if before and after:
+                return f"{before} → {after}"
+    if event.action in ("PROMPT_SEND", "PROMPT_DRAFT"):  # 복구된 원문이 있으면 프롬프트 첫 줄
+        for item in _evidence_items(event):
+            observed = item.observed if isinstance(item.observed, dict) else {}
+            text = (prompt_texts.get(str(observed.get("message_id") or ""))
+                    or prompt_texts.get(item.record_id or ""))
+            if text:
+                return text
+    for key in tuple(CSV_BEHAVIOR_CORE_KEYS.get(event.action, ())) + CSV_BEHAVIOR_ID_KEYS:
+        value = _observed_value(event, key)
+        if value is not None:
+            return redact_url_query(str(value))[0]
+    return None
+
+
+def _behavior_details(event: Event, prompt_texts: dict[str, str]) -> str | None:
+    """"<발견 근거>_<핵심 내용>". 행위명을 정하지 않은 새 action 은 근거 문장을 만들어 내지 않는다."""
+    reason = CSV_BEHAVIOR_REASONS_BY_RULE.get(event.rule_id) or CSV_BEHAVIOR_REASONS.get(event.action)
+    if reason is None:
+        return None
+    core = _behavior_core(event, prompt_texts)
+    return f"{reason}_{core}" if core else reason
+
+
+def _artifact_fields(item: EvidenceItem) -> list[str]:
+    """한 Evidence 에서 최종 CSV 에 낼 관찰 값 (whitelist 밖 값과 내부 분석 정보는 내지 않는다)."""
+    observed = item.observed if isinstance(item.observed, dict) else {}
+    if item.artifact_type == "preferences":  # 삭제 대화상자 체크박스 상태를 그대로 펼친다
+        selected = observed.get("clear_data")
+        if isinstance(selected, dict) and selected:
+            names = (["cache"] if "cache" in selected else []) + sorted(n for n in selected if n != "cache")
+            return ([f"{PREFERENCES_CLEAR_DATA_KEY}.{names[0]}={str(bool(selected[names[0]])).lower()}"]
+                    + [f"{name}={str(bool(selected[name])).lower()}" for name in names[1:]])
+    fields = []
+    for key, label, unit in CSV_ARTIFACT_DETAIL_FIELDS.get(item.artifact_type, ()):
+        value = observed.get(key)
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        if key == "state":  # downloads.state 는 숫자다 — 이름을 붙여 읽을 수 있게 한다
+            value = CSV_DOWNLOAD_STATES.get(value, value)
+        if key in ("url", "current_path", "target_path"):
+            value = redact_url_query(str(value))[0]
+        fields.append(f"{label}={value}{unit}")
+    return fields
+
+
+def _artifact_segment(item: EvidenceItem) -> str:
+    """"[아티팩트명] 핵심 내용" 한 조각."""
+    fields = _artifact_fields(item)
+    if fields:
+        summary = ("다운로드 기록 확인" if item.artifact_type == "history" and "filename" in (item.observed or {})
+                   else CSV_ARTIFACT_SUMMARIES.get(item.artifact_type))
+        if summary:
+            fields.append(summary)
+    elif item.note:  # whitelist 에 없는 관찰이면 Evidence 가 남긴 설명을 그대로 쓴다 (내부 코드가 아니다)
+        fields = [redact_url_query(item.note)[0]]
+    else:
+        fields = [CSV_ARTIFACT_SUMMARIES.get(item.artifact_type, "기록 확인")]
+    return f"[{CSV_ARTIFACT_LABELS.get(item.artifact_type, item.artifact_type)}] " + ", ".join(fields)
+
+
+def _artifact_details(event: Event) -> str | None:
+    """Event 가 쓴 artifact 를 순서대로 "[이름] 내용 | [이름] 내용" 으로. 같은 문장은 한 번만."""
+    segments: list[str] = []
+    for item in _evidence_items(event):
+        segment = _artifact_segment(item)
+        if segment not in segments:
+            segments.append(segment)
+    return " | ".join(segments) if segments else None
 
 
 CSV_EMPTY_CELL = "-"  # 팀 공통: 시각·ID 등 값이 없는 셀은 빈칸 대신 "-"
@@ -169,33 +373,19 @@ def _fill_empty(row: dict[str, Any]) -> dict[str, Any]:
             for k, v in row.items()}
 
 
-def _timeline_row(event: Event) -> dict[str, Any]:
+def _timeline_row(event: Event, prompt_texts: dict[str, str] | None = None) -> dict[str, Any]:
     evidence = _timeline_evidence(event)
-    location = record_detail = None
+    location = None
     if evidence is not None:
         location = redact_url_query(csv_final_artifact_path(evidence.source_path, evidence.record_location))[0]
-        if evidence.record_location:
-            record_detail = redact_url_query(evidence.record_location)[0]
-    conversation_id = _timeline_conversation_id(event)
-    behavior = [_timeline_summary(event, evidence)]  # 무엇을 했는가
-    if event.action == "PROMPT_DRAFT":  # 초안 저장만 확인됨 — 전송은 미확인이라 Verdict 도 의심으로 고정
-        behavior.append("전송 미확인(입력창 초안 저장만)")
-    if conversation_id:
-        behavior.append(f"conversation_id={conversation_id}")
-    # 무엇을 근거로 판정했는가 — confidence·rule_id·artifact_type 은 최종 CSV 에서 이 칸에만 남는다.
-    details = [f"artifact_type={evidence.artifact_type}"] if evidence is not None else []
-    details += [f"confidence={event.confidence}", f"rule_id={event.rule_id}",
-                f"rule_verification={event.rule_verification}"]
-    if record_detail:  # entry / stream / block / offset / carving 등 record 상세는 경로가 아니라 이 칸에 둔다
-        details.append(f"record={record_detail}")
     return _fill_empty({
         "Model": CSV_FINAL_MODEL,
-        "Timestamp": csv_final_timestamp(event.timestamp_kst),  # 없으면 빈 cell — 시각을 만들어 내지 않는다
+        "Timestamp": csv_final_timestamp(event.timestamp_kst),  # 없으면 "-" — 시각을 만들어 내지 않는다
         "User_behavior": CSV_USER_BEHAVIOR_LABELS.get(event.action, event.action),
-        "Behavior_details ": " | ".join(behavior),
+        "Behavior_details ": _behavior_details(event, prompt_texts or {}),
         "Verdict": "의심" if event.action == "PROMPT_DRAFT" else CSV_VERDICT_LABELS.get(event.action_status, event.action_status),
         "Artifact_path": location,
-        "Artifact_details ": " | ".join(details),
+        "Artifact_details ": _artifact_details(event),
     })
 
 

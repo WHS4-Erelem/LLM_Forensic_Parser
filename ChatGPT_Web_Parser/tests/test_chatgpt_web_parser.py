@@ -2315,8 +2315,8 @@ class AccountIdentitySwitchTest(unittest.TestCase):
         row = _final_csv._timeline_row(p.detect_account_switch(records)[0])
         self.assertEqual(list(row), list(p.CSV_TIMELINE_COLUMNS))
         self.assertEqual(row["User_behavior"], "계정 전환")  # 팀 분류 체계 이름 (2026-09-23 행위명 통일)
-        self.assertTrue(row["Behavior_details "].startswith("ACCOUNT_SWITCH | SUPPORTING | "))
-        self.assertIn("aaaa1111 → bbbb2222", row["Behavior_details "])
+        # 최종 CSV 는 "<발견 근거>_<핵심 내용>" 만 낸다 (action·evidence_level 같은 내부 표현은 events.csv 에 남는다).
+        self.assertEqual(row["Behavior_details "], "재인증/계정 전환 흔적_aaaa1111 → bbbb2222")
 
     def test_single_artifact_change_without_chain_makes_no_event(self):
         # 계정 식별자 하나만 바뀌고 인증 체인이 없으면 ACCOUNT_SWITCH 를 만들지 않는다.
@@ -6299,18 +6299,16 @@ class FinalCsvExportTest(unittest.TestCase):
         header, rows = self.read_csv("timeline.csv")
         self.assertEqual({dict(zip(header, row))["Model"] for row in rows}, {"chatgpt-web"})
 
-    def test_timeline_keeps_rule_id_status_and_kst_timestamp(self):
+    def test_timeline_keeps_event_order_status_and_kst_timestamp(self):
+        """행은 Event 순서를 그대로 따르고 시각·판정은 Event 값 그대로다 (rule_id 는 최종 CSV 에 내지 않는다)."""
         result = make_result()
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        by_rule = {}
-        for row in rows:
-            cells = dict(zip(header, row))
-            by_rule[cells["Artifact_details "].split("rule_id=")[1].split(" | ")[0]] = cells
-        for event in result.events:
-            row = by_rule[event.rule_id]
+        events = [event for event in result.events if event.action not in p.CSV_NON_TEAM_ACTIONS]
+        self.assertEqual(len(rows), len(events))
+        for event, row in zip(events, [dict(zip(header, row)) for row in rows]):
             self.assertEqual(row["Timestamp"], p.csv_final_timestamp(event.timestamp_kst) or p.CSV_EMPTY_CELL)
-            self.assertIn(f"confidence={event.confidence}", row["Artifact_details "])  # 내부 상세는 이 칸에 남는다
+            self.assertEqual(row["Verdict"], p.CSV_VERDICT_LABELS[event.action_status])
             if event.timestamp_kst:
                 self.assertIn("KST", row["Timestamp"])  # 시각이 있는 행만 팀 표기를 갖는다 (없으면 "-")
 
@@ -6369,12 +6367,13 @@ class FinalCsvExportTest(unittest.TestCase):
         event = result.events[0]
         evidence = event.primary_evidence[0]
         self.assertIn(evidence.source_path, row["Artifact_path"])
-        if evidence.record_location:  # record 상세는 경로가 아니라 Artifact_details 칸에 둔다
+        if evidence.record_location:  # record 상세는 경로에 붙이지 않는다 (records.csv / JSON 에 그대로 남는다)
             self.assertNotIn(evidence.record_location, row["Artifact_path"])
-            self.assertIn(f"record={evidence.record_location}", row["Artifact_details "])
         self.assertNotIn("#", row["Artifact_path"])
-        self.assertIn(evidence.evidence_level, row["Behavior_details "])
-        self.assertIn(f"artifact_type={evidence.artifact_type}", row["Artifact_details "])
+        # 최종 CSV 두 칸에는 내부 표현을 내지 않는다 — 아티팩트는 사람이 읽는 이름으로만 적는다
+        self.assertNotIn(evidence.evidence_level, row["Behavior_details "])
+        self.assertNotIn(f"artifact_type={evidence.artifact_type}", row["Artifact_details "])
+        self.assertTrue(row["Artifact_details "].startswith("[History] "), row["Artifact_details "])
         # 두 칸의 역할이 다르다 - 같은 문장을 그대로 복제하지 않는다
         self.assertNotEqual(row["Behavior_details "], row["Artifact_details "])
 
@@ -6385,7 +6384,9 @@ class FinalCsvExportTest(unittest.TestCase):
         result.events = [event]
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        self.assertNotIn("conversation_id=", dict(zip(header, rows[0]))["Behavior_details "])
+        # 대화 ID 를 관찰하지 못했으면 그 자리에 다른 값을 채우지 않는다 (URL 근거만 남는다)
+        self.assertEqual(dict(zip(header, rows[0]))["Behavior_details "],
+                         "로그아웃 URL 방문_https://chatgpt.com/auth/logout")
 
     def test_timeline_conversation_id_comes_from_observed_evidence(self):
         event = make_event()
@@ -6394,12 +6395,13 @@ class FinalCsvExportTest(unittest.TestCase):
         result.events = [event]
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        self.assertIn("conversation_id=conv-xyz", dict(zip(header, rows[0]))["Behavior_details "])
+        self.assertEqual(dict(zip(header, rows[0]))["Behavior_details "], "로그아웃 URL 방문_conv-xyz")
 
     def test_timeline_redacts_auth_query_values(self):
         event = make_event()
-        event.primary_evidence[0].note = ("https://chatgpt.com/auth/callback"
-                                          "?code=SECRETAUTHCODE&state=SECRETSTATE&access_token=SECRETTOKEN")
+        event.primary_evidence[0].observed = {"url": ("https://chatgpt.com/auth/callback"
+                                                      "?code=SECRETAUTHCODE&state=SECRETSTATE"
+                                                      "&access_token=SECRETTOKEN")}
         event.primary_evidence[0].record_location = "urls.id=1"
         result = make_result()
         result.events = [event]
@@ -6639,6 +6641,188 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
         """같은 파일 계열이라도 '파일 다운로드' 는 팀 목록에 있어 그대로 남는다 (제외가 번지지 않는다)."""
         self.assertEqual(self.behaviors_for(["FILE_UPLOAD", "FILE_DOWNLOAD", "FILE_UPLOAD_DELETE"]),
                          ["파일 다운로드"])
+
+    def test_every_shipped_detector_action_has_a_team_label(self):
+        """배포된 Rule 이 만드는 action 은 모두 라벨 표에 있어야 한다.
+
+        라벨이 없으면 내부 코드가 최종 CSV 로 그대로 나간다 (위 test 가 보장하는 '조용히 사라지지 않음' 의
+        대가다). 이 test 가 있으면 그 상황이 배포까지 가지 않는다 — 새 Rule 을 추가하는 시점에 막힌다.
+        """
+        source = Path(_final_csv.__file__).resolve().parent.parent / "detectors"
+        actions = {match for path in sorted(source.glob("*.py"))
+                   for match in re.findall(r'action="([A-Z_]+)"', path.read_text(encoding="utf-8"))}
+        self.assertTrue(actions, f"detector action 을 찾지 못했다: {source}")
+        self.assertEqual(sorted(actions - set(_final_csv.CSV_USER_BEHAVIOR_LABELS)), [])
+        self.assertEqual(sorted(actions - set(_final_csv.CSV_BEHAVIOR_REASONS)), [])
+
+
+# --- 최종 CSV 는 사람이 읽는 표현만 낸다 (2026-10-01 팀 출력 통일 요구) --------------------------
+# Behavior_details = "<발견 근거>_<핵심 내용>", Artifact_details = "[아티팩트명] 핵심 내용".
+# 내부 표현(action · evidence_level · rule_id · confidence · rule_verification · signal)은 최종 CSV 에서만
+# 빠지고 events.csv / records.csv / result.json 에는 그대로 남는다 (forensic 근거를 지우는 변경이 아니다).
+
+class FinalCsvHumanReadableTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="csv-readable-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+
+    def rows(self, result, debug=False, name="timeline.csv"):
+        self.out = self.dir / uuid.uuid4().hex  # write_result_csv 는 기존 출력을 덮어쓰지 않는다 — 호출마다 새 폴더
+        p.write_result_csv(result, self.out, debug=debug)
+        with open(self.out / name, encoding="utf-8-sig", newline="") as handle:
+            table = list(csv.reader(handle))
+        return [dict(zip(table[0], row)) for row in table[1:]]
+
+    def row_for(self, event, records=(), conversations=()):
+        result = make_result()
+        result.events = [event]
+        result.records = list(records) or result.records
+        result.conversations = list(conversations)
+        row, = self.rows(result)
+        return row
+
+    # A. User_behavior 는 팀 목록 밖 값을 내지 않는다
+    def test_user_behavior_stays_inside_the_team_list(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        outside = {row["User_behavior"] for row in self.rows(result)} - _final_csv.CSV_TEAM_USER_BEHAVIORS
+        self.assertEqual(sorted(outside), [])
+
+    # B. 전송 미확인 prompt — 새 행위명을 만들지 않고 '전송 미확인' 을 근거 칸에 적는다
+    def test_unsent_prompt_keeps_the_team_behavior_name_and_says_unconfirmed(self):
+        draft = make_record(record_id="ls-draft", artifact_type="local_storage",
+                            observed={"drafts": [{"draft_id": "null_thread", "content": "합성 초안 질문입니다\n둘째 줄"}]})
+        event = make_event(action="PROMPT_DRAFT", action_status="DETECTED",
+                           primary_evidence=[make_evidence(record_id="ls-draft", artifact_type="local_storage",
+                                                           source_path="Default/Local Storage/leveldb",
+                                                           record_location="conversationDrafts",
+                                                           observed={"sequence": 2})],
+                           supporting_evidence=[])
+        row = self.row_for(event, records=[draft])
+        self.assertEqual(row["User_behavior"], "사용자 프롬프트 입력/전송")  # 초안 전용 행위명을 만들지 않는다
+        self.assertEqual(row["Behavior_details "], "프롬프트 작성 흔적(전송 미확인)_합성 초안 질문입니다")
+        self.assertIn("전송 미확인", row["Behavior_details "])
+        self.assertEqual(row["Verdict"], "의심")  # 전송이 확인되지 않았으므로 확정이 아니다
+
+    def test_sent_prompt_shows_the_recovered_first_line(self):
+        message = make_message(0, message_id="msg-user-1", content="첫 줄 질문\n두 번째 줄")
+        conversation = make_conversation(messages=[message])
+        event = make_event(action="PROMPT_SEND", primary_evidence=[
+            make_evidence(artifact_type="cache", source_path=CACHE_PATH, record_location="entry=1",
+                          observed={"message_id": "msg-user-1", "role": "user"})], supporting_evidence=[])
+        row = self.row_for(event, conversations=[conversation])
+        self.assertEqual(row["Behavior_details "], "사용자 메시지 전송_첫 줄 질문")
+
+    def test_login_from_the_session_list_does_not_claim_a_url_visit(self):
+        """같은 '로그인' 이라도 근거가 다르면 문장이 다르다 — URL 방문을 관찰하지 않았으면 그렇게 쓰지 않는다."""
+        event = make_event(action="LOGIN", rule_id="CHATGPT_ACCOUNT_SESSION_001",
+                           primary_evidence=[make_evidence(artifact_type="local_storage",
+                                                           source_path="Default/Local Storage/leveldb",
+                                                           record_location="seq=390",
+                                                           observed={"key_kind": "account_switch_sessions",
+                                                                     "session_count": 1})],
+                           supporting_evidence=[])
+        self.assertEqual(self.row_for(event)["Behavior_details "], "세션 목록의 최근 로그인 기록")
+        url_event = make_event(action="LOGIN", rule_id="CHATGPT_LOGIN_001", supporting_evidence=[])
+        self.assertEqual(self.row_for(url_event)["Behavior_details "],
+                         "로그인 URL 방문 흔적_https://chatgpt.com/auth/logout")
+
+    def test_prompt_without_recovered_text_shows_only_the_reason(self):
+        """복구된 원문이 없으면 근거만 적는다 — 없는 프롬프트 내용을 만들어 내지 않는다."""
+        event = make_event(action="PROMPT_SEND", primary_evidence=[
+            make_evidence(artifact_type="cache", source_path=CACHE_PATH, record_location="entry=1",
+                          observed={"role": "user"})], supporting_evidence=[])
+        self.assertEqual(self.row_for(event)["Behavior_details "], "사용자 메시지 전송")
+
+    # C. Behavior_details 에 내부 token 이 없다
+    INTERNAL_TOKENS = ("DIRECT", "SUPPORTING", "INFERRED", "rule_id", "confidence", "rule_verification",
+                       "evidence_level", "signal_count", "Evidence Family", "Rule=")
+
+    def test_behavior_details_has_no_internal_tokens(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        for row in self.rows(result):
+            for token in self.INTERNAL_TOKENS:
+                self.assertNotIn(token, row["Behavior_details "])
+
+    def test_behavior_details_does_not_start_with_the_internal_action_code(self):
+        for action in sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) - _final_csv.CSV_NON_TEAM_ACTIONS):
+            with self.subTest(action=action):
+                row = self.row_for(make_event(action=action))
+                self.assertNotIn(action, row["Behavior_details "])
+                self.assertNotIn(action, row["Artifact_details "])
+
+    # D·E. Artifact_details 는 "[아티팩트명] 핵심 내용" 이고 내부 표현이 없다
+    def test_artifact_details_uses_human_artifact_names(self):
+        cases = {
+            "history": "[History] ", "cache": "[Cache] ", "local_storage": "[Local Storage] ",
+            "session_storage": "[Session Storage] ", "sessions": "[Sessions] ", "preferences": "[Preferences] ",
+        }
+        for artifact_type, prefix in cases.items():
+            with self.subTest(artifact_type=artifact_type):
+                event = make_event(primary_evidence=[make_evidence(artifact_type=artifact_type)],
+                                   supporting_evidence=[])
+                self.assertTrue(self.row_for(event)["Artifact_details "].startswith(prefix),
+                                self.row_for(event)["Artifact_details "])
+
+    def test_artifact_details_joins_multiple_artifacts_with_a_bar(self):
+        row = self.row_for(make_event())  # 기본 Event 는 History + Local Storage 를 쓴다
+        self.assertEqual([segment.split("]")[0] + "]" for segment in row["Artifact_details "].split(" | ")],
+                         ["[History]", "[Local Storage]"])
+
+    def test_artifact_details_has_no_internal_tokens(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        for row in self.rows(result):
+            for token in ("rule_id=", "confidence=", "rule_verification=", "evidence_level=", "signal_count=",
+                          "Evidence Family=", "Rule=", "artifact_type=", "record="):
+                self.assertNotIn(token, row["Artifact_details "])
+
+    # F. CACHE_DELETE — 탐지 로직은 그대로고 표현만 사람이 읽는 형태다
+    def test_cache_delete_row_is_human_readable(self):
+        preferences = make_record(record_id="pf1", artifact_type="preferences", source_path="Default/Preferences",
+                                  record_location="browser.clear_data", timestamp_raw=None, timestamp_utc=None,
+                                  timestamp_kst=None, timestamp_type="unknown", timestamp_source=None,
+                                  observed={"key": "browser.clear_data", "key_kind": "clear_browsing_data_selection",
+                                            "clear_data": {"browsing_history": False, "cache": True,
+                                                           "cookies": False, "download_history": False}})
+        records = [ls_record("conversation_history",
+                             {"conversation_items": [{"id": NEW_RULE_CONV_ID, "title": "합성"}]}, record_id="l1"),
+                   preferences]
+        coverage = p.Coverage(artifact_type="cache", browser_profile="Default", source_path="Default/Cache",
+                              status="PARSED", record_count=0)
+        event, = p.detect_cache_delete(records, [coverage])
+        result = make_result()
+        result.events, result.records = [event], records
+        row, = self.rows(result)
+        self.assertEqual(row["User_behavior"], "캐시 삭제")
+        self.assertEqual(row["Behavior_details "], "캐시 삭제 설정 흔적_browser.clear_data.cache=true")
+        self.assertTrue(row["Artifact_details "].startswith("[Preferences] browser.clear_data.cache=true"),
+                        row["Artifact_details "])
+        self.assertEqual(row["Timestamp"], p.CSV_EMPTY_CELL)  # Preferences mtime 을 삭제 시각으로 쓰지 않는다
+        self.assertEqual(row["Verdict"], "의심")
+
+    # G. 최종 CSV 만 정리되고 내부 근거는 그대로 남는다
+    def test_internal_evidence_survives_in_json_and_debug_csv(self):
+        result = make_result()
+        event = result.events[0]
+        self.rows(result, debug=True)
+        with open(self.out / "events.csv", encoding="utf-8-sig", newline="") as handle:
+            table = list(csv.reader(handle))
+        event_row = dict(zip(table[0], table[1]))
+        self.assertEqual(event_row["rule_id"], event.rule_id)
+        self.assertEqual(event_row["confidence"], event.confidence)
+        self.assertEqual(event_row["rule_verification"], event.rule_verification)
+        self.assertEqual(event_row["action"], event.action)  # 내부 action 코드는 debug CSV 에 그대로
+        exported = json.dumps(result.to_dict(), ensure_ascii=False)
+        for kept in (event.rule_id, event.confidence, event.action, "evidence_level",
+                     "primary_evidence", "supporting_evidence", "DIRECT", "SUPPORTING"):
+            self.assertIn(kept, exported)
+        self.assertEqual([item.evidence_level for item in event.primary_evidence], ["DIRECT"])
+        self.assertEqual([item.evidence_level for item in event.supporting_evidence], ["SUPPORTING"])
 
 
 # --- 행위 Rule 9종 (PROMPT_SEND · FILE_UPLOAD_DELETE · SHARE_LINK · MODEL_CHANGE · ACCOUNT_NAME_CHANGE ·
