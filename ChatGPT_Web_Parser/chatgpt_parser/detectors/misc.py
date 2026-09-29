@@ -19,6 +19,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ..artifacts.cache import REASON_DIRECT_URL, REASON_TIMESTAMP_EXPLAINED, REASON_TIMESTAMP_MISSING
 from ..artifacts.history import redact_url_query
+from ..artifacts.preferences import PREFERENCES_CLEAR_DATA_KEY, PREFERENCES_CLEAR_DATA_KIND
 from ..artifacts.session_storage import SESSION_STORAGE_ORIGIN
 from ..detectors.common import CHATGPT_HOST, DATA_EXPORT_REQUEST_RULE_ID, REASON_EMBEDDED_TIMESTAMP, REASON_HEURISTIC_RULE, REASON_MULTIPLE_SUPPORTING_SIGNALS, REASON_NOT_UNIQUE_TO_ACTION, REASON_RULE_PARTIALLY_VERIFIED, REASON_SUPPORTING_CORRELATED, REASON_TIMESTAMP_APPROXIMATED, _HEURISTIC_COMMON_LIMITATIONS, _cache_conversation_nodes, _candidate_event, _conversation_id_of, _merged_warnings, _message_sort_key, _session_evidence
 from ..models import Event, EvidenceItem
@@ -529,71 +530,95 @@ def detect_history_delete(records: list[ArtifactRecord],
 
 
 # ---- 8.25 CHATGPT_CACHE_DELETE_001 ------------------------------------------
-# 브라우저 캐시 삭제 고유의 흔적은 없다. 단일 수집본에서 볼 수 있는 것은 "있어야 할 캐시가 없다" 뿐이라
-# 독립 신호 2개 이상이 겹칠 때만 CANDIDATE / LOW 로 남긴다. 정상 eviction 과 구분하지 못한다.
-#   S1 (필수) Cache Coverage 는 PARSED 인데 ChatGPT 대화 응답 Record 가 0건 — 캐시는 읽혔지만 대상 entry 가 없음
-#   S2 같은 Profile 의 대화 목록에 대화 ID 가 남아 있음 (캐시될 대상이 있었음)
-#   S3 같은 Profile 의 History·Sessions 에 ChatGPT 대화 화면 방문이 남아 있음
+# 브라우저 캐시 삭제 고유의 흔적은 없다. 단일 수집본에서 삭제를 가리킬 수 있는 관찰값은 "삭제 대화상자에 캐시가
+# 선택돼 있다" (P1) 하나뿐이고, 그것도 선택 상태일 수 있어 ChatGPT 맥락 신호 (S2 / S3) 가 1개 이상 함께 있을 때만
+# CANDIDATE / LOW 로 남긴다. 판정식은 P1 AND (S2 OR S3) 다. 정상 eviction 과 구분하지 못한다.
+#   P1 (삭제) Preferences 의 browser.clear_data.cache = true — 삭제 대화상자에서 캐시가 선택된 상태
+#   S2 (맥락) 같은 Profile 의 대화 목록에 대화 ID 가 남아 있음 (캐시될 대상이 있었음)
+#   S3 (맥락) 같은 Profile 의 History·Sessions 에 ChatGPT 대화 화면 방문이 남아 있음
+# "ChatGPT 대화 응답 Record 가 0건" 은 이 Rule 에서 어떤 방향으로도 쓰지 않는다 — 필수 조건도, 대체 양성 신호도,
+#   primary / supporting evidence 도, confidence 상향 요소도 아니다. 0건은 원래 캐시되지 않았거나 eviction ·
+#   수집 범위 차이 · 미지원 endpoint 로도 생기는 값이고 (artifact 의 부재는 행위의 증거가 아니다), 과거 Negative
+#   False Positive 의 원인이었다. 반대로 2026-09-30 E10-04 (캐시 삭제 PRE / POST) 에서는 캐시를 삭제해도
+#   blockfile 안의 대화 응답 entry 가 그대로 남았다 (POST 의 conversation_response Record 1건) — 0건 조건을
+#   요구하면 실제 삭제를 놓친다 (False Negative). 그래서 양쪽 모두 판정에서 제외한다.
+# S2 / S3 는 ChatGPT 맥락이 있었다는 보조 신호일 뿐이고 그 자체는 삭제의 근거가 아니다 (둘만으로는 Event 를 만들지 않는다).
 # Cache 자체가 없으면(NOT_PRESENT) Event 를 만들지 않는다 — '미존재'는 '삭제'가 아니다.
 
 CACHE_DELETE_RULE_ID = "CHATGPT_CACHE_DELETE_001"
-REASON_CACHE_PARSED_WITHOUT_ENTRIES = "CACHE_PARSED_WITHOUT_ENTRIES"
+REASON_CLEAR_DATA_CACHE_SELECTED = "CLEAR_DATA_CACHE_SELECTED"
 REASON_CONVERSATION_LIST_PRESENT = "CONVERSATION_LIST_PRESENT"
 REASON_CONVERSATION_VISIT_PRESENT = "CONVERSATION_VISIT_PRESENT"
 _CACHE_DELETE_INFERENCE = (
-    "캐시는 읽혔는데 ChatGPT 대화 응답 entry 가 하나도 없고, 대화 목록·방문 기록은 남아 있음 → "
-    "캐시가 지워졌을 가능성이 있는 것으로만 관찰한다 (삭제 시각·범위·수행자는 추론하지 않음)"
+    "Chrome 삭제 대화상자에 캐시가 선택된 상태이고 같은 Profile 에 ChatGPT 대화 목록·방문 기록이 남아 있음 "
+    "→ 캐시가 지워졌을 가능성이 있는 것으로만 관찰한다 "
+    "(삭제 실행 여부·시각·범위·수행자는 추론하지 않음)"
 )
 _CACHE_DELETE_LIMITATIONS = (
     "캐시 삭제에 고유한 흔적은 없다. 정상 eviction(용량 회수)·캐시 미보존과 구분하지 못한다",
     "브라우저 전체 캐시 삭제일 수 있으며 ChatGPT 전용 행위가 아니다",
+    f"{PREFERENCES_CLEAR_DATA_KEY}.cache=true 는 Chrome 삭제 대화상자에서 캐시가 선택된 상태를 나타내는 값일 수 있다 — "
+    "선택만 하고 삭제하지 않은 경우와 구분하지 못하므로 그 자체로 삭제 실행을 증명하지 않는다",
+    f"{PREFERENCES_CLEAR_DATA_KEY} 에는 삭제 시각 필드가 없다. Preferences 파일 수정 시각은 다른 설정 변경으로도 "
+    "갱신되므로 실제 삭제 시각으로 쓰지 않는다",
     "삭제 시각의 근거가 없어 Event 시각을 만들지 않는다 (시각 없음)",
+    "대화 응답 entry 가 0건인 것은 이 Rule 의 판정·evidence·confidence 에 사용하지 않는다 "
+    "(원래 캐시되지 않음·eviction·수집 범위 차이로도 0건이 된다). 반대로 entry 가 남아 있어도 캐시 삭제일 수 있다 "
+    "(E10-04: 외부 파일만 사라지고 blockfile entry 는 남았다)",
+    "대화 목록·방문 기록 (S2 / S3) 은 ChatGPT 맥락이 있었다는 보조 신호일 뿐 삭제의 근거가 아니다",
     "Cache 파일 자체가 없는 경우(NOT_PRESENT)는 이 Rule 의 대상이 아니다 ('미존재'는 '삭제'가 아니다)",
-    "NTFS $UsnJrnl 등 파일 시스템 레벨 삭제 근거는 현재 Reader 범위 밖이라 결합하지 않는다",
+    "NTFS $UsnJrnl($J) · $MFT 등 파일 시스템 레벨의 실제 파일 삭제 근거는 현재 Reader 범위 밖이라 결합하지 않는다",
 )
 
 
 def detect_cache_delete(records: list[ArtifactRecord],
                         coverages: list[Coverage] | tuple[Coverage, ...] = ()) -> list[Event]:
-    """캐시는 읽혔지만 ChatGPT 대화 응답 entry 가 없고 다른 흔적은 남은 경우 → CACHE_DELETE (CANDIDATE / LOW)."""
+    """Preferences 의 캐시 선택 (P1) 과 ChatGPT 맥락 (S2 / S3) 이 겹치면 → CACHE_DELETE (CANDIDATE / LOW)."""
+    sha_by_source = {c.source_path: c.source_sha256 for c in coverages}
     events: list[Event] = []
     for coverage in sorted([c for c in coverages if c.artifact_type == "cache" and c.status == "PARSED"],
                            key=lambda c: c.source_path):
         profile_key = (coverage.os_user, coverage.browser_profile)
         group = [r for r in records if (r.os_user, r.browser_profile) == profile_key]
-        if any(r.artifact_type == "cache" and r.observed.get("cache_key_kind") == "conversation_response"
-               for r in group):
-            continue  # S1 불성립 — 대화 응답 entry 가 남아 있다
+        clear_data_records = [r for r in group if r.artifact_type == "preferences"
+                              and r.observed.get("key_kind") == PREFERENCES_CLEAR_DATA_KIND
+                              and (r.observed.get("clear_data") or {}).get("cache") is True]
         conversation_records = [r for r in group if r.artifact_type == "local_storage"
                                 and r.observed.get("key_kind") == "conversation_history"
                                 and (r.observed.get("conversation_items") or [])]
         visit_records = [r for r in group if r.artifact_type in ("history", "sessions")
                          and isinstance(r.observed.get("url"), str) and "/c/" in r.observed["url"]]
-        signals = [(REASON_CACHE_PARSED_WITHOUT_ENTRIES, "Cache 는 읽혔지만 ChatGPT 대화 응답 entry 가 0건", None)]
+
+        if not clear_data_records:
+            continue  # P1 이 없으면 판정하지 않는다 (대화 응답 entry 0건은 신호로 쓰지 않는다)
+        deletion = [(REASON_CLEAR_DATA_CACHE_SELECTED,
+                     f"Preferences 의 {PREFERENCES_CLEAR_DATA_KEY}.cache=true "
+                     "(삭제 대화상자에서 캐시가 선택된 상태)", clear_data_records[0])]
+        # ChatGPT 맥락 신호 (삭제의 근거가 아니라 캐시될 대상이 있었다는 보조 신호)
+        context: list[tuple[str, str, ArtifactRecord]] = []
         if conversation_records:
-            signals.append((REASON_CONVERSATION_LIST_PRESENT,
+            context.append((REASON_CONVERSATION_LIST_PRESENT,
                             f"같은 Profile 의 대화 목록 Record {len(conversation_records)}건이 남아 있음",
                             conversation_records[0]))
         if visit_records:
-            signals.append((REASON_CONVERSATION_VISIT_PRESENT,
+            context.append((REASON_CONVERSATION_VISIT_PRESENT,
                             f"같은 Profile 에 ChatGPT 대화 화면 방문 Record {len(visit_records)}건이 남아 있음",
                             visit_records[0]))
-        if len(signals) < 2:
-            continue
+        if not context:
+            continue  # 삭제 신호만으로는 (맥락 없이는) 판정하지 않는다
 
-        anchor = signals[1][2]
-        primary = EvidenceItem(
-            evidence_id=f"evidence:{CACHE_DELETE_RULE_ID}:{coverage.source_path}",
-            record_id=None, evidence_level="INFERRED", artifact_type="cache", source_path=coverage.source_path,
-            record_location=None, source_sha256=coverage.source_sha256,
-            observed={"signal": signals[0][0], "signal_count": len(signals),
-                      "cache_coverage_status": coverage.status, "conversation_response_record_count": 0},
-            note=signals[0][1])
-        supporting = []
-        for reason, text, record in signals[1:]:
-            item = _session_evidence(record, "INFERRED", None, text, CACHE_DELETE_RULE_ID)
+        def evidence_item(reason: str, note: str, record: ArtifactRecord) -> EvidenceItem:
+            item = _session_evidence(record, "INFERRED", sha_by_source.get(record.source_path), note,
+                                     CACHE_DELETE_RULE_ID)
             item.observed = {"signal": reason, "artifact_type": record.artifact_type}
-            supporting.append(item)
+            if reason == REASON_CLEAR_DATA_CACHE_SELECTED:  # 선택 상태 전체 (cache 외 항목도 그대로 보인다)
+                item.observed["clear_data"] = copy.deepcopy(record.observed.get("clear_data"))
+            return item
+
+        signals = deletion + context
+        items = [evidence_item(*signal) for signal in signals]
+        primary, supporting = items[0], items[1:]
+        primary.observed["signal_count"] = len(signals)
         reasons = [reason for reason, _, _ in signals] + [REASON_MULTIPLE_SUPPORTING_SIGNALS,
                                                           REASON_NOT_UNIQUE_TO_ACTION, REASON_TIMESTAMP_MISSING]
         events.append(Event(

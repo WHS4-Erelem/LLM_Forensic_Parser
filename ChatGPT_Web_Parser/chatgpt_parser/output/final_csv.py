@@ -23,9 +23,10 @@ from ..discovery import _join_source_path
 
 # --- 12-2. 최종 사용자용 CSV 2종 ---------------------------------------------
 # 개발·검증용 CSV 5종 (위) 은 그대로 두고, 사람이 바로 읽는 최종 출력 2개를 같은 ParseResult 에서 파생한다.
-#   timeline.csv                → "사용자가 언제 무엇을 했는가"  (Event 1건 = 1 row, 시각순)
+#   timeline.csv                → "사용자가 언제 무엇을 했는가"  (팀 행위 분류 체계에 있는 Event 1건 = 1 row, 시각순)
 #   recovered_conversations.csv → "사용자가 LLM 과 어떤 대화를 했는가" (복구된 메시지 1건 = 1 row)
-# 새 판정을 만들지 않는다. Event 수·메시지 수와 행 수가 정확히 일치하고, 복구되지 않은 내용을 채우지 않는다.
+# 새 판정을 만들지 않고, 복구되지 않은 내용을 채우지 않는다. 메시지 수와 행 수는 정확히 일치한다.
+# timeline.csv 행 수는 Event 수와 다를 수 있다 — CSV_NON_TEAM_ACTIONS 는 최종 행을 만들지 않는다 (아래 참조).
 # 시각은 KST(+09:00) 표기이며 원본 raw·UTC 는 events.csv / JSON 에 그대로 남아 있다.
 
 # 컬럼 이름·순서는 팀 공통 CSV 형식에 맞춘다. "Behavior_details " / "Artifact_details " / "message order" 의
@@ -52,7 +53,7 @@ CSV_USER_BEHAVIOR_LABELS = {
     "CONVERSATION_ACCESS": "대화 열람",
     "CONVERSATION_RETRY": "대화 재시도",
     "CONVERSATION_REMOVED_FROM_LIST": "대화 목록에서 사라짐",
-    "CONVERSATION_DELETE": "대화 삭제",
+    "CONVERSATION_DELETE": "기존 대화 삭제",  # 팀 분류 체계의 이름 (Rule 이 보는 것은 개별 대화 1건의 삭제다)
     "PROMPT_DRAFT": "사용자 프롬프트 입력/전송",  # 팀 행위 분류 체계: 초안은 별도 행위가 아니라 전송 미확인(의심) 으로 표기 (2026-09-23)
     "PROMPT_SEND": "사용자 프롬프트 입력/전송",
     "FILE_UPLOAD": "파일 업로드",
@@ -67,6 +68,35 @@ CSV_USER_BEHAVIOR_LABELS = {
     "HISTORY_DELETE": "방문기록 삭제",
     "CACHE_DELETE": "캐시 삭제",
 }
+# 팀 공통 행위 분류 체계 (integration/user_behaviors.txt, 2026-09-30 기준) 의 사본.
+# 파서 6개는 통합기와 서로에게 독립이라 그 파일을 읽지 않는다 (경로가 없는 배포에서도 같게 동작해야 한다).
+# 목록이 바뀌면 여기만 고친다. 사본이 원본과 같은지는 test 가 원본 파일과 대조해서 지킨다.
+CSV_TEAM_USER_BEHAVIORS = frozenset({
+    "로그인", "로그아웃", "계정 전환", "계정 이름 변경",
+    "애플리케이션 설치", "애플리케이션 실행", "애플리케이션 삭제", "정상 종료", "강제 종료",
+    "새로운 대화 생성", "기존 대화 삭제", "대화 수정", "대화 재시도", "대화 공유", "공유 링크 생성",
+    "대화 데이터 Export", "사용자 프롬프트 입력/전송", "사용자 프롬프트 삭제", "임시 채팅 사용",
+    "이미지 업로드", "이미지 업로드 삭제", "문서 업로드", "문서 업로드 삭제", "문서 다운로드", "파일 다운로드",
+    "이미지 생성 요청", "생성 이미지 다운로드", "생성 이미지 다운로드 삭제",
+    "모델 변경", "모델 다운로드 내역",
+    "서비스 접속", "브라우저 시크릿 모드", "방문기록 삭제", "캐시 삭제",
+})
+# 팀 회의(2026-09-23) 확정: 공유 분석표(「시나리오 이미지 행위 시각」의 사용자 행위 열, = integration/user_behaviors.txt)
+# 에 있는 행위만 최종 timeline.csv 의 User_behavior 로 낸다. 목록 밖 행위는 **탐지를 멈추지 않는다** —
+# Rule·Evidence·Coverage·debug CSV(events.csv)·result.json 에는 그대로 남고, 최종 timeline.csv 행만 만들지 않는다.
+# ("탐지하지 않는다" 와 "최종 User_behavior 로 내지 않는다" 는 다르다. 판정 근거는 지우지 않는다.)
+#
+# 제외 대상을 이름마다 손으로 적지 않고 팀 목록과 대조해서 만든다 — 목록 밖 이름이 새로 생겨도
+# 통합기의 UNKNOWN_USER_BEHAVIOR 로 새지 않는다. (2026-09-30: FILE_UPLOAD "파일 업로드" 가 그 경우였다.)
+#   CONVERSATION_ACCESS            대화 열람 — 회의에서 개별 삭제 확정 ("무려 29개나, 얘도 그냥 지우는 걸로")
+#   PROFILE_ACCESS                 프로필 화면 접근 — 분석표에 없는 파서 고유 행위
+#   CONVERSATION_REMOVED_FROM_LIST 대화 목록에서 사라짐 — 기존 대화 삭제 판정의 보조 근거로만 남긴다
+#   FILE_UPLOAD / FILE_UPLOAD_DELETE  분석표는 종류별(이미지/문서)로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
+# label 이 아예 없는 action 은 여기 들어오지 않는다. 내부 코드가 그대로 출력되어 통합기가 시끄럽게 알리는 쪽이
+# 조용히 사라지는 것보다 안전하다 (새 Rule 을 추가하고 이름을 정하지 않은 경우).
+CSV_NON_TEAM_ACTIONS = frozenset(action for action, label in CSV_USER_BEHAVIOR_LABELS.items()
+                                 if label not in CSV_TEAM_USER_BEHAVIORS)
+
 # action_status → 팀 형식. Parser 가 만드는 값은 이 둘뿐이라 매핑에 없으면 원문을 그대로 둔다.
 CSV_VERDICT_LABELS = {"DETECTED": "확정", "CANDIDATE": "의심"}
 
@@ -74,7 +104,9 @@ CSV_VERDICT_LABELS = {"DETECTED": "확정", "CANDIDATE": "의심"}
 def csv_final_timestamp(kst: str | None) -> str | None:
     """
     ISO KST(`2026-09-01T18:41:00.065000+09:00`) → 팀 공통 표기(`2026-09-01 18:41:00.065000 KST`).
-    소수 자리를 늘리거나 줄이지 않는다 — 원본 precision 이 낮으면 낮은 그대로 둔다 (가짜 정밀도 금지).
+    소수부는 팀 공통 계약대로 6자리 표기로 정규화한다 (소수부가 없으면 `.000000` 을 채운다) — 원본 정밀도는
+    JSON 의 timestamp_raw / timestamp_utc 에 그대로 보존한다. 시각이 아예 없으면 None 을 돌려주고,
+    최종 CSV 에는 csv_final_cells 가 `-` 로 적는다 (빈 칸은 통합 contract 위반이다).
     +09:00 이 아닌 값은 손대지 않는다 (표기를 바꾸면서 시각을 바꾸지 않는다).
     """
     if not kst or not kst.endswith("+09:00"):

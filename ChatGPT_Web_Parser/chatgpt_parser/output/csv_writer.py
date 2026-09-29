@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ..output.debug import CSV_CONVERSATION_COLUMNS, CSV_COVERAGE_COLUMNS, CSV_EVENT_COLUMNS, CSV_MESSAGE_COLUMNS, CSV_RECORD_COLUMNS
-from ..output.final_csv import CSV_RECOVERED_CONVERSATION_COLUMNS, CSV_TIMELINE_COLUMNS, _recovered_conversation_row, _timeline_row
+from ..output.final_csv import (CSV_NON_TEAM_ACTIONS, CSV_RECOVERED_CONVERSATION_COLUMNS, CSV_TIMELINE_COLUMNS,
+                                _recovered_conversation_row, _timeline_row)
 
 
 # =============================================================================
@@ -95,7 +96,8 @@ def _csv_rows(result: ParseResult, filename: str) -> list[dict[str, Any]]:
         return [dict(message.to_dict(), conversation_title=conversation.title)
                 for conversation in result.conversations for message in conversation.messages]
     if filename == "timeline.csv":
-        return [_timeline_row(event) for event in result.events]
+        # 팀 분류 체계 밖 행위는 최종 timeline 행을 만들지 않는다 (Event 자체는 events.csv / JSON 에 그대로 남는다).
+        return [_timeline_row(event) for event in result.events if event.action not in CSV_NON_TEAM_ACTIONS]
     if filename == "recovered_conversations.csv":
         return [_recovered_conversation_row(conversation, message)
                 for conversation in result.conversations for message in conversation.messages]
