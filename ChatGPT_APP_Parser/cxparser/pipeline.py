@@ -13,7 +13,7 @@ from .artifacts import rollout as rollout_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
 from .artifacts import webcache_conv as webcache_art
-from .errors import ArtifactNotFoundError, CxError
+from .errors import CxError
 from .image import open_image
 from .model import RecordBuilder
 from .vfs import DirectoryVfs, TskImageVfs
@@ -86,12 +86,11 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             targets.append((kind, vfile, meta))
 
     if not inventory:
-        raise ArtifactNotFoundError(
-            "이미지에서 Codex Desktop 아티팩트 경로를 하나도 찾지 못했습니다",
-            scanned_files=scanned,
-            searched_patterns=[p[0] for p in locate._PATTERNS])
-
-    if not targets:
+        # 음성 대조(negative control) 이미지에서는 "없음" 이 정상 결과다 — 오류가 아니라 0건 + 경고로 끝낸다.
+        # 진짜 입력 오류(이미지 안 열림, NTFS 없음)는 그 전 단계에서 CxError 로 이미 걸러진다.
+        warnings.append("Codex Desktop 아티팩트 경로 0건 (스캔 파일 %d, 탐색 패턴 %d종) — 앱 미설치/미사용 이미지로 판단"
+                        % (scanned, len(locate._PATTERNS)))
+    elif not targets:
         warnings.append(
             "Codex 관련 경로는 %d건 발견했으나, 파싱 대상 종류(%s)에 해당하는 "
             "파일은 없습니다" % (len(inventory), ", ".join(kinds)))
@@ -167,7 +166,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.9",
+        "tool": {"name": "cxparser", "version": "0.3.10",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
