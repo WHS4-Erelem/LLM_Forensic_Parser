@@ -27,7 +27,7 @@ from ..discovery import _join_source_path
 #   timeline.csv                → "사용자가 언제 무엇을 했는가"  (팀 행위 분류 체계에 있는 Event 1건 = 1 row, 시각순)
 #   recovered_conversations.csv → "사용자가 LLM 과 어떤 대화를 했는가" (복구된 메시지 1건 = 1 row)
 # 새 판정을 만들지 않고, 복구되지 않은 내용을 채우지 않는다. 메시지 수와 행 수는 정확히 일치한다.
-# timeline.csv 행 수는 Event 수와 다를 수 있다 — CSV_NON_TEAM_ACTIONS 는 최종 행을 만들지 않는다 (아래 참조).
+# timeline.csv 행 수는 Event 수와 다를 수 있다 — 팀 행위 목록 밖 action 은 최종 행을 만들지 않는다 (아래 참조).
 # 시각은 KST(+09:00) 표기이며 원본 raw·UTC 는 events.csv / JSON 에 그대로 남아 있다.
 
 # 컬럼 이름·순서는 팀 공통 CSV 형식에 맞춘다. "Behavior_details " / "Artifact_details " / "message order" 의
@@ -43,7 +43,8 @@ CSV_RECOVERED_CONVERSATION_COLUMNS = (
 CSV_FINAL_MODEL = "chatgpt-web"  # 최종 CSV 표기. 내부 SERVICE("chatgpt_web") 는 그대로 둔다.
 
 # action(내부 Rule 코드) → 최종 CSV 의 사람이 읽는 행위 이름. 최종 CSV 표기에만 쓰고 Rule·판정은 바꾸지 않는다.
-# 의미를 코드에서 확인한 action 만 넣는다. 없는 action 은 내부 코드 문자열을 그대로 출력한다 (잘못 번역하지 않는다).
+# 의미를 코드에서 확인한 action 만 넣는다 (잘못 번역하지 않는다). 여기 없는 action 은 최종 timeline 행을
+# 만들지 않는다 — csv_final_user_behavior() 참조. 탐지·Event·근거는 그대로 남는다.
 CSV_USER_BEHAVIOR_LABELS = {
     "LOGIN": "로그인",
     "LOGOUT": "로그아웃",
@@ -93,13 +94,26 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
 #   PROFILE_ACCESS                 프로필 화면 접근 — 분석표에 없는 파서 고유 행위
 #   CONVERSATION_REMOVED_FROM_LIST 대화 목록에서 사라짐 — 기존 대화 삭제 판정의 보조 근거로만 남긴다
 #   FILE_UPLOAD / FILE_UPLOAD_DELETE  분석표는 종류별(이미지/문서)로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
-# label 이 아예 없는 action 은 여기 들어오지 않는다. 내부 코드가 그대로 출력되어 통합기가 시끄럽게 알리는 쪽이
-# 조용히 사라지는 것보다 안전하다 (새 Rule 을 추가하고 이름을 정하지 않은 경우).
+# label 이 아예 없는 action 은 이 집합에 들어오지 않지만 최종 timeline 에서 빠지는 결과는 같다
+# (csv_final_user_behavior() 가 팀 목록 대조 하나로 판단한다). 내부 action 코드를 User_behavior 로
+# 내보내는 fallback 은 두지 않는다 — 팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다 (2026-10-01 확정).
+# 이름을 정하지 않은 새 Rule 이 조용히 묻히는 것은 test 로 막는다
+# (test_every_shipped_detector_action_has_a_team_label: 배포된 action 전부에 팀 목록 라벨이 있어야 한다).
 CSV_NON_TEAM_ACTIONS = frozenset(action for action, label in CSV_USER_BEHAVIOR_LABELS.items()
                                  if label not in CSV_TEAM_USER_BEHAVIORS)
 
 # action_status → 팀 형식. Parser 가 만드는 값은 이 둘뿐이라 매핑에 없으면 원문을 그대로 둔다.
 CSV_VERDICT_LABELS = {"DETECTED": "확정", "CANDIDATE": "의심"}
+
+
+def csv_final_user_behavior(action: str) -> str | None:
+    """최종 timeline.csv 의 User_behavior. 팀 목록에 없는 action(라벨이 없는 경우까지) 은 None.
+
+    None 은 "이 Event 로 최종 timeline 행을 만들지 않는다" 는 뜻이다. 탐지를 멈추거나 근거를 지우는 것이
+    아니라서 Event·Evidence·Coverage 는 events.csv / result.json 에 그대로 남는다.
+    """
+    label = CSV_USER_BEHAVIOR_LABELS.get(action)
+    return label if label in CSV_TEAM_USER_BEHAVIORS else None
 
 
 def csv_final_timestamp(kst: str | None) -> str | None:
@@ -381,7 +395,7 @@ def _timeline_row(event: Event, prompt_texts: dict[str, str] | None = None) -> d
     return _fill_empty({
         "Model": CSV_FINAL_MODEL,
         "Timestamp": csv_final_timestamp(event.timestamp_kst),  # 없으면 "-" — 시각을 만들어 내지 않는다
-        "User_behavior": CSV_USER_BEHAVIOR_LABELS.get(event.action, event.action),
+        "User_behavior": csv_final_user_behavior(event.action),  # 팀 목록 밖이면 None — 내부 코드를 내지 않는다
         "Behavior_details ": _behavior_details(event, prompt_texts or {}),
         "Verdict": "의심" if event.action == "PROMPT_DRAFT" else CSV_VERDICT_LABELS.get(event.action_status, event.action_status),
         "Artifact_path": location,

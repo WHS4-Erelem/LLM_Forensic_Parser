@@ -6349,7 +6349,7 @@ class FinalCsvExportTest(unittest.TestCase):
         header, rows = self.read_csv("timeline.csv")
         self.assertEqual([dict(zip(header, row))["Verdict"] for row in rows], ["확정", "의심"])
 
-    def test_timeline_user_behavior_uses_korean_label_or_keeps_action(self):
+    def test_timeline_user_behavior_uses_team_label_and_drops_unknown_action(self):
         result = make_result()
         known, unknown = make_event(), make_event(event_id="event:2")
         known.action, unknown.action = "ACCOUNT_SWITCH", "SOME_FUTURE_ACTION"
@@ -6357,7 +6357,8 @@ class FinalCsvExportTest(unittest.TestCase):
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
         behaviors = [dict(zip(header, row))["User_behavior"] for row in rows]
-        self.assertEqual(behaviors, ["계정 전환", "SOME_FUTURE_ACTION"])  # 모르는 action 은 번역하지 않는다
+        # 모르는 action 은 번역하지도, 내부 코드로 내보내지도 않는다 — 행 자체를 만들지 않는다 (2026-10-01 팀 확정).
+        self.assertEqual(behaviors, ["계정 전환"])
 
     def test_timeline_builds_artifact_path_and_behavior_details(self):
         result = make_result()
@@ -6617,14 +6618,37 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
                          frozenset(action for action, label in _final_csv.CSV_USER_BEHAVIOR_LABELS.items()
                                    if label not in _final_csv.CSV_TEAM_USER_BEHAVIORS))
 
-    def test_label_less_action_is_not_silently_dropped(self):
-        """라벨이 없는 action 은 제외 대상이 아니다 — 내부 코드가 그대로 나가 통합기가 알려 준다.
+    # 2026-10-01 팀 확정: 라벨이 없는 action 도 최종 timeline 에서 빼고, 내부 action 코드를 User_behavior 로
+    # 내보내는 fallback 은 두지 않는다 (팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다).
+    # 대신 "조용히 사라짐" 은 아래 test_every_shipped_detector_action_has_a_team_label 이 배포 전에 막는다.
+    def test_label_less_action_makes_no_timeline_row(self):
+        """라벨이 없는 새 action 은 최종 timeline 행을 만들지 않는다."""
+        self.assertIsNone(_final_csv.csv_final_user_behavior("CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertEqual(self.behaviors_for(["CHATGPT_NEW_ACTION_WITHOUT_LABEL"]), [])
 
-        조용히 사라지는 쪽이 위험하다 (새 Rule 을 넣고 행위명을 정하지 않은 경우).
-        """
-        self.assertNotIn("CHATGPT_NEW_ACTION_WITHOUT_LABEL", _final_csv.CSV_NON_TEAM_ACTIONS)
-        self.assertEqual(self.behaviors_for(["CHATGPT_NEW_ACTION_WITHOUT_LABEL"]),
+    def test_label_less_action_is_still_kept_in_event_and_debug_output(self):
+        """같은 action 이 Event·debug events.csv 에는 그대로 남는다 — 개발자가 확인할 수 있어야 한다."""
+        result = make_result()
+        result.events = [make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL")]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        event_header, event_rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows],
                          ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+        self.assertEqual([event.action for event in result.events], ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+
+    def test_no_internal_action_code_fallback_in_user_behavior(self):
+        """행 생성기를 직접 불러도 내부 action 코드가 User_behavior 로 나오지 않는다 (fallback 제거)."""
+        row = _final_csv._timeline_row(make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertNotEqual(row["User_behavior"], "CHATGPT_NEW_ACTION_WITHOUT_LABEL")
+        self.assertNotIn(row["User_behavior"], set(_final_csv.CSV_USER_BEHAVIOR_LABELS))
+
+    def test_every_timeline_user_behavior_is_a_team_behavior(self):
+        """라벨 표의 모든 action 을 한 번에 내보내도 최종 User_behavior 는 팀 목록의 부분집합이다."""
+        actions = sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) | {"CHATGPT_NEW_ACTION_WITHOUT_LABEL"})
+        behaviors = set(self.behaviors_for(actions))
+        self.assertTrue(behaviors)
+        self.assertEqual(sorted(behaviors - self.team_behaviors_from_file()), [])
 
     def test_file_upload_is_detected_and_kept_in_debug_but_not_in_timeline(self):
         """FILE_UPLOAD · FILE_UPLOAD_DELETE 는 Event 로 남고 debug events.csv 에도 있다 — 최종 timeline 행만 없다."""
@@ -6645,8 +6669,8 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
     def test_every_shipped_detector_action_has_a_team_label(self):
         """배포된 Rule 이 만드는 action 은 모두 라벨 표에 있어야 한다.
 
-        라벨이 없으면 내부 코드가 최종 CSV 로 그대로 나간다 (위 test 가 보장하는 '조용히 사라지지 않음' 의
-        대가다). 이 test 가 있으면 그 상황이 배포까지 가지 않는다 — 새 Rule 을 추가하는 시점에 막힌다.
+        라벨이 없으면 그 행위는 최종 timeline 에 나가지 않는다. 조용히 빠지는 일이 배포까지 가지 않도록
+        새 Rule 을 추가하는 시점에 이 test 가 막는다 (라벨 + 발견 근거 문장 둘 다 필요하다).
         """
         source = Path(_final_csv.__file__).resolve().parent.parent / "detectors"
         actions = {match for path in sorted(source.glob("*.py"))

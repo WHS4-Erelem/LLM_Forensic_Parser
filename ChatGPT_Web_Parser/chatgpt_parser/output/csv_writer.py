@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from ..output.debug import CSV_CONVERSATION_COLUMNS, CSV_COVERAGE_COLUMNS, CSV_EVENT_COLUMNS, CSV_MESSAGE_COLUMNS, CSV_RECORD_COLUMNS
-from ..output.final_csv import (CSV_NON_TEAM_ACTIONS, CSV_RECOVERED_CONVERSATION_COLUMNS, CSV_TIMELINE_COLUMNS,
-                                _recovered_conversation_row, _timeline_row, timeline_prompt_texts)
+from ..output.final_csv import (CSV_RECOVERED_CONVERSATION_COLUMNS, CSV_TIMELINE_COLUMNS,
+                                _recovered_conversation_row, _timeline_row, csv_final_user_behavior,
+                                timeline_prompt_texts)
 
 
 # =============================================================================
@@ -100,7 +101,7 @@ def _csv_rows(result: ParseResult, filename: str) -> list[dict[str, Any]]:
         # 프롬프트 첫 줄은 이미 복구된 메시지·초안에서만 찾는다 (Event 마다 다시 훑지 않도록 한 번만 만든다).
         prompt_texts = timeline_prompt_texts(result)
         return [_timeline_row(event, prompt_texts) for event in result.events
-                if event.action not in CSV_NON_TEAM_ACTIONS]
+                if csv_final_user_behavior(event.action) is not None]
     if filename == "recovered_conversations.csv":
         return [_recovered_conversation_row(conversation, message)
                 for conversation in result.conversations for message in conversation.messages]
