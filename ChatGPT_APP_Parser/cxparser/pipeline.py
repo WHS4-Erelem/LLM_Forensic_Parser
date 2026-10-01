@@ -3,13 +3,17 @@
 import os
 import time
 
-from . import locate, timeline, usn as usn_mod
+from . import derive, locate, timeline, usn as usn_mod
 from .artifacts import auth as auth_art
 from .artifacts import global_state as gs_art
+from .artifacts import package_install as pkg_art
+from .artifacts import prefetch as prefetch_art
+from .artifacts import recent_lnk as lnk_art
 from .artifacts import rollout as rollout_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
-from .errors import ArtifactNotFoundError, CxError
+from .artifacts import webcache_conv as webcache_art
+from .errors import CxError
 from .image import open_image
 from .model import RecordBuilder
 from .vfs import DirectoryVfs, TskImageVfs
@@ -21,10 +25,13 @@ PARSERS = {
     "global_state": gs_art.parse,
     "auth": auth_art.parse,
     "sqlite": sqlite_art.parse,
+    "prefetch": prefetch_art.parse,
+    "recent_lnk": lnk_art.parse,
+    "webcache": webcache_art.parse,
 }
 
 DEFAULT_KINDS = ("rollout", "rollout_loose", "session_index", "global_state", "auth",
-                 "sqlite")
+                 "sqlite", "prefetch", "recent_lnk", "webcache")
 
 
 class Result(dict):
@@ -59,6 +66,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     targets = []
     inventory = []
     sqlite_siblings = {}     # -wal/-shm 은 본 DB 와 함께 열어야 최신 트랜잭션이 보인다
+    cache_parts = {}         # 채팅창 HTTP 캐시: Cache_Data 폴더별 {data_N / f_xxxxxx: vfile} — index 파서가 함께 연다
     scanned = 0
     for vfile in vfs.iter_files():
         scanned += 1
@@ -69,18 +77,20 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         if kind == "sqlite" and (vfile.path.endswith("-wal") or vfile.path.endswith("-shm")):
             sqlite_siblings[vfile.path] = vfile
             continue
+        if kind == "webcache_part":
+            cache_parts.setdefault(vfile.path.rsplit("/", 1)[0].lower(), {})[meta["fn"]] = vfile
+            continue
         if kind == "sqlite" and not sqlite_art.is_main_db(vfile.path):
             continue          # 처리 대상 아닌 DB 는 발견 목록에만
         if kind in kinds:
             targets.append((kind, vfile, meta))
 
     if not inventory:
-        raise ArtifactNotFoundError(
-            "이미지에서 Codex Desktop 아티팩트 경로를 하나도 찾지 못했습니다",
-            scanned_files=scanned,
-            searched_patterns=[p[0] for p in locate._PATTERNS])
-
-    if not targets:
+        # 음성 대조(negative control) 이미지에서는 "없음" 이 정상 결과다 — 오류가 아니라 0건 + 경고로 끝낸다.
+        # 진짜 입력 오류(이미지 안 열림, NTFS 없음)는 그 전 단계에서 CxError 로 이미 걸러진다.
+        warnings.append("Codex Desktop 아티팩트 경로 0건 (스캔 파일 %d, 탐색 패턴 %d종) — 앱 미설치/미사용 이미지로 판단"
+                        % (scanned, len(locate._PATTERNS)))
+    elif not targets:
         warnings.append(
             "Codex 관련 경로는 %d건 발견했으나, 파싱 대상 종류(%s)에 해당하는 "
             "파일은 없습니다" % (len(inventory), ", ".join(kinds)))
@@ -103,6 +113,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             elif kind == "sqlite":
                 recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt,
                               siblings=sqlite_siblings)
+            elif kind == "webcache":
+                recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt,
+                              siblings=cache_parts.get(vfile.path.rsplit("/", 1)[0].lower(), {}))
             else:
                 recs = parser(vfile, image_desc, rb, max_excerpt=max_excerpt)
             records.extend(recs)
@@ -140,6 +153,12 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                                               max_excerpt=max_excerpt))
             usn_summary.append({**loc, "status": "ok", **info})
 
+    # --- 3b'. 패키지 폴더 생성 시각 → 설치 (폴더는 iter_files 에 안 나오므로 발견 목록에서 루트를 찾아 직접 연다) --------
+    records.extend(pkg_art.records_from_inventory(vfs, inventory, image_desc, rb))
+
+    # --- 3c. 파생 규칙: 관찰 레코드끼리 대조해 로그인·계정 전환·첨부 업로드를 올린다 --------
+    records.extend(derive.derive(records, rb))
+
     tl = timeline.build(records)
     status_counts = {}
     for r in records:
@@ -147,7 +166,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.3",
+        "tool": {"name": "cxparser", "version": "0.3.10",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

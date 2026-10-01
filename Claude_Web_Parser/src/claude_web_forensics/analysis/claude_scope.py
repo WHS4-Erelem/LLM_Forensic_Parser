@@ -1,20 +1,4 @@
-"""Claude-relevance gate for filesystem files.
-
-A file on disk (Downloads, $Recycle.Bin, a USN destination) is treated as a
-Claude file only on one of these strong grounds:
-
-  history_target_path    exact normalised path of a History download whose URL
-                         chain / referrer is Claude
-  claude_zone_identifier Zone.Identifier HostUrl/ReferrerUrl pointing at Claude
-  claude_cache_response  byte-identical to a cached Claude download-file
-                         response body (direct byte comparison, no hashing)
-  usn_chain_same_frn     same FRN's rename chain connects the file to a
-                         history_target_path
-
-A filename match alone is never sufficient. Content is compared only for files
-whose size already equals a cached Claude download body, so ordinary files are
-never read.
-"""
+"""Claude-relevance gate for filesystem files."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -27,16 +11,12 @@ BASIS_HISTORY_TARGET = "history_target_path"
 BASIS_ZONE = "claude_zone_identifier"
 BASIS_CACHE_RESPONSE = "claude_cache_response"
 BASIS_USN_CHAIN = "usn_chain_same_frn"
-BASIS_CLAUDE_STORAGE = "claude_attachment_storage"
-
 
 def norm_path(path: str) -> str:
-    """Case-insensitive, separator- and drive-independent path key."""
     text = str(path or "").replace("\\", "/")
     if len(text) > 1 and text[1] == ":":
         text = text[2:]
     return text.lower().lstrip("/").rstrip("/")
-
 
 def zone_is_claude(zone) -> bool:
     if zone is None:
@@ -46,14 +26,11 @@ def zone_is_claude(zone) -> bool:
     urls = f"{getattr(zone, 'host_url', '') or ''} {getattr(zone, 'referrer_url', '') or ''}"
     return "claude.ai" in urls.lower() or "claude.com" in urls.lower()
 
-
 @dataclass
 class ClaudeScope:
-    """Everything the gate needs, derived once from already-parsed evidence."""
+    target_paths: set[str] = field(default_factory=set)
+    target_names: set[str] = field(default_factory=set)
 
-    target_paths: set[str] = field(default_factory=set)       # normalised
-    target_names: set[str] = field(default_factory=set)       # for USN name seeding only
-    # size -> decoded Claude download bodies kept in the temporary workspace
     cache_bodies: dict[int, list[Path]] = field(default_factory=dict)
 
     @classmethod
@@ -78,21 +55,18 @@ class ClaudeScope:
                 scope.cache_bodies.setdefault(size, []).append(Path(body))
         return scope
 
-    # -- metadata-only checks (no byte reads) -----------------------------
     def path_basis(self, path: str) -> str:
         return BASIS_HISTORY_TARGET if path and norm_path(path) in self.target_paths else ""
 
     def zone_basis(self, zone) -> str:
         return BASIS_ZONE if zone_is_claude(zone) else ""
 
-    # -- size pre-filter, then byte comparison ---------------------------
     def size_is_candidate(self, size: int | None) -> bool:
         return isinstance(size, int) and size > 0 and size in self.cache_bodies
 
     def content_basis(
         self, size: int | None, open_stream: Callable[[], BinaryIO | None]
     ) -> str:
-        """Compare a size-matched file with each cached body of that size."""
         from ..util.common import stream_equals_file
 
         if not self.size_is_candidate(size):
@@ -110,14 +84,9 @@ class ClaudeScope:
                         pass
         return ""
 
-
 def usn_chain_basis(
-    volume_id: str,
-    destination_path: str,
-    lifecycles: dict,
-    scope: ClaudeScope,
+    volume_id: str, destination_path: str, lifecycles: dict, scope: ClaudeScope,
 ) -> str:
-    """Same-FRN rename chain linking `destination_path` to a Claude target path."""
     target = norm_path(destination_path)
     if not target:
         return ""
@@ -132,27 +101,15 @@ def usn_chain_basis(
             return BASIS_USN_CHAIN
     return ""
 
-
 def interesting_usn_names(scope: ClaudeScope, verified_names: Iterable[str]) -> set[str]:
-    """USN seeding: History targets + files already proven Claude-related only."""
     names = set(scope.target_names)
     names.update(n for n in verified_names if n)
     return names
 
-
 def interesting_usn_frns(verified_frns: Iterable[str]) -> set[str]:
-    """USN seeding by file reference: Claude-verified files only."""
     return {f for f in verified_frns if f and "-" in f}
 
-
 def gate_recycle_entries(volume, entries, scope: ClaudeScope) -> tuple[list, int]:
-    """Metadata-first Claude gate for $Recycle.Bin entries.
-
-    Accepts on the exact $I original path or a Claude Zone.Identifier on $R.
-    Otherwise only size-matched candidates are compared byte for byte with the
-    cached Claude download body. Every other $R is never read.
-    Returns (verified entries, number of content candidates compared).
-    """
     verified = []
     content_candidates = 0
     for entry in entries:
@@ -161,20 +118,13 @@ def gate_recycle_entries(volume, entries, scope: ClaudeScope) -> tuple[list, int
             content_candidates += 1
             record = volume.get(entry.r_path)
             if record is not None:
-                basis = scope.content_basis(
-                    entry.r_logical_size, lambda: volume.open_record(record)
-                )
+                basis = scope.content_basis(entry.r_logical_size, lambda: volume.open_record(record))
         if basis:
             entry.claude_link_basis = basis
             verified.append(entry)
     return verified, content_candidates
 
-
 def gate_recycle_by_usn(entries, volume_id: str, pairs, scope: ClaudeScope) -> list:
-    """Second chance for unverified entries: the same FRN's rename chain.
-
-    Uses rename pairs already produced by the single $UsnJrnl pass.
-    """
     from .file_analysis import build_lifecycles
 
     pending = [e for e in entries if not e.claude_link_basis]

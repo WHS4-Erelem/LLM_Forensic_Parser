@@ -30,6 +30,7 @@ HANDLED = ("state_5.sqlite", "thread_history_1.sqlite", "logs_2.sqlite")
 # logs_2 에서 행위 근거로 뽑는 패턴 (본문 일부 일치)
 LOG_LOGOUT = 'rpc.method="account/logout"'
 LOG_AUTH_CHANGED = "Reloaded auth, changed: true"
+AUTO_RESTART_SEC = 10   # ponytail: 표본 2개(자동 재시작 1초 / 사용자 재실행 24초 이상)에서 잡은 값. 표본이 늘면 조정
 # 같은 요청이 여러 줄로 로깅되므로 요청 ID 로 묶는다
 _RPC_ID_RE = re.compile(r'rpc\.request_id=\w*\("?([^")]+)"?\)')
 
@@ -323,4 +324,46 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
         status="ok",
         details={"artifact": "codex_sqlite", "db": "logs_2.sqlite", "table": "logs",
                  "row_count": n, "first_ts_utc": lo_iso, "last_ts_utc": hi_iso}))
+    # --- 프로세스 구간 → 실행(E08-01)·종료(E08-02) ----------------------------------------------
+    # 조사(2026-09-23): process_uuid 는 앱 프로세스마다 새로 붙는다. 평서문 표본 세 구간의 시작이 Prefetch 실행 시각·
+    # 재실행과 초 단위로 일치했고, 강제 종료 4초 전에 마지막 줄이 찍혔다. 앱은 종료 로그를 남기지 않아 정상/강제는 구분 못 한다.
+    if "process_uuid" in cols:
+        prev_hi = None
+        for row in conn.execute("select process_uuid, min(ts) lo, max(ts) hi, count(*) n from logs "
+                                "group by process_uuid order by lo"):
+            if row["lo"] is None:
+                continue
+            pid = row["process_uuid"] or "-"
+            lo_iso, hi_iso = parse_any_time(row["lo"])[0], parse_any_time(row["hi"])[0]
+            # 사용자 실행 vs 자동 재시작: 직전 프로세스가 끝난 지 AUTO_RESTART_SEC 안에 새 프로세스가 뜨면 앱이 스스로 재실행한 것
+            # (표본: 샌드박스 설정 후 1초 뒤 재시작). 팀 합의(2026-09-23): 사용자가 아이콘을 눌러 켠 횟수 = 확정 행, 자동 재시작 = 의심 행.
+            gap = (row["lo"] - prev_hi) if prev_hi is not None else None
+            auto = gap is not None and 0 <= gap <= AUTO_RESTART_SEC
+            prev_hi = row["hi"]
+            det = {"artifact": "codex_sqlite", "db": "logs_2.sqlite", "table": "logs", "process_uuid": pid,
+                   "key": ("자동 재시작(직전 종료 %d초 뒤) 프로세스 %s" % (gap, pid[:12]) if auto
+                           else "프로세스 %s (로그 %d줄)" % (pid[:12], row["n"])),          # Behavior_details 의 <핵심 내용>
+                   "session_first_utc": lo_iso, "session_last_utc": hi_iso, "row_count": row["n"],
+                   "auto_restart": auto, "gap_from_previous_exit_sec": gap}
+            records.append(model.Record(
+                rb.next_id(), "E08-01", events.name("E08-01"),
+                model.timestamp(utc=lo_iso, original=row["lo"], fmt="epoch_seconds", meaning="이 프로세스의 첫 로그 기록 시각",
+                                source=model.TS_SOURCE_CONTENT),
+                model.user_action(action="애플리케이션 실행(자동 재시작)" if auto else "애플리케이션 실행(프로세스 시작)",
+                                  confidence=model.CONF_INFERRED if auto else model.CONF_CONFIRMED,
+                                  rationale=(("logs 의 process_uuid=%s 첫 기록이 직전 프로세스 종료 %d초 뒤 — 사용자가 켠 것이 아니라 "
+                                              "앱이 스스로 재실행한 것으로 추정 (기준 %d초)") % (pid[:12], gap, AUTO_RESTART_SEC) if auto else
+                                             ("logs 의 process_uuid=%s 첫 기록 — 앱 프로세스마다 새 ID 가 붙으므로 구간 하나가 "
+                                              "실행 한 번이다. 직전 종료와 충분히 떨어져 있어 사용자가 켠 것으로 본다") % pid[:12])),
+                _db_evidence(image_desc, vfile, "logs", "process_uuid=%s first" % pid, sha), status="ok", details=det))
+            records.append(model.Record(
+                rb.next_id(), "E08-02", events.name("E08-02"),
+                model.timestamp(utc=hi_iso, original=row["hi"], fmt="epoch_seconds", meaning="이 프로세스의 마지막 로그 기록 시각",
+                                source=model.TS_SOURCE_CONTENT),
+                model.user_action(action="애플리케이션 종료(프로세스 로그 끝)", confidence=model.CONF_INFERRED,
+                                  rationale=("같은 process_uuid 의 마지막 기록 — 이후 기록이 없으니 프로세스가 끝난 것. 앱이 종료 로그를 "
+                                             "남기지 않아 정상 종료와 강제 종료를 구분하지 못함 (팀 규칙: 강제 종료 근거 없으면 정상 종료·의심). "
+                                             "강제 종료 표본에서는 마지막 줄이 종료 4초 전이었다")),
+                _db_evidence(image_desc, vfile, "logs", "process_uuid=%s last" % pid, sha), status="ok",
+                notes=["정상/강제 종료 구분 불가 — 창 닫기(트레이 상주)는 프로세스 종료가 아니라 여기 잡히지 않음"], details=det))
     return records

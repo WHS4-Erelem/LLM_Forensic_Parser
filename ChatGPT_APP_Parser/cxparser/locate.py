@@ -22,6 +22,8 @@ SCAN_ROOTS = (
     "Users/*/AppData/Local/Packages/" + PACKAGE_FAMILY,
     "Program Files/WindowsApps/openai.codex_*",
     "ProgramData/Packages/" + PACKAGE_FAMILY,
+    "Windows/Prefetch",                                   # CODEX.EXE-*.pf : 실행 기록 (E08-01)
+    "Users/*/AppData/Roaming/Microsoft/Windows/Recent",   # *.lnk : 앱이 저장한 파일의 바로가기 (E05-05 / E06-02)
 )
 
 # (kind, 정규식) — 경로는 소문자·슬래시 정규화 후 매칭
@@ -37,9 +39,13 @@ _PATTERNS = [
     ("sqlite",         re.compile(r"/users/(?P<user>[^/]+)/\.codex/(?P<db>[^/]+\.sqlite(-wal|-shm)?)$")),
     ("thread_lock",    re.compile(r"/users/(?P<user>[^/]+)/\.codex/thread-writer-locks/(?P<fn>[^/]+)$")),
     ("documents_output", re.compile(r"/users/(?P<user>[^/]+)/documents/codex/(?P<rest>.+)$")),
+    ("webcache",       re.compile(r"/appdata/local/packages/" + PACKAGE_FAMILY + r"/localcache/roaming/codex/web/codex/default/cache/cache_data/index$")),
+    ("webcache_part",  re.compile(r"/appdata/local/packages/" + PACKAGE_FAMILY + r"/localcache/roaming/codex/web/codex/default/cache/cache_data/(?P<fn>data_[0-3]|f_[0-9a-f]{6})$")),
     ("package_userdata", re.compile(r"/users/(?P<user>[^/]+)/appdata/local/packages/" + PACKAGE_FAMILY + r"/(?P<rest>.+)$")),
     ("package_binary",  re.compile(r"/program files/windowsapps/openai\.codex_(?P<ver>[^/]+)/(?P<rest>.+)$")),
     ("package_registration", re.compile(r"/programdata/packages/" + PACKAGE_FAMILY + r"(/(?P<rest>.+))?$")),
+    ("prefetch",       re.compile(r"/windows/prefetch/(codex|chatgpt)\.exe-[0-9a-f]{8}\.pf$")),   # 8월 판은 ChatGPT.exe, 9월 판은 Codex.exe
+    ("recent_lnk",     re.compile(r"/users/(?P<user>[^/]+)/appdata/roaming/microsoft/windows/recent/(?P<fn>[^/]+\.lnk)$")),
 ]
 
 # 대화 내용 파싱 대상(1차 MVP)

@@ -9,6 +9,11 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
 
 # 빌드 결과
 build/
@@ -20,6 +25,12 @@ _work/
 temp/
 tmp/
 *.partial
+*.tmp
+
+# 로컬 환경 설정
+.env
+.env.*
+!.env.example
 
 # 분석 결과 — 복원된 대화 원문·계정 식별자가 들어 있으므로 절대 커밋하지 않는다
 integration/out/

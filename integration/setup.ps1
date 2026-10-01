@@ -7,7 +7,10 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 uv venv --python 3.12 .venv312
-uv pip install --python .venv312\Scripts\python.exe pytsk3==20260715 libewf-python==20240506 brotli==1.2.0 cramjam==2.12.1
+uv pip install --python .venv312\Scripts\python.exe -r ..\ChatGPT_APP_Parser\requirements.txt
+uv pip install --python .venv312\Scripts\python.exe -r ..\ChatGPT_Web_Parser\requirements.txt
+uv pip install --python .venv312\Scripts\python.exe -r ..\Claude_APP_Parser\requirements.txt
+uv pip install --python .venv312\Scripts\python.exe -r ..\Gemini_Web_Parser\requirements.txt
 uv pip install --python .venv312\Scripts\python.exe -r ..\Claude_Web_Parser\requirements.lock
 
 uv venv --python 3.14 .venv314

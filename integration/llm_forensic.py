@@ -48,6 +48,18 @@ CONV_FIELDS = [canonical_header(c) for c in CONV_COLUMNS]
 EXTRA_COLUMNS = ["source_parser", "parser_version", "source_file", "parse_time_utc",
                  "artifact_path_normalized", "volume_ref", "evidence_id", "evidence_sha256"]
 VERDICTS = {"확정", "의심"}
+USER_BEHAVIORS_FILE = os.path.join(HERE, "user_behaviors.txt")
+
+
+def load_user_behaviors(path=USER_BEHAVIORS_FILE):
+    """팀 행위 분류 체계 (한 줄에 하나, # 주석). 파일이 없으면 None → 검사 안 함."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        return {ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")}
+
+
+USER_BEHAVIORS = load_user_behaviors()
 VERDICT_RULE = "확정 | 의심"
 EMPTY = "-"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST$")
@@ -60,6 +72,7 @@ REPORT_NAME = "integration_report.json"
 # 파서 결과는 고쳐 받지 않는다. 어느 파서의 어느 파일·행·열이 어떤 값이었고 무엇이 기대됐는지만 남긴다.
 ERROR_STATUS = {
     "PARSER_EXECUTION_ERROR": "failed",              # 종료코드≠0 · 시간 초과 · 실행 불가
+    "UNSUPPORTED_INPUT": "failed",                   # 레지스트리 inputs 에 없는 이미지 확장자 → 실행하지 않음
     "OUTPUT_MISSING": "failed",                      # 레지스트리 outputs 의 CSV 가 없음
     "CSV_FORMAT_ERROR": "contract_violation",        # UTF-8 CSV 로 읽히지 않음
     "HEADER_MISMATCH": "contract_violation",
@@ -70,7 +83,9 @@ ERROR_STATUS = {
     "NORMALIZATION_ERROR": "normalization_error",    # 통합 쪽 정규화 계산 실패
     "DB_ERROR": "db_error",
     "OUTPUT_WRITE_ERROR": "output_error",            # 병합 CSV·보고서 쓰기 실패 (다른 프로그램이 파일을 연 경우 등)
+    "UNKNOWN_USER_BEHAVIOR": "warning",              # user_behaviors.txt 에 없는 행위명. 경고만 하고 적재는 한다 (파서 담당자가 이름을 맞춘다)
 }
+# ponytail: 경고는 상태에 영향 없음. 파서들이 이름을 다 맞추면 "warning" → "contract_violation" 으로 바꿔 승격한다
 _STATUS_ORDER = ["failed", "contract_violation", "normalization_error", "db_error", "output_error"]
 REPORT_ERROR_LIMIT = 100                             # 보고서에는 파서당 앞 100건만 (전체는 DB runs.violations)
 
@@ -110,6 +125,14 @@ def evidence_manager(path, quick=False):
         head = fh.read(8)
     kind = "e01" if head == EWF1_SIG else "raw"
     segments = [path]
+    m = re.match(r"^(.*)\.(\d{3})$", path) if kind == "raw" else None
+    if m:                                               # raw 분할 (image.001, .002, …): 주어진 번호부터 연속으로 모은다
+        stem, n = m.group(1), int(m.group(2))
+        segments = []
+        while os.path.isfile("%s.%03d" % (stem, n)):
+            segments.append("%s.%03d" % (stem, n)); n += 1
+        if os.path.isfile("%s.%03d" % (stem, n + 1)):
+            raise ValueError("raw 중간 세그먼트 누락: .%03d" % n)
     if kind == "e01":
         stem = os.path.splitext(path)[0]
         segments, n = [], 1
@@ -182,7 +205,7 @@ def code_hash(cwd):
             if f.endswith((".py", ".json")):
                 h.update(os.path.relpath(os.path.join(root, f), cwd).encode())
                 with open(os.path.join(root, f), "rb") as fh:
-                    h.update(fh.read())
+                    h.update(fh.read().replace(b"\r\n", b"\n"))   # git autocrlf 로 줄바꿈만 다른 같은 코드는 같은 해시
     return h.hexdigest()[:16]
 
 
@@ -200,11 +223,19 @@ def run_parser(p, image, out_dir):
     parse_time_utc = utc_now()
     timeout = p.get("timeout_sec", 1800)
     exec_problem = None
+    inputs = [s.lower() for s in p.get("inputs", [])]   # 파서가 확장자를 검사해 거절하는 경우만 레지스트리에 선언 (비어 있으면 검사 안 함)
+    unsupported = bool(inputs) and os.path.splitext(image)[1].lower() not in inputs
     t0 = time.time()
     try:
+        if unsupported:                                # 실행해도 파서가 거절하므로 시간 낭비 없이 사유만 남긴다
+            raise ValueError("파서가 이 입력 확장자를 지원하지 않음: %s (지원: %s). 파서 담당자가 확장자 검사를 넓히면 parsers.json inputs 도 갱신"
+                             % (os.path.splitext(image)[1] or "(없음)", ", ".join(inputs)))
         r = subprocess.run(cmd, cwd=p["cwd"], env=env, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
         rc, out, err = r.returncode, r.stdout, r.stderr
+    except ValueError as exc:
+        rc, out, err = -3, "", str(exc)
+        exec_problem = str(exc)
     except subprocess.TimeoutExpired as exc:           # 강제 종료 전까지 나온 출력도 run.log 에 남긴다
         rc, out, err = -1, _text(exc.stdout), _text(exc.stderr) + "\ntimeout %ss" % timeout
         exec_problem = "시간 초과로 강제 종료 (timeout_sec=%s)" % timeout
@@ -220,7 +251,11 @@ def run_parser(p, image, out_dir):
     files = {k: os.path.join(out_dir, v) for k, v in p["outputs"].items()}
     missing = [k for k, v in files.items() if not os.path.isfile(v)]
     errors = []
-    if rc != 0:
+    if unsupported:
+        errors.append(make_error(p["name"], "UNSUPPORTED_INPUT", exec_problem, file="run.log", field="inputs",
+                                 actual=os.path.splitext(image)[1].lower(), expected=inputs))
+        missing = []                                   # 실행하지 않았으니 결과 없음은 당연 — 별도 오류로 세지 않는다
+    elif rc != 0:
         errors.append(make_error(p["name"], "PARSER_EXECUTION_ERROR", exec_problem or "파서가 비정상 종료 (stdout/stderr 는 run.log)",
                                  file="run.log", field="returncode", actual=rc, expected=0))
     for k in missing:
@@ -257,35 +292,12 @@ def normalize_path(raw):
     return " | ".join(x for x in parts if x) or EMPTY
 
 
-def volume_ref(path, details="", run_volume=None):
-    """볼륨 식별자. 우선순위: Artifact_details 의 volume=/partition_offset= 키 → 경로의 NTFS@오프셋·volumeN → 실행 단위 값 → '-'."""
-    m = re.search(r"\bvolume=([^,;|\s]+)", str(details), re.I) or re.search(r"partition_offset=(\d+)", str(details), re.I)
-    if m:
-        v = m.group(1)
-        return v if v.lower().startswith(("ntfs@", "volume")) else "ntfs@%s" % v
-    m = re.search(r"NTFS@(\d+)", str(path), re.I)
-    if m:
-        return "ntfs@%s" % m.group(1)
+def volume_ref(path):
+    """Artifact_path 에 명시된 volumeN 만 볼륨 식별자로 쓴다. 드라이브 경로는 '-'."""
     m = re.match(r"^(volume\d+):", str(path), re.I)
     if m:
         return m.group(1).lower()
-    return run_volume or EMPTY
-
-
-def run_volume_from_json(p, out_dir):
-    """레지스트리 volume_json: 파서가 실행 단위로 고른 파티션을 JSON 에서 읽는다 (행 단위 정보가 없는 파서용)."""
-    spec = p.get("volume_json")
-    if not spec:
-        return None
-    try:
-        with open(os.path.join(out_dir, spec["file"]), encoding="utf-8") as fh:
-            node = json.load(fh)
-        for key in spec["pointer"].strip("/").split("/"):
-            node = node[int(key)] if isinstance(node, list) else node[key]
-        m = re.search(spec["regex"], str(node))
-        return spec["format"].format(*m.groups()) if m else None
-    except (OSError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+    return EMPTY
 
 
 def kst_to_utc(ts):
@@ -338,11 +350,11 @@ def read_contract_csv(parser, path, columns, errors):
     return len(rows) - 1, list(enumerate(rows[1:], 2))
 
 
-def normalize(run, evidence, run_volume=None):
+def normalize(run, evidence):
     """파서 결과 CSV 2개 → (events, messages, errors, source_rows).
     원본 헤더 계약을 먼저 검사하고, 통과한 행만 canonical 열 이름으로 옮긴다. 값은 고치지 않고 provenance·정규화 열만 덧붙인다.
     source_rows: 파일별 데이터 행 수 (헤더 제외, 못 읽으면 None)."""
-    parser, errors, source_rows = run["parser"], [], {}
+    parser, errors, warnings, source_rows = run["parser"], [], [], {}
     prov = {"source_parser": parser, "parser_version": run["parser_version"], "parse_time_utc": run["parse_time_utc"],
             "evidence_id": evidence["evidence_id"], "evidence_sha256": evidence["evidence_sha256"]}
     out = {"timeline": [], "conversations": []}
@@ -374,7 +386,7 @@ def normalize(run, evidence, run_volume=None):
             for target, src, fn in (("timestamp_utc", "timestamp", lambda: kst_to_utc(r["timestamp"])),
                                     ("artifact_path_normalized", "artifact_path", lambda: normalize_path(r["artifact_path"])),
                                     ("volume_ref", "artifact_path",
-                                     lambda: volume_ref(r["artifact_path"], r.get("artifact_details", ""), run_volume))):
+                                     lambda: volume_ref(r["artifact_path"]))):
                 try:
                     derived[target] = fn()
                 except Exception as exc:               # 통합 쪽 계산 실패 — 파서 값은 고치지 않고 오류로만 남긴다
@@ -382,10 +394,13 @@ def normalize(run, evidence, run_volume=None):
                                              file=name, row=i, field=src, actual=r[src]))
             if len(errors) > before:
                 continue
+            if kind == "timeline" and USER_BEHAVIORS is not None and r["user_behavior"] not in USER_BEHAVIORS:
+                warnings.append(make_error(parser, "UNKNOWN_USER_BEHAVIOR", "팀 행위 분류 체계에 없는 행위명 (적재는 함)", file=name, row=i,
+                                           field="user_behavior", actual=r["user_behavior"], expected=os.path.basename(USER_BEHAVIORS_FILE)))
             raw = dict(zip(columns, values))           # row_hash 는 파서 원본 헤더·값 기준 (이전 버전과 같은 값)
             row_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
             out[kind].append({**r, **prov, **derived, "source_file": name, "row_hash": row_hash})
-    return out["timeline"], out["conversations"], errors, source_rows
+    return out["timeline"], out["conversations"], errors + warnings, source_rows
 
 
 # ---------------------------------------------------------------- 4. Unified DB
@@ -514,22 +529,46 @@ def _safe(v):
     return "'" + s if s != EMPTY and s[:1] in ("=", "+", "-", "@") else s
 
 
+def _csv_fragments(value, limit=32766):
+    """Excel 한 셀 한계 안에서 가능한 줄바꿈·공백 위치로 나눈다. 원문 줄바꿈은 그대로 보존한다."""
+    parts = []
+    text = EMPTY if value is None or str(value).strip() == "" else str(value)
+    while len(text) > limit:
+        cut = max(text.rfind("\n", 0, limit + 1), text.rfind(" ", 0, limit + 1))
+        cut = cut + 1 if cut > 0 else limit
+        parts.append(text[:cut])
+        text = text[cut:]
+    return parts + [text]
+
+
+def _csv_rows(row):
+    """긴 셀만 다음 물리 행으로 잇고, 나머지 열은 각 행에 유지한다."""
+    fragments = [_csv_fragments(value) for value in row]
+    for i in range(max(map(len, fragments))):
+        yield [_safe(parts[i] if i < len(parts) else (parts[0] if len(parts) == 1 else EMPTY))
+               for parts in fragments]
+
+
 def write_merged(db, evidence_id, out_dir):
     """반환: [(경로, 행 수, {source_parser: 행 수})]."""
     written = []
-    for name, table, fields in (("timeline.csv", "events", TIMELINE_FIELDS),
-                                ("recovered_conversations.csv", "messages", CONV_FIELDS)):
+    for name, table, fields, columns in (("timeline.csv", "events", TIMELINE_FIELDS, TIMELINE_COLUMNS),
+                                         ("recovered_conversations.csv", "messages", CONV_FIELDS, CONV_COLUMNS)):
         out_cols = fields + EXTRA_COLUMNS
+        header = columns + EXTRA_COLUMNS                 # 사람이 보는 병합 CSV 는 팀 계약 헤더 그대로 (DB 안에서만 snake_case)
         rows = db.execute("select %s from %s where evidence_id=? order by (timestamp_utc is null), timestamp_utc, source_parser"
                           % (", ".join(map(_q, out_cols)), table), (evidence_id,)).fetchall()
         path = os.path.join(out_dir, name)
         with open(path, "w", encoding="utf-8-sig", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(out_cols)
+            w.writerow(header)
+            by_parser = Counter()
+            parser_index = out_cols.index("source_parser")
             for r in rows:
-                w.writerow([_safe(c) for c in r])
-        by_parser = Counter(r[out_cols.index("source_parser")] for r in rows)
-        written.append((path, len(rows), dict(sorted(by_parser.items()))))
+                for csv_row in _csv_rows(r):
+                    w.writerow(csv_row)
+                    by_parser[r[parser_index]] += 1
+        written.append((path, sum(by_parser.values()), dict(sorted(by_parser.items()))))
     return written
 
 
@@ -559,6 +598,8 @@ def _console_result(status, run, events, messages, errors, dup, detail_path):
     label = "OK" if status == "success" else status.upper()
     types = ", ".join("%s x%d" % kv for kv in Counter(e["type"] for e in errors).items())
     note = types or ("동일 행 %d건은 1회만 적재" % dup if dup else "")
+    if status == "success" and not events and not messages:
+        note = (note + " · " if note else "") + "0건 — 흔적 없음이거나 파서가 입력을 못 읽은 것. run.log 확인"
     print((" %-8s %6.1fs  events=%-3d messages=%-3d %s" % (label, run["elapsed_sec"], len(events), len(messages), note)).rstrip())
     if errors:
         more = " (외 %d건)" % (len(errors) - 1) if len(errors) > 1 else ""
@@ -568,6 +609,7 @@ def _console_result(status, run, events, messages, errors, dup, detail_path):
 
 def _parser_entry(status, run, events, messages, errors, source_rows, inserted):
     return {"status": status, "timeline_rows": len(events), "conversation_rows": len(messages),
+            "artifacts_found": bool(events or messages),   # success 라도 False 면 흔적 없음 또는 입력 미인식 — run.log 로 구분
             "source_rows": source_rows, "db_inserted": inserted,
             "returncode": run["returncode"], "elapsed_sec": run["elapsed_sec"],
             "parser_version": run["parser_version"], "parse_time_utc": run["parse_time_utc"],
@@ -584,7 +626,7 @@ def run_one(p, ev, case_dir, db, run_id, report_path):
     errors, events, messages, source_rows = list(run["errors"]), [], [], {}
     if not errors:
         try:
-            events, messages, errors, source_rows = normalize(run, ev, run_volume_from_json(p, out_dir))
+            events, messages, errors, source_rows = normalize(run, ev)
         except Exception as exc:                       # 통합 코드 결함이 전체 실행을 멈추지 않게
             errors = [make_error(p["name"], "NORMALIZATION_ERROR", "정규화 중 예외 (%s: %s)" % (type(exc).__name__, exc))]
     status = status_of(errors)
@@ -648,10 +690,9 @@ def main(argv=None):
     report = {"report_version": 1, "run_id": run_id, "generated_at_utc": None,
               "mode": "full" if only is None else "only", "only": only, "quick": args.quick,
               "registry": os.path.abspath(args.registry),
-              "evidence": {k: ev[k] for k in ("evidence_id", "kind", "path", "segments", "size_bytes",
-                                              "evidence_quick_fingerprint", "evidence_sha256")},
-              "exit_code": None, "summary": {}, "db": {"path": db_path}, "parsers": {},
-              "merged_output": {}, "integration_errors": [], "warnings": []}
+               "evidence": {"evidence_id": ev["evidence_id"]},
+               "exit_code": None, "summary": {}, "db": {"path": db_path}, "parsers": {},
+               "integration_errors": [], "warnings": []}
     unknown = [n for n in only or [] if n not in {p["name"] for p in reg["parsers"]}]
     if unknown:
         report["warnings"].append("레지스트리에 없는 파서 이름은 무시: %s" % ", ".join(unknown))
@@ -682,10 +723,14 @@ def main(argv=None):
         statuses[status] += 1
     failed = len(parsers) - statuses["success"]
 
-    fatal = False
+    fatal, merged_parsers = False, set()
     try:
         for path, n, by_parser in write_merged(db, ev["evidence_id"], case_dir):
-            report["merged_output"][os.path.basename(path)] = {"path": path, "rows": n, "rows_by_parser": by_parser}
+            field = "timeline_rows" if os.path.basename(path) == "timeline.csv" else "conversation_rows"
+            merged_parsers.update(by_parser)
+            for parser, count in by_parser.items():
+                if parser in report["parsers"]:
+                    report["parsers"][parser][field] = count
             print("[Timeline] %s  %d행" % (path, n))
     except sqlite3.Error as exc:
         fatal = True
@@ -698,7 +743,7 @@ def main(argv=None):
         print("[Timeline] FAILED OUTPUT_WRITE_ERROR 병합 CSV 쓰기 실패 (%s)" % exc)
     db.close()
     print("[DB] %s" % db_path)
-    preserved = sorted({k for m in report["merged_output"].values() for k in m["rows_by_parser"]} - set(report["parsers"]))
+    preserved = sorted(merged_parsers - set(report["parsers"]))
     report["preserved_from_previous_runs"] = preserved     # --only 로 이번에 실행하지 않았지만 병합본에 남은 파서
     report["summary"] = {"parsers_run": len(parsers), "success": statuses["success"], "failed": statuses["failed"],
                          "contract_violation": statuses["contract_violation"],
@@ -735,7 +780,7 @@ CV = ["Model", "timestamp", "conversation_uuid", "conversation_title", "message_
 ts = "2026-09-15 13:20:41.807000 KST"
 tl = [[name, ts, "프롬프트 전송", "v=" + mode, "확정",
        r"C:\Users\A\Downloads\x.pdf|C:\Users\A\Downloads\x.pdf:Zone.Identifier", "volume=ntfs@5"],
-      [name, "-", "파일 다운로드", "b", "의심", r"volume0:\Users\A\y.txt | D:/img.E01::NTFS@7/Users/A/z", "-"]]
+      [name, "-", "테스트용 비표준 행위", "b", "의심", r"volume0:\Users\A\y.txt | D:/img.E01::NTFS@7/Users/A/z", "-"]]
 cv = [[name, ts, "c1", "t", "m1", "-", "1", "user", "hello " + mode, r"C:\Users\A\conv.json"]]
 if mode == "bad":
     TL = TL[:3] + ["Behavior_details"] + TL[4:] if os.environ.get("FAKE_BAD_HEADER") else TL
@@ -763,14 +808,13 @@ def self_test():
     assert normalize_path(r"volume0:\$Extend\$UsnJrnl:$J | volume0:\A\B.exe") == r"$extend\$usnjrnl:$J | a\b.exe"
     assert normalize_path(r"C:\A\f.txt::$DATA") == r"a\f.txt::$DATA"
     assert normalize_path("-") == EMPTY and normalize_path("") == EMPTY
-    assert volume_ref("img.E01::NTFS@227540992/Users") == "ntfs@227540992"
+    assert volume_ref("img.E01::NTFS@227540992/Users") == EMPTY
     assert volume_ref("volume0:\\Users") == "volume0" and volume_ref("C:\\Users") == EMPTY
-    assert volume_ref("C:\\Users", "[Rollout] MFT=1, volume=ntfs@227540992, 규칙=E04-01") == "ntfs@227540992"
-    assert volume_ref("C:\\Users", "x, partition_offset=1048576; y") == "ntfs@1048576"
-    assert volume_ref("Users/a", "", "ntfs@5") == "ntfs@5"
     assert kst_to_utc("2026-09-15 13:20:41.807000 KST") == "2026-09-15T04:20:41.807000Z"
     assert kst_to_utc("-") is None and kst_to_utc("2026-09-15 13:20:41 KST") is None
     assert _safe("=1") == "'=1" and _safe("") == EMPTY and _safe("-") == EMPTY
+    split = list(_csv_rows(["x" * 32767, "keep"]))
+    assert len(split) == 2 and len(split[0][0]) == 32766 and split[1] == ["x", "keep"]
     assert _ewf_ext(1) == "E01" and _ewf_ext(99) == "E99" and _ewf_ext(100) == "EAA"
     assert len(code_hash(HERE)) == 16 and code_hash(HERE) == code_hash(HERE)
     # canonical header · provenance 열
@@ -794,6 +838,26 @@ def self_test():
         assert ev["evidence_sha256"] == hashlib.sha256(data).hexdigest() == ev["segment_hashes"][0]["sha256"]
         assert ev["evidence_quick_fingerprint"] == ev["evidence_sha256"] and ev["evidence_id"] == ev["evidence_sha256"][:16]
         assert evidence_manager(raw, quick=True)["evidence_sha256"] == EMPTY
+        # raw 분할 (image.001/.002): 세그먼트를 모두 모으고 전체 해시는 이어붙인 값, 결번은 거부
+        a, b = os.urandom(700), os.urandom(300)
+        for n, chunk in ((1, a), (2, b)):
+            with open(os.path.join(td, "split.%03d" % n), "wb") as fh:
+                fh.write(chunk)
+        sp = evidence_manager(os.path.join(td, "split.001"))
+        assert sp["kind"] == "raw" and sp["segments"] == ["split.001", "split.002"] and sp["size_bytes"] == 1000
+        assert sp["evidence_sha256"] == hashlib.sha256(a + b).hexdigest() and len(sp["segment_hashes"]) == 2
+        os.rename(os.path.join(td, "split.002"), os.path.join(td, "split.003"))
+        try:
+            evidence_manager(os.path.join(td, "split.001")); assert False, "결번을 잡아야 한다"
+        except ValueError as exc:
+            assert "누락" in str(exc)
+        os.remove(os.path.join(td, "split.001")); os.remove(os.path.join(td, "split.003"))
+        # 소스 해시는 줄바꿈(CRLF/LF)에 영향받지 않는다 (git autocrlf 로 PC 마다 다른 파일)
+        for sub, nl in (("lf", b"\n"), ("crlf", b"\r\n")):
+            os.makedirs(os.path.join(td, sub))
+            with open(os.path.join(td, sub, "m.py"), "wb") as fh:
+                fh.write(b"x = 1" + nl + "print('한글')".encode() + nl)
+        assert code_hash(os.path.join(td, "lf")) == code_hash(os.path.join(td, "crlf"))
         _self_test_contract(td)
         _self_test_db(td)
         _self_test_end_to_end(td, raw, ev["evidence_id"])
@@ -821,7 +885,7 @@ def _self_test_contract(td):
                                       ["m", ts, "a"]])
     _write_csv(cv, CONV_COLUMNS, [["m", ts, "c", "t", "u", "-", "1", "user", "hi", "-"]])
     events, messages, errors, source_rows = normalize(run, ev)
-    got = [(e["type"], e["file"], e["row"], e["field"], e["actual"], e["expected"]) for e in errors]
+    got = [(e["type"], e["file"], e["row"], e["field"], e["actual"], e["expected"]) for e in errors if e["type"] != "UNKNOWN_USER_BEHAVIOR"]
     assert got == [("EMPTY_CELL", "timeline.csv", 3, "behavior_details", "", "값 또는 '-'"),
                    ("INVALID_VERDICT", "timeline.csv", 3, "verdict", "추정", "확정 | 의심"),
                    ("INVALID_TIMESTAMP", "timeline.csv", 4, "timestamp", "2026-09-15 13:20:41 KST", TS_RULE),
@@ -903,7 +967,8 @@ def _self_test_end_to_end(td, image, evidence_id):
     reg = {"parsers": [{"name": n, "model": n, "python": sys.executable, "cwd": td,
                         "args": ["fake_parser.py", n, mode, "{out}"],
                         "outputs": {"timeline": "timeline.csv", "conversations": "recovered_conversations.csv"}}
-                       for n, mode in (("alpha", "ok"), ("beta", "bad"), ("gamma", "fail"))]}
+                       for n, mode in (("alpha", "ok"), ("beta", "bad"), ("gamma", "fail"), ("delta", "ok"))]}
+    reg["parsers"][3]["inputs"] = [".e01"]             # delta 는 E01 만 지원한다고 선언 → .dd 입력이면 실행 없이 UNSUPPORTED_INPUT
     reg_path, out = os.path.join(td, "reg.json"), os.path.join(td, "out")
     with open(reg_path, "w", encoding="utf-8") as fh:
         json.dump(reg, fh)
@@ -939,37 +1004,46 @@ def _self_test_end_to_end(td, image, evidence_id):
     assert p["beta"]["status"] == "contract_violation" and p["beta"]["timeline_rows"] == 0
     assert {"type": "INVALID_VERDICT", "file": "timeline.csv", "row": 4, "field": "verdict", "actual": "추정",
             "expected": "확정 | 의심"}.items() <= next(e for e in p["beta"]["errors"] if e["type"] == "INVALID_VERDICT").items()
-    assert set(p["beta"]["error_types"]) == {"EMPTY_CELL", "INVALID_VERDICT", "INVALID_TIMESTAMP"}
+    assert set(p["beta"]["error_types"]) - {"UNKNOWN_USER_BEHAVIOR"} == {"EMPTY_CELL", "INVALID_VERDICT", "INVALID_TIMESTAMP"}
+    # 행위명 경고: alpha 의 '프롬프트 전송'·'테스트용 비표준 행위' 는 목록에 없는 이름 → 경고 2건, 그래도 success 이고 2행 다 적재
+    assert p["alpha"]["error_types"] == {"UNKNOWN_USER_BEHAVIOR": 2} and p["alpha"]["status"] == "success"
+    assert {(e["row"], e["actual"]) for e in p["alpha"]["errors"]} == {(2, "프롬프트 전송"), (3, "테스트용 비표준 행위")}
+    assert "UNKNOWN_USER_BEHAVIOR x2" in console
     assert p["gamma"]["status"] == "failed" and [e["type"] for e in p["gamma"]["errors"]] == [
         "PARSER_EXECUTION_ERROR", "OUTPUT_MISSING", "OUTPUT_MISSING"]
-    assert rep["summary"] == {"parsers_run": 3, "success": 1, "failed": 1, "contract_violation": 1,
+    assert p["delta"]["status"] == "failed" and [e["type"] for e in p["delta"]["errors"]] == ["UNSUPPORTED_INPUT"]
+    assert re.search(r"\[Runner\] delta +FAILED .*UNSUPPORTED_INPUT", console) and p["delta"]["elapsed_sec"] < 1
+    with open(os.path.join(case, "delta", "run.log"), encoding="utf-8") as fh:
+        assert "지원하지 않음" in fh.read()               # 실행 안 했어도 사유는 run.log 에 남는다
+    assert p["alpha"]["artifacts_found"] and not p["gamma"]["artifacts_found"]
+    assert rep["summary"] == {"parsers_run": 4, "success": 1, "failed": 2, "contract_violation": 1,
                               "normalization_error": 0, "db_error": 0} and rep["exit_code"] == 1
     with open(os.path.join(case, "timeline.csv"), encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.reader(fh))
-    assert rows[0] == TIMELINE_FIELDS + EXTRA_COLUMNS and all(h == h.strip() for h in rows[0])
-    tl = [dict(zip(rows[0], r)) for r in rows[1:]]
+    assert rows[0] == TIMELINE_COLUMNS + EXTRA_COLUMNS                      # 병합 CSV 헤더는 팀 계약 그대로
+    tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}
-    assert {r["volume_ref"] for r in tl} == {"ntfs@5", "ntfs@7"}                         # volume_ref 규칙은 그대로
+    assert {r["volume_ref"] for r in tl} == {EMPTY, "volume0"}
     assert all(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", r["parse_time_utc"]) for r in tl)
     with open(os.path.join(case, "recovered_conversations.csv"), encoding="utf-8-sig", newline="") as fh:
-        assert next(csv.reader(fh)) == CONV_FIELDS + EXTRA_COLUMNS
+        assert next(csv.reader(fh)) == CONV_COLUMNS + EXTRA_COLUMNS
 
     # 2) 같은 evidence 재실행 (alpha 출력이 바뀜): 이전 alpha 행은 남지 않고 runs 이력은 쌓인다
     rc, console, rep = cli(FAKE_MODE_ALPHA="v2")
     assert db_rows("select distinct behavior_details from events where source_parser='alpha' and behavior_details like 'v=%'") == [("v=v2",)]
     assert db_rows("select content from messages") == [("hello v2",)]
-    assert db_rows("select count(*) from runs") == [(6,)] and rep["db"]["reset"]["scope"] == "evidence"
+    assert db_rows("select count(*) from runs") == [(8,)] and rep["db"]["reset"]["scope"] == "evidence"
 
     # 3) --only beta (이번엔 성공): alpha 결과는 유지, beta 만 교체
     rc, console, rep = cli("--only", "beta", FAKE_MODE_BETA="ok")
     assert rc == 0 and list(rep["parsers"]) == ["beta"] and rep["db"]["reset"]["parsers"] == ["beta"]
     assert db_rows("select source_parser, count(*) from events group by source_parser order by 1") == [("alpha", 2), ("beta", 2)]
-    assert rep["preserved_from_previous_runs"] == ["alpha"] and rep["merged_output"]["timeline.csv"]["rows_by_parser"] == {"alpha": 2, "beta": 2}
+    assert rep["preserved_from_previous_runs"] == ["alpha"]
     # 4) --only beta 가 다시 계약 위반이면 beta 의 이전 결과도 빠진다 (alpha 는 그대로)
     rc, console, rep = cli("--only", "beta")
     assert rc == 1 and db_rows("select source_parser, count(*) from events group by source_parser order by 1") == [("alpha", 2)]
-    assert db_rows("select count(*) from runs") == [(8,)]
+    assert db_rows("select count(*) from runs") == [(10,)]
     # 5) 헤더 끝 공백이 빠진 CSV → HEADER_MISMATCH 로 거부
     rc, console, rep = cli("--only", "beta", FAKE_BAD_HEADER="1")
     assert rep["parsers"]["beta"]["error_types"].get("HEADER_MISMATCH") == 1 and "HEADER_MISMATCH" in console
