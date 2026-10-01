@@ -31,6 +31,7 @@ tmp/
 .env
 .env.*
 !.env.example
+**/.claude/settings.local.json
 
 # 분석 결과 — 복원된 대화 원문·계정 식별자가 들어 있으므로 절대 커밋하지 않는다
 integration/out/
