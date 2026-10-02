@@ -4,7 +4,7 @@
 SQLite 에 적재하고 병합 `timeline.csv` / `recovered_conversations.csv` 와 실행 요약 `integration_report.json` 을 만든다.
 
 ```
-powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 / .venv314 생성
+powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 생성
 python llm_forensic.py -i <이미지.E01|.dd> -o out              # 전체 실행
 python llm_forensic.py -i <이미지> -o out --only chatgpt_desktop,lmstudio
 python llm_forensic.py --self-test
@@ -33,8 +33,8 @@ provenance 열 (병합 CSV·DB 공통, 원본 열을 덮어쓰지 않고 덧붙�
 | `timestamp_utc` | (DB 만) 원본 KST 표기를 UTC ISO 로 환산한 정규화 시각. 병합 CSV 정렬에 쓴다 |
 | `artifact_path_normalized` | 경로마다 드라이브·볼륨·이미지 접두어 제거, `\` 구분, 소문자 — 검색·중복 판별용. 여러 경로는 `\|` (앞뒤 공백 무관)로 나눠 각각 정규화한 뒤 ` \| ` 로 잇는다. NTFS ADS 스트림 표기(`:Zone.Identifier`, `:$J`)는 원문 그대로 |
 | `volume_ref` | 파서가 준 볼륨 식별자 (`ntfs@오프셋`, `volume0`), 없으면 `-` |
-| `source_parser`, `parser_version`, `source_file`, `parse_time_utc` | 어느 파서의 어느 파일에서, 어떤 코드 버전(소스 해시 포함)으로, 언제(UTC, 예 `2026-09-21T19:22:46Z`) 나왔는지 |
-| `evidence_id`, `evidence_sha256` | 어떤 증거 이미지인지. `evidence_sha256` 은 세그먼트 전체를 순서대로 이어 계산한 SHA-256 (무결성 대조용). `evidence_id` 는 첫 64MiB 지문(`evidence_quick_fingerprint`)의 앞 16자로, 폴더명 식별자일 뿐 무결성 값이 아니다. `--quick` 이면 `evidence_sha256`='-' |
+| `source_parser`, `parser_version`, `source_file`, `parse_time_utc` | 어느 파서의 어느 파일에서, 어떤 코드 버전(소스 해시 포함, 줄바꿈 CRLF/LF 차이는 무시)으로, 언제(UTC, 예 `2026-09-21T19:22:46Z`) 나왔는지 |
+| `evidence_id`, `evidence_sha256` | 어떤 증거 이미지인지. `evidence_sha256` 은 세그먼트 전체(E01 분할·raw 분할 모두)를 순서대로 이어 계산한 SHA-256 (무결성 대조용). `evidence_id` 는 첫 64MiB 지문(`evidence_quick_fingerprint`)의 앞 16자로, 폴더명 식별자일 뿐 무결성 값이 아니다. `--quick` 이면 `evidence_sha256`='-' |
 
 같은 evidence 재실행 (unified.db)
 - 실행 시작 시 한 트랜잭션으로 이전 결과를 지운다. 실패하면 `DB_ERROR` 로 파서를 실행하지 않고 종료코드 3.
@@ -48,6 +48,7 @@ provenance 열 (병합 CSV·DB 공통, 원본 열을 덮어쓰지 않고 덧붙�
 | 유형 | 상태 | 뜻 |
 |---|---|---|
 | `PARSER_EXECUTION_ERROR` | failed | 종료코드≠0 · 시간 초과 · 실행 불가 (상세는 `<파서명>\run.log`) |
+| `UNSUPPORTED_INPUT` | failed | 레지스트리 `inputs` 에 없는 이미지 확장자. 파서를 실행하지 않고 사유만 run.log 에 남긴다 |
 | `OUTPUT_MISSING` | failed | 레지스트리 outputs 의 CSV 가 없음 |
 | `CSV_FORMAT_ERROR` | contract_violation | UTF-8 CSV 로 읽히지 않음 |
 | `HEADER_MISMATCH` | contract_violation | 헤더가 계약과 다름 (열 위치별, 공백·대소문자 차이 표시) |
@@ -79,10 +80,13 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 
 규칙
 - 파서는 손대지 않는다. 실행 방법은 `parsers.json` 레지스트리에만 적는다.
+- 파서가 확장자를 검사해 거절하는 경우에만 레지스트리 `inputs` 에 지원 확장자를 선언한다 (현재 claude_desktop·gemini_web·lmstudio). 선언이 없으면 검사하지 않는다. 담당자가 파서의 허용 목록을 넓히면 이 선언도 같이 갱신한다.
+- 입력 이미지: E01 분할(.E01~)과 raw 분할(.001, .002 …)은 첫 세그먼트 경로만 주면 나머지를 모아 결번을 검사한다. `.dd`/`.raw`/`.img` 단일 파일도 된다.
+- `[Runner]` 가 `OK events=0 messages=0` 이면 콘솔에 0건 표시가 붙고 보고서의 `artifacts_found` 가 false 다. 흔적이 없는 것인지 파서가 입력을 못 읽은 것인지는 `<파서명>\run.log` 로 구분한다.
 - `artifact_path` 는 파서 표기 그대로 두고, 검색·중복 판별은 `artifact_path_normalized` 로 한다 (드라이브 문자 추정 안 함).
 - `volume_ref` 는 파서가 준 값만 옮긴다. 우선순위: Artifact_details 의 `volume=` / `partition_offset=` 키 → 경로의 `NTFS@오프셋`·`volumeN` → 레지스트리 `volume_json`(실행 단위 JSON) → `-`.
   현재 chatgpt_desktop·gemini_web 은 행 단위, chatgpt_web 은 실행 단위, lmstudio 는 경로(volume0), claude_desktop·claude_web 은 미제공(`-`).
 - 헤더·열 수·Verdict·Timestamp·빈 셀 계약을 어긴 파서 결과는 고쳐 받지 않고 그 파서 결과 전체를 적재하지 않은 채 `contract_violation` 으로 보고한다 (위 오류 유형 표).
 - 종료코드 0 전부 성공 / 1 일부 실패·위반 / 2 입력 실패 / 3 통합 DB·병합 출력 오류.
 
-실행 환경: `.venv312` = ChatGPT Desktop·ChatGPT Web·Claude Desktop·Claude Web·Gemini, `.venv314` = LM Studio (`setup.ps1` 참조).
+실행 환경: `.venv312` = 모든 파서 (`setup.ps1` 참조).

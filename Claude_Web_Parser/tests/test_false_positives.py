@@ -6,24 +6,20 @@ from __future__ import annotations
 
 import datetime as dt
 
-from claude_web_forensics.analysis.accounts import (
-    M_NONE,
-    M_SINGLE_SESSION_CONTEXT,
-    build_account_context,
-    link_account,
-)
 from claude_web_forensics.analysis.conversations import ConversationBuilder
-from claude_web_forensics.analysis.correlator import Correlator
 from claude_web_forensics.analysis.detectors import (
     DetectorContext,
+    detect_account_switch,
     detect_cache_cleared,
     detect_chrome_incognito,
     detect_conversation_delete,
     detect_document_attachment_removed,
+    detect_document_download,
     detect_downloaded_file_deleted,
     detect_export,
     detect_history_cleared,
     detect_image_generation,
+    detect_login,
     detect_logout,
     detect_model_change,
 )
@@ -60,16 +56,11 @@ def rec(family, locator, ts=None, **attrs) -> EvidenceRecord:
 def make_ctx(records, extended_fs=False, file_traces=None, conversations=None) -> DetectorContext:
     store = EvidenceStore()
     store.extend(records)
-    builder = conversations or ConversationBuilder()
     return DetectorContext(
         store=store,
-        correlator=Correlator(store),
-        conversations=builder,
-        account_ctx=build_account_context(store),
+        conversations=conversations or ConversationBuilder(),
         file_traces=file_traces or [],
-        lifecycles={},
         extended_fs=extended_fs,
-        artifact_available={f: True for f in store.families_present()},
     )
 
 
@@ -131,7 +122,7 @@ def test_settings_url_alone_does_not_confirm_export_completion():
     assert event.verdict == VERDICT_SUSPECTED
     assert event.action_detail == (
         "Export 설정 화면 접근(완료 미확인)_"
-        "https://claude.ai/new#settings/data-privacy-controls/export-data"
+        "claude.ai/new#settings/data-privacy-controls/export-data"
     )
     assert result.coverage[0].status == VERDICT_SUSPECTED
 
@@ -181,47 +172,116 @@ def test_history_download_alone_does_not_confirm_local_deletion():
     assert detect_downloaded_file_deleted(ctx).events == []
 
 
-def test_multiple_account_candidates_leave_account_empty():
+def visit(locator, when, url, title="Claude"):
+    return rec(FAMILY_HISTORY, locator, when, subtype="visit", url=url, title=title)
+
+
+T = dt.datetime(2026, 9, 23, 1, 56, tzinfo=KST)
+S = dt.timedelta(seconds=1)
+
+
+def test_desktop_app_delegation_is_not_a_web_login():
+    """The desktop app finishing its OAuth in the browser is not a Claude web login."""
+    ctx = make_ctx([
+        visit("a", T, "https://claude.ai/login/app-google-auth?open_in_browser=1&hop_nonce=x"),
+        visit("b", T + 4 * S, "https://accounts.google.com/o/oauth2/v2/auth?client_id=c"),
+        visit("c", T + 18 * S, "https://claude.ai/login/popup-google-auth?code=secret"),
+        visit("d", T + 60 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+    ])
+    assert detect_login(ctx).events == []
+    assert any("desktop-app" in note for note in ctx.notes)
+
+
+def test_separate_login_flows_stay_separate_with_their_own_landing_time():
+    day2 = T + dt.timedelta(hours=11)
+    ctx = make_ctx([
+        visit("a1", T, "https://claude.ai/login"),
+        visit("a2", T + 5 * S, "https://accounts.google.com/v3/signin/challenge/pwd?TL=x"),
+        visit("a3", T + 40 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+        visit("b1", day2, "https://accounts.google.com/o/oauth2/v2/auth?client_id=c"),
+        visit("b2", day2 + 30 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+    ])
+    events = detect_login(ctx).events
+    assert sorted(e.timestamp for e in events) == [T + 40 * S, day2 + 30 * S]
+
+
+def test_login_detail_and_verdict_never_contradict():
+    """History alone stays 의심; a sign-in landing says 인증 완료 미확인; 확정 never says 미확인."""
+    history_only = make_ctx([
+        visit("a1", T, "https://claude.ai/login"),
+        visit("a2", T + 40 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+    ])
+    [event] = detect_login(history_only).events
+    assert event.verdict == VERDICT_SUSPECTED and "세션 생성 기록 미확인" in event.action_detail
+
+    marker = rec("local_storage", "m", T + 41 * S, script_key="rq-cache-confirmed-account-session",
+                 marker_at=T + 41 * S)
+    confirmed = make_ctx(list(history_only.store) + [marker])
+    [event] = detect_login(confirmed).events
+    assert event.verdict == VERDICT_CONFIRMED and "미확인" not in event.action_detail
+
+    sign_in = make_ctx([
+        visit("a1", T, "https://accounts.google.com/o/oauth2/v2/auth?client_id=c"),
+        visit("a2", T + 40 * S, "https://claude.ai/new", "Sign in - Claude"),
+    ])
+    [event] = detect_login(sign_in).events
+    assert event.verdict == VERDICT_SUSPECTED and "인증 완료 미확인" in event.action_detail
+
+
+def test_residual_organization_uuids_alone_never_create_a_switch():
+    """Two organizations cached in one profile are multi-account traces, not a switch."""
     records = [
-        rec(FAMILY_CACHE, "a", cache_key="k1", variant_index=0,
-            account_uuid="aaaaaaaa-0000-0000-0000-000000000001",
-            organization_uuid="org-1"),
-        rec(FAMILY_CACHE, "b", cache_key="k2", variant_index=0,
-            account_uuid="bbbbbbbb-0000-0000-0000-000000000002",
-            organization_uuid="org-1"),
+        rec(FAMILY_CACHE, "a", cache_key="https://claude.ai/api/organizations/o1/x", variant_index=0,
+            organization_uuid="org-1", response_at=T),
+        rec(FAMILY_CACHE, "b", cache_key="https://claude.ai/api/organizations/o2/x", variant_index=0,
+            organization_uuid="org-2", response_at=T + 60 * S),
     ]
-    store = EvidenceStore()
-    store.extend(records)
-    ctx = build_account_context(store)
-    orphan = rec(FAMILY_HISTORY, "u", subtype="url", url="https://claude.ai/new",
-                 organization_uuid="org-1")
-    link = link_account(orphan, ctx)
-    assert link.account_uuid is None
-    assert link.method == M_NONE
-    assert len(link.candidates) == 2
+    result = detect_account_switch(make_ctx(records))
+    assert result.events == []
+    assert result.coverage[0].status == VERDICT_UNDETERMINED
 
 
-def test_single_account_context_is_used_but_labelled():
+def test_switch_needs_two_login_sessions_with_different_organizations():
+    later = T + dt.timedelta(minutes=30)
     records = [
-        rec(FAMILY_CACHE, "a", cache_key="k1", variant_index=0,
-            account_uuid="aaaaaaaa-0000-0000-0000-000000000001")
+        visit("a1", T, "https://claude.ai/login"),
+        visit("a2", T + 40 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+        rec(FAMILY_CACHE, "c1", cache_key="https://claude.ai/api/organizations/o1/x",
+            variant_index=0, organization_uuid="org-1", response_at=T + 50 * S),
+        visit("l1", T + 600 * S, "https://claude.ai/logout"),
+        visit("b1", later, "https://claude.ai/login"),
+        visit("b2", later + 30 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+        rec(FAMILY_CACHE, "c2", cache_key="https://claude.ai/api/organizations/o2/x",
+            variant_index=0, organization_uuid="org-2", response_at=later + 35 * S),
     ]
-    store = EvidenceStore()
-    store.extend(records)
-    ctx = build_account_context(store)
-    orphan = rec(FAMILY_HISTORY, "u", subtype="url", url="https://claude.ai/new")
-    link = link_account(orphan, ctx)
-    assert link.account_uuid == "aaaaaaaa-0000-0000-0000-000000000001"
-    assert link.method == M_SINGLE_SESSION_CONTEXT
+    [event] = detect_account_switch(make_ctx(records)).events
+    assert event.timestamp == later + 30 * S
+    assert event.verdict == VERDICT_CONFIRMED
+    assert "조직 A" in event.action_detail and "조직 B" in event.action_detail
+    same_org = [r for r in records if r.record_locator != "c2"] + [
+        rec(FAMILY_CACHE, "c3", cache_key="https://claude.ai/api/organizations/o1/y",
+            variant_index=0, organization_uuid="org-1", response_at=later + 35 * S)]
+    assert detect_account_switch(make_ctx(same_org)).events == []
 
 
-def test_organization_uuid_never_becomes_an_account_uuid():
-    records = [rec(FAMILY_HISTORY, "u", subtype="url",
-                   url="https://claude.ai/api/organizations/org-1/x",
-                   organization_uuid="org-1")]
-    store = EvidenceStore()
-    store.extend(records)
-    ctx = build_account_context(store)
-    assert "org-1" not in ctx.account_uuids
-    link = link_account(records[0], ctx)
-    assert link.account_uuid is None
+def test_installer_download_is_not_a_document_download():
+    ctx = make_ctx([rec(FAMILY_HISTORY, "d", T, subtype="download", download_id=1, state=1,
+                        file_name="Claude Setup.exe", mime_type="application/x-msdownload",
+                        target_path=r"C:\Users\u\Downloads\Claude Setup.exe",
+                        chain_urls=["https://claude.ai/api/desktop/win32/x64/setup/latest/redirect"])])
+    assert detect_document_download(ctx).events == []
+
+
+def test_unresolved_session_in_between_leaves_the_switch_unreported():
+    """org-1 session, a session with no org record, then org-2: the switch moment is unknown."""
+    def login(prefix, start, org=None):
+        out = [visit(f"{prefix}1", start, "https://claude.ai/login"),
+               visit(f"{prefix}2", start + 30 * S, "https://claude.ai/new", "새 채팅 - Claude"),
+               visit(f"{prefix}3", start + 300 * S, "https://claude.ai/logout")]
+        if org:
+            out.append(rec(FAMILY_CACHE, f"{prefix}c", cache_key=f"https://claude.ai/api/organizations/{org}/x",
+                           variant_index=0, organization_uuid=org, response_at=start + 40 * S))
+        return out
+    hour = dt.timedelta(hours=1)
+    records = login("a", T, "org-1") + login("b", T + hour) + login("c", T + 2 * hour, "org-2")
+    assert detect_account_switch(make_ctx(records)).events == []

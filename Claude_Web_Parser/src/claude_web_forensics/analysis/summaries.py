@@ -1,221 +1,104 @@
-"""Human-readable summaries of the artifact records a detector actually used.
-
-What goes in: the values that *demonstrate* the action — filenames, URLs, paths
-that are themselves the evidence, UUIDs, timestamps, states.
-
-What stays out: evidence ids, detail refs, table row ids, LevelDB sequence
-numbers, record locators, MFT record positions, source paths inside the image,
-staging paths, raw references and whole JSON blobs. Those remain internal.
-"""
+"""One-line descriptions of the records a detector used (Artifact_details)."""
 from __future__ import annotations
 
-from typing import Any, Iterable
+import datetime as dt
+import re
+from typing import Any
 
 from ..model.entities import FAMILY_DISPLAY, EvidenceRecord
-from ..util.common import to_kst_display
+from ..util.common import KST, ensure_aware, from_webkit
 
-# Keys that must never be rendered into the report.
-_FORBIDDEN_KEYS = frozenset(
-    {
-        "record_locator", "evidence_id", "detail_ref", "raw_ref", "source_path",
-        "ldb_seq_no", "leveldb_seq_number", "sequence_number", "mft_segment",
-        "mft_sequence", "byte_offset", "record_location", "metadata_location",
-        "body_location", "staged_path", "value", "_json", "command_ordinal",
-        "download_id", "usn", "variant_index", "external_value_path",
-        "decoded_body_path", "artifact_path",
-    }
+MAX_VALUE = 120
+_SECRET_QUERY = re.compile(
+    r"(?:^|&)(?:code|state|token|nonce|hop_nonce|client_id|scope|tl|part|as|rart|gis_params|"
+    r"session\w*|authuser|continue|ifkv|flowname)=", re.I,
 )
 
-MAX_VALUE = 180
+def clip(value: Any, limit: int = MAX_VALUE) -> str:
+    text = " ".join(str(value if value is not None else "").replace("\x00", "").split())
+    return text if len(text) <= limit else text[:limit] + "…"
 
+def short_url(url: Any, limit: int = MAX_VALUE) -> str:
+    text = str(url or "").replace("\x00", "").strip().split(" ")[-1]
+    prefix = ""
+    if text.startswith("blob:"):
+        prefix, text = "blob:", text[5:]
+    text = re.sub(r"^[a-z]+://", "", text)
+    base, _, fragment = text.partition("#")
+    path, _, query = base.partition("?")
+    if query and (len(query) > 40 or _SECRET_QUERY.search(query)):
+        query = "…"
+    out = prefix + path + (f"?{query}" if query else "")
+    if fragment and "=" not in fragment:
+        out += f"#{fragment}"
+    return clip(out, limit)
 
-def _clip(value: Any, limit: int = MAX_VALUE) -> str:
-    text = str(value if value is not None else "").replace("\r", " ").replace("\n", " ")
-    text = " ".join(text.split())
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "…"
+def kst(value: dt.datetime | None) -> str:
+    aware = ensure_aware(value)
+    return aware.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S") if aware else "-"
 
+def _title(value: Any) -> str:
+    return f" ({clip(value, 40)})" if value else ""
 
-def _pairs(items: Iterable[tuple[str, Any]]) -> str:
-    out = []
-    for key, value in items:
-        if key in _FORBIDDEN_KEYS:
-            continue
-        if value in (None, "", [], {}):
-            continue
-        out.append(f"{key}={_clip(value)}")
-    return ", ".join(out)
-
+def _pairs(*items: tuple[str, Any]) -> str:
+    return ", ".join(f"{k}={clip(v)}" for k, v in items if v not in (None, "", [], {}))
 
 def summarize_record(record: EvidenceRecord) -> str:
-    """One line describing what this record shows. Empty when nothing useful."""
     family = record.artifact_family
     attrs = record.attributes
-    display = FAMILY_DISPLAY.get(family, family)
+    head = f"[{FAMILY_DISPLAY.get(family, family)}]"
     subtype = attrs.get("subtype")
 
+    if family == "history" and subtype == "download":
+        end = from_webkit(attrs.get("end_time")) or record.timestamp
+        return f"{head} 다운로드 {attrs.get('state_label')} {kst(end)}, " + _pairs(
+            ("파일", attrs.get("file_name")), ("MIME", attrs.get("mime_type")),
+            ("크기", attrs.get("received_bytes")), ("URL", short_url((attrs.get("chain_urls") or [""])[0])),
+        )
+    if family == "history" and subtype == "visit":
+        return f"{head} {kst(record.timestamp)} 방문 {short_url(attrs.get('url'))}{_title(attrs.get('title'))}"
     if family == "history":
-        if subtype == "download":
-            body = _pairs(
-                [
-                    ("상태", attrs.get("state_label")),
-                    ("파일명", attrs.get("file_name")),
-                    ("저장 경로", attrs.get("target_path") or attrs.get("current_path")),
-                    ("MIME", attrs.get("mime_type")),
-                    ("크기", attrs.get("received_bytes")),
-                    ("다운로드 URL", (attrs.get("chain_urls") or [""])[0]),
-                ]
-            )
-            return f"[{display}] 다운로드 {body}" if body else ""
-        if subtype in ("url", "visit"):
-            body = _pairs(
-                [
-                    ("URL", attrs.get("url")),
-                    ("제목", attrs.get("title")),
-                    ("방문 횟수", attrs.get("visit_count")),
-                ]
-            )
-            return f"[{display}] {body}" if body else ""
-
-    if family == "cookies":
-        body = _pairs(
-            [
-                ("host", attrs.get("host_key")),
-                ("name", attrs.get("name")),
-                ("secure", attrs.get("is_secure")),
-                ("httponly", attrs.get("is_httponly")),
-            ]
-        )
-        # Cookie values are never reproduced.
-        return f"[{display}] {body}" if body else ""
-
-    if family == "cache":
-        body = _pairs(
-            [
-                ("유형", attrs.get("key_kind")),
-                ("대화 제목", attrs.get("conversation_title")),
-                ("대화 UUID", record.conversation_uuid),
-                ("snapshot UUID", attrs.get("snapshot_uuid")),
-                ("is_temporary", attrs.get("is_temporary")),
-                ("모델", attrs.get("conversation_model")),
-                ("Content-Type", attrs.get("content_type")),
-                ("Content-Encoding", attrs.get("content_encoding")),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
-    if family == "indexeddb":
-        body = _pairs(
-            [
-                ("저장소", f"{attrs.get('database')}/{attrs.get('object_store')}"
-                 if attrs.get("database") else None),
-                ("key", attrs.get("key_text")),
-                ("상태", attrs.get("record_state")),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
-    if family == "local_storage":
-        body = _pairs(
-            [
-                ("key", attrs.get("script_key")),
-                ("내용", attrs.get("value_preview")),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
+        return (f"{head} {short_url(attrs.get('url'))}{_title(attrs.get('title'))}, "
+                f"방문 {attrs.get('visit_count')}회, 마지막 {kst(record.timestamp)}")
     if family == "sessions":
-        body = _pairs(
-            [
-                ("URL", attrs.get("url")),
-                ("제목", attrs.get("title")),
-                ("referrer", attrs.get("referrer_url")),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
+        return f"{head} {kst(record.timestamp)} 탭 탐색 {short_url(attrs.get('url'))}{_title(attrs.get('title'))}"
+    if family == "cookies":
+        return f"{head} {attrs.get('host_key')} {attrs.get('name')} 생성 {kst(record.timestamp)}"
+    if family == "cache":
+        line = f"{head} {attrs.get('key_kind')} {short_url(attrs.get('cache_key'))}"
+        if attrs.get("response_at"):
+            line += f" 응답 {kst(attrs['response_at'])}"
+        return line + (f", {clip(attrs.get('content_type'), 40)}" if attrs.get("content_type") else "")
+    if family == "indexeddb":
+        line = (f"{head} {attrs.get('database')}/{attrs.get('object_store')} "
+                f"key={clip(attrs.get('key_text'), 60)}, 상태={attrs.get('record_state')}")
+        return line + (f", updatedAt {kst(record.timestamp)}" if record.timestamp else "")
+    if family == "local_storage":
+        line = f"{head} key={clip(attrs.get('script_key'), 60)}"
+        return line + (f", 기록 시각 {kst(record.timestamp)}" if record.timestamp else "") + \
+            f", 값 {attrs.get('value_length')}자"
     if family == "mft":
-        body = _pairs(
-            [
-                ("경로", attrs.get("full_path")),
-                ("할당", attrs.get("allocated")),
-                ("크기", attrs.get("logical_size")),
-                ("대체 스트림", ";".join(attrs.get("data_streams") or []) or None),
-            ]
+        streams = ";".join(attrs.get("data_streams") or [])
+        return f"{head} " + _pairs(
+            ("경로", attrs.get("full_path")), ("할당", attrs.get("allocated")),
+            ("크기", attrs.get("logical_size")), ("대체 스트림", streams),
         )
-        return f"[{display}] {body}" if body else ""
-
     if family == "zone_identifier":
-        body = _pairs(
-            [
-                ("ZoneId", attrs.get("zone_id")),
-                ("HostUrl", attrs.get("host_url")),
-                ("ReferrerUrl", attrs.get("referrer_url")),
-                ("대화 UUID", record.conversation_uuid),
-                ("원격 경로", attrs.get("remote_path")),
-            ]
+        return f"{head} " + _pairs(
+            ("ZoneId", attrs.get("zone_id")), ("HostUrl", short_url(attrs.get("host_url"))),
+            ("ReferrerUrl", short_url(attrs.get("referrer_url"))),
         )
-        return f"[{display}] {body}" if body else ""
-
-    if family == "usn":
-        reasons = ";".join(attrs.get("reasons") or [])
-        body = _pairs(
-            [
-                ("파일명", attrs.get("file_name")),
-                ("변경", reasons or None),
-                ("시각", to_kst_display(record.timestamp) or None),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
-    if family == "recycle_bin":
-        body = _pairs(
-            [
-                ("원본 경로", attrs.get("original_path")),
-                ("원본 크기", attrs.get("original_size")),
-                ("삭제 시각", to_kst_display(record.timestamp) or None),
-                ("$R 존재", "예" if attrs.get("has_r_file") else "아니오"),
-            ]
-        )
-        return f"[{display}] {body}" if body else ""
-
     if family == "filesystem_file":
-        body = _pairs(
-            [
-                ("파일명", attrs.get("file_name")),
-                ("경로", attrs.get("windows_path")),
-                ("크기", attrs.get("size")),
-            ]
+        return f"{head} " + _pairs(("파일", attrs.get("file_name")), ("경로", attrs.get("windows_path")), ("크기",
+            attrs.get("size")),)
+    if family == "usn":
+        return f"{head} " + _pairs(
+            ("파일", attrs.get("file_name")), ("변경", ";".join(attrs.get("reasons") or [])),
+            ("시각", kst(record.timestamp)),
         )
-        return f"[{display}] {body}" if body else ""
-
-    return f"[{display}] {_clip(record.summary)}" if record.summary else ""
-
-
-def summarize_group(
-    records: Iterable[EvidenceRecord], max_lines_per_family: int = 3
-) -> list[str]:
-    """Deduplicated per-artifact lines for the records a detector relied on.
-
-    Duplicate records of the same artifact collapse into one line; records the
-    detector did not use are never passed in, so they never appear.
-    """
-    seen: set[str] = set()
-    per_family: dict[str, int] = {}
-    lines: list[str] = []
-    for record in records:
-        if record is None:
-            continue
-        line = summarize_record(record)
-        if not line or line in seen:
-            continue
-        family = record.artifact_family
-        if per_family.get(family, 0) >= max_lines_per_family:
-            continue
-        per_family[family] = per_family.get(family, 0) + 1
-        seen.add(line)
-        lines.append(line)
-    # Stable order: group by artifact display name.
-    lines.sort()
-    return lines
+    if family == "recycle_bin":
+        return f"{head} " + _pairs(
+            ("원본 경로", attrs.get("original_path")), ("원본 크기", attrs.get("original_size")),
+            ("삭제 시각", kst(record.timestamp)), ("$R 존재", "예" if attrs.get("has_r_file") else "아니오"),
+        )
+    return f"{head} {clip(record.summary)}"

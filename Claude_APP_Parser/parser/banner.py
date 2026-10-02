@@ -78,7 +78,7 @@ def _b3() -> str:
         "{d}{cy}    {r}{cy}██      ██   ██ ██      ██   ██ ██      ██  ██  ██{r}",
         "{d}{cy}    {r}{bl}███████ ██   ██ ███████ ██   ██ ███████ ██      ██{r}",
         "",
-        "{b}{WH}      에 레 렘{r}{gy}  ·  A I   F O R E N S I C   P A R S E R{r}",
+        "{b}{WH}      에 레 렘{r}{gy}  ·  C L A U D E   D E S K T O P   P A R S E R{r}",
         "",
     ])
 

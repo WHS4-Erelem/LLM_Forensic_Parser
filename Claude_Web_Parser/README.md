@@ -65,12 +65,13 @@ output/
 └─ recovered_conversations.csv  복구된 Claude 대화 메시지
 ```
 
-진행 상황과 파싱 상태는 콘솔에만 출력하며 로그 파일은 만들지 않습니다. 아티팩트 staging 사본은 출력 폴더 밖의 임시 작업 폴더에 두고 실행이 끝나면 삭제합니다(`--keep-staging` 사용 시 유지). 파일 바이트는 내보내지 않으며 해시도 계산하지 않습니다.
+진행 상황과 파싱 상태는 콘솔에만 출력하며 로그 파일은 만들지 않습니다. 콘솔에는 `diag` 줄(Cache key 유형별 복호화·JSON 파싱 건수와 최상위 JSON 키, IndexedDB key 유형과 react-query queryKey, 대화 객체·메시지 발견/폐기 건수와 사유, 보고하지 않은 흔적의 건수)과 행위별 `coverage` 줄이 함께 출력되며, 내용 원문·토큰 값은 출력하지 않습니다. 아티팩트 staging 사본은 출력 폴더 밖의 임시 작업 폴더에 두고 실행이 끝나면 삭제합니다(`--keep-staging` 사용 시 유지). 파일 바이트는 내보내지 않으며 해시도 계산하지 않습니다.
 
 두 CSV 모두 BOM이 포함된 UTF-8(Excel에서 한글이 깨지지 않음)이며, 인덱스 열이 없고, 표준 CSV quoting을 적용해 값 안의 쉼표·큰따옴표·줄바꿈이 한 셀 안에 유지됩니다. 결과가 0건이어도 헤더는 항상 기록되며, 임시 이름으로 작성 → 재검증 → 이름 변경 순서로 저장합니다. 같은 입력이면 행 순서도 항상 같습니다. `=` `+` `-` `@`로 시작하는 값에는 `'`를 붙여 Excel이 수식으로 실행하지 않게 합니다.
 
 * `timestamp`는 **KST만** 사용하며 형식은 `2026-08-21 07:43:58.056458 KST`입니다. 근거 있는 시각이 없으면 비워 둡니다.
-* 대표 시각은 행위를 *직접 입증하는* 레코드의 시각입니다 — 다운로드는 `downloads.end_time`, 휴지통 삭제는 `$I` 삭제 시각, 모델 변경은 `model_selected` 이벤트.
+* 대표 시각은 행위를 *직접 입증하는* 레코드 자신의 시각입니다 — 다운로드는 `downloads.end_time`, 휴지통 삭제는 `$I` 삭제 시각, 로그인은 인증 흐름 뒤 첫 인증 페이지 방문, 전송은 `claudeai.message.sent` 이벤트 시각, 초안은 초안 자체의 `updatedAt`. 객체에 생성 시각이 없으면(공유 스냅샷, 업로드 파일 자산) 그 객체를 브라우저가 받은 Cache 응답 시각을 쓰고 `Behavior_details `에 기준을 밝히며, 다른 페이지의 방문 시각을 대입하지 않습니다.
+* Sessions/Tabs(SNSS)의 시각은 1601년 기준 UTC 값이므로 UTC로 해석합니다.
 * 마스킹하지 않습니다. 단, 쿠키·토큰 **값**은 출력하지 않고 host, name, path, 시각, flag, 값 길이만 기록합니다.
 
 ### timeline.csv
@@ -81,7 +82,9 @@ output/
 
 `Model`은 항상 `claude-web`입니다. `Verdict`는 `확정`과 `의심`만 출력하며 `판단불가`는 출력하지 않습니다. `User_behavior`에는 판정과 관계없이 아래 24개 고정 행위명 중 하나만 들어갑니다. `Behavior_details `는 `<흔적 성격>_<핵심 내용>` 형식입니다(예: `프롬프트 작성 흔적(전송 미확인)_[MRK_E0505] …`, `이미지 업로드 준비 흔적(전송 불확인)_x.png`, `Export 설정 화면 접근(완료 미확인)_<URL>`).
 
-`Artifact_path`에는 해당 행의 판정에 실제로 사용된 아티팩트의 **디스크 이미지 내부 논리 경로**를 중복 제거 후 `|`로 연결해 기록합니다(예: `C:\Users\<사용자>\AppData\Local\Google\Chrome\User Data\Default\History`, `…\Cache\Cache_Data\data_3`, `…\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000005.ldb`, `C:\$MFT`, `C:\$Extend\$UsnJrnl:$J`, `C:\$Recycle.Bin\<SID>\$I…`, `…\Downloads\a.pdf:Zone.Identifier`). 경로를 확인할 수 없으면 빈 문자열로 두며, 분석 PC의 staging 경로는 절대 기록하지 않습니다. `Artifact_details `에는 기존의 파싱 결과 설명을 유지합니다.
+`Artifact_path`에는 해당 행의 판정에 실제로 사용된 아티팩트의 **디스크 이미지 내부 논리 경로**만 중복 제거 후 `|`로 연결해 기록합니다(예: `C:\Users\<사용자>\AppData\Local\Google\Chrome\User Data\Default\History`, `…\Cache\Cache_Data\data_3`, `…\IndexedDB\https_claude.ai_0.indexeddb.leveldb\000005.ldb`, `C:\$MFT`, `C:\$Extend\$UsnJrnl:$J`, `C:\$Recycle.Bin\<SID>\$I…`, `…\Downloads\a.pdf:Zone.Identifier`). 순서는 detector가 정한 중요도 순(가장 직접적인 근거가 먼저)입니다. 경로를 확인할 수 없으면 빈 문자열로 두며, 분석 PC의 staging 경로는 절대 기록하지 않습니다.
+
+`Artifact_details `는 같은 셀 안에서 **경로 하나당 한 줄**이며, `Artifact_path`의 경로와 순서대로 1:1로 대응합니다. 각 줄은 `[계열]`로 시작하고 그 경로에서 행위를 가장 직접적으로 보여 주는 레코드의 핵심값(짧은 URL·방문 시각·제목, 이벤트 이름·시각, 파일명·상태 등)만 담습니다. 같은 경로의 레코드가 여럿이면 detector가 고른 핵심값을 한 줄로 합칩니다(`; `로 구분). URL은 호스트·경로·fragment만 남기고 길거나 인증값이 든 query는 `?…`로 줄이며, JSON 본문과 쿠키 값은 넣지 않습니다.
 
 `timeline.csv`에는 실제 UUID를 출력하지 않습니다. 계정·조직·대화·메시지·파일·snapshot UUID는 분석 과정에서 그대로 사용하지만, 출력 직전에 두 상세 열에서 제거합니다(`대화 UUID=…` 같은 라벨 쌍은 통째로 삭제하고, URL·JSON 미리보기 안의 UUID는 `[uuid]`로 대체). 대화 제목, 파일명, 모델명, URL, 다운로드 상태, MIME 등 나머지 정보는 유지하며 사용자가 입력한 리터럴 `<uuid>` 문자열도 그대로 둡니다.
 
@@ -137,25 +140,25 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 
 | Rule | Action | 직접 증거 allowlist | 비고 |
 |---|---|---|---|
-| `R-E0101` | E01-01 로그인 | token fragment가 포함된 magic-link 인증 URL | 현재 cookie만 있거나 `/new` 방문 1건만 있는 경우는 제외 |
+| `R-E0101` | E01-01 로그인 | 흐름 안에서 생성된 계정 세션 마커(`rq-cache-confirmed-account-session`) 또는 `sessionKey` 쿠키 | History 인증 URL 흐름 → 인증 페이지(`/new`, `/chat/…`) 진입을 흐름마다 한 행으로. 다른 계열(세션 마커·쿠키·진입 직후 조직 API 응답)이 없으면 `의심`. 데스크톱 앱의 브라우저 인증 위임(`app-google-auth`)은 제외 |
 | `R-E0102` | E01-02 로그아웃 | 명시적인 `/logout` 또는 `login?from=logout` | cookie 부재는 절대 사용하지 않음 |
-| `R-E0103` | E01-03 계정 전환 | *(없음)* | 2개 이상의 계정 컨텍스트와 재인증/onboarding 흔적이 필요하며, 잔존 UUID만으로는 계정 전환으로 보지 않음 |
-| `R-E0301` | E03-01 새로운 대화 생성 | conversation API object + root user message | |
+| `R-E0103` | E01-03 계정 전환 | *(없음)* | 연속된 두 로그인 세션의 조직이 각 세션 창 **안의** 기록(조직 범위 Cache 응답, 대화 객체, 해당 조직 대화 방문)으로 확인되고 서로 다를 때만. 잔존 UUID만으로는 계정 전환으로 보지 않음 |
+| `R-E0301` | E03-01 새로운 대화 생성 | `chorus.conversation_created` 이벤트 | 대화 객체(`created_at`) + 생성 시점의 `/chat/<uuid>` 방문은 두 계열로 `확정`. 객체만 있으면(다른 기기 생성 가능) 보고하지 않음. `/new` 직후 첫 방문뿐이면 `의심` |
 | `R-E0302` | E03-02 기존 대화 삭제 | 명시적인 delete 이벤트 / tombstone | Cache 잔존은 삭제의 증거가 아니며, server-side 영구 삭제라고 부르지 않음 |
 | `R-E0303` | E03-03 대화 수정 | 하나의 parent 아래에 ≥2개의 human message UUID | 텍스트가 다르다는 사실만으로 수정으로 보지 않음 |
 | `R-E0304` | E03-04 대화 재시도 | assistant branch의 `input_mode=retry` | |
-| `R-E0401` | E04-01 사용자 프롬프트 입력/전송 | `created_at`이 있는 user message UUID | draft만 있으면 `의심`이며 `행위_상세`에는 "프롬프트 작성 흔적(전송 미확인)"으로 기록 |
-| `R-E0501` / `R-E0503` | E05-01/03 이미지 / 문서 업로드 | 전송된 메시지와 연결된 attachment | draft만 있으면 `의심`이며 `행위_상세`에는 "준비 흔적(전송 불확인)"으로 기록 |
+| `R-E0401` | E04-01 사용자 프롬프트 입력/전송 | `created_at`이 있는 user message UUID, `claudeai.message.sent` 이벤트 | 전송 직전 초안(같은 길이·같은 계정)은 전송 행의 내용으로만 쓰고 다시 내보내지 않음. 초안만 있으면 작성 과정 하나당 한 행 `의심`, "프롬프트 작성 흔적(전송 미확인)" |
+| `R-E0501` / `R-E0503` | E05-01/03 이미지 / 문서 업로드 | 전송된 메시지와 연결된 attachment | draft 첨부나 이 프로필이 조회한 업로드 파일 자산(`/files/<uuid>/preview`·`document_pdf`)만 있으면 `의심`(전송 미확인). 프로젝트 지식 파일 목록은 업로드 흔적이 아님 |
 | `R-E0502` / `R-E0504` | E05-02/04 첨부파일 제거 | 명시적인 removal 이벤트 / tombstone | 잔존 metadata는 제거의 증거가 아님 |
-| `R-E0505` | E05-05 문서 다운로드 | History `COMPLETE` + target path + Claude URL chain | 중단된 경우: `의심`, "다운로드 시도 흔적(완료 미확인)" |
+| `R-E0505` | E05-05 문서 다운로드 | History `COMPLETE` + target path + Claude URL chain | 설치 파일·실행 파일(`.exe` 등, `application/x-msdownload`, `/desktop/…/setup`)은 제외. 중단된 경우: `의심`, "다운로드 시도 흔적(완료 미확인)" |
 | `R-E0601` | E06-01 이미지 생성 | user message와 연결된 assistant tool result / output resource | prompt keyword만으로는 절대 충분하지 않음 |
 | `R-E0602` | E06-02 생성 이미지 다운로드 | `R-E0505`와 동일하며 image MIME 사용 | |
 | `R-E0603` | E06-03 다운로드 파일 삭제 | exact path로 Claude 다운로드와 연결된 `$I` 삭제 metadata | USN은 경로/삭제 정황을 보강할 수 있으나 standalone USN delete 또는 deleted MFT만으로 이벤트를 생성하지 않음 |
 | `R-E0701` | E07-01 대화 데이터 Export | export API request / archive / completion object | settings 방문만 있으면: `의심`, "Export 설정 화면 접근(완료 미확인)" |
-| `R-E0702` | E07-02 공유 링크 생성 | snapshot→conversation을 매핑하는 snapshot object | |
-| `R-E0901` | E09-01 모델 변경 | `previous_model`이 있는 `model_selector.model_selected` | 현재 모델 하나만으로는 변경 이벤트를 생성하지 않음 |
-| `R-E0902` | E09-02 계정 이름 변경 | 하나의 account UUID에 대해 시간 순서가 있는 두 개의 display name | 현재 이름 하나는 metadata일 뿐 |
-| `R-E1001` | E10-01 임시 채팅 사용 | `is_temporary=true` | Chrome Incognito와 동일하지 않음 |
+| `R-E0702` | E07-02 공유 링크 생성 | snapshot→conversation을 매핑하는 snapshot object | 시각은 snapshot의 `created_at`, 없으면 그 객체의 Cache 응답 시각(기준을 상세에 표시) |
+| `R-E0901` | E09-01 모델 변경 | `previous_model`이 있는 `model_selected` 이벤트 | 한 대화의 시간순 모델 관측(메시지, `message.sent`, 대화 객체 `updated_at`)이 달라지면 두 계열로 `확정`. 현재 모델 하나만으로는 생성하지 않음 |
+| `R-E0902` | E09-02 계정 이름 변경 | 같은 account UUID·같은 이름 필드에 시간 순서가 있는 서로 다른 두 값 | 현재 이름 하나는 metadata일 뿐. 변경 시각은 알 수 없으므로 시각 없음 |
+| `R-E1001` | E10-01 임시 채팅 사용 | `is_temporary=true`, `message.sent`의 `is_incognito=true` | Chrome Incognito와 동일하지 않음 |
 | `R-E1002` | E10-02 Chrome Incognito | *(없음)* | 고정 `판단불가`: 부재를 근거로 추론하지 않음 |
 | `R-E1003` | E10-03 방문기록 삭제 | *(없음)* | record 부재를 사용하지 않음 |
 | `R-E1004` | E10-04 캐시 삭제 | *(없음; 최대 `의심`)* | 일치하는 USN Cache 삭제가 50건 이상이면 의심 이벤트를 만들 수 있으며, Cache가 비어 있다는 사실만으로 판단하지 않음 |
@@ -170,7 +173,7 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 | E01 분할 segment | partial | segment 탐색 및 gap 보고 구현됨. 분할 이미지 테스트는 없음 |
 | raw/dd MBR | partial | **synthetic fixture에서만 검증** — 실제 dd가 제공되지 않음 |
 | raw/dd GPT | partial | **synthetic fixture에서만 검증** |
-| 분할 raw (`.001`) | partial | synthetic fixture |
+| 분할 raw (`.001`~`.005`) | **supported** | FTK Imager 5분할 64 GiB raw, end-to-end |
 | GPT partition 탐색 | **supported** | 기준 E01 |
 | BitLocker clear key | **supported** | 기준 E01(protector 존재, unlock 확인) |
 | BitLocker recovery / BEK / FVEK | not_tested | 구현됨. 사용 가능한 fixture 없음 |
@@ -197,12 +200,12 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 * 설계상 **Login Data는 절대 열지 않습니다**.
 * **unallocated carving을 수행하지 않으며**, server-side reconstruction, password 분석, 일반적인 PII masking 또는 Chrome Incognito 사용 여부 추론도 수행하지 않습니다.
 * **Cache 잔존만으로 대화가 여전히 존재하거나 삭제되었다는 것을 입증할 수 없습니다.** "Recovered"는 이 이미지에서 복구되었다는 뜻이지 서버에 존재한다는 뜻이 아닙니다.
-* **Account UUID는 절대 추측하지 않습니다.** 후보가 여러 개이면 필드를 비워 두며, 후보들 중 하나를 임의로 선택하지 않습니다.
-* **raw/dd는 synthetic fixture로만 검증되었습니다.** 이 프로젝트에는 실제 dd acquisition이 제공되지 않았습니다.
+* **계정·조직 UUID는 추측하지 않습니다.** 세션의 조직은 그 세션 창 안의 기록이 하나의 조직만 가리킬 때만 정하며, 여럿이면 비워 둡니다.
+* **대화 본문이 이미지에 없으면 메시지를 만들지 않습니다.** 대화 목록 객체·요약·초안으로 메시지 UUID나 본문을 채우지 않습니다.
 
 ## 소스 구조
 
-`src/claude_web_forensics/` 아래 모듈 27개(그 외 `__init__.py` 9개):
+`src/claude_web_forensics/` 아래 모듈 26개(그 외 `__init__.py` 9개):
 
 | 모듈 | 내용 |
 |---|---|
@@ -218,7 +221,7 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 | `parsers/ccl_adapter.py`, `parsers/common.py` | CCL wrapper와 공통 helper |
 | `analysis/rules.py` | 24개 행위 카탈로그와 판정 규칙 |
 | `analysis/detectors.py` | 행위별 detector |
-| `analysis/accounts.py`, `conversations.py`, `correlator.py`, `summaries.py` | 계정 연결, 대화 트리, 증거 그룹화, 아티팩트 상세 |
+| `analysis/conversations.py`, `correlator.py`, `summaries.py` | 대화 객체·메시지·초안, 독립 계열 계산, 경로별 상세 한 줄 |
 | `analysis/claude_scope.py` | 디스크 파일의 Claude 관련성 판정 |
 | `analysis/file_analysis.py` | 파일 흔적, 경로 생명주기, USN 최종 경로 확인 |
 | `model/entities.py` | 증거·행위·대화·파싱 상태·파일 추적 데이터 클래스 |
@@ -243,8 +246,5 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 ## 개발
 
 ```bash
-python -m pytest tests/unit -q          # 빠름, 이미지 불필요
-python -m pytest tests -q               # integration test 포함
+python -m pytest tests -q               # 이미지 불필요
 ```
-
-`tests/fixtures/synth.py`는 테스트 suite에서 사용하는 synthetic MBR/GPT/split raw 이미지, USN 레코드 및 `$I` 파일을 생성합니다.

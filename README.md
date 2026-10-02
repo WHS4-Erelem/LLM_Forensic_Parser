@@ -11,11 +11,11 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 |---|---|---|---|
 | `ChatGPT_APP_Parser` | ChatGPT / Codex 데스크톱 앱 (MS Store `OpenAI.Codex`) | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python |
 | `ChatGPT_Web_Parser` | chatgpt.com (Chrome) | `python -m chatgpt_parser.cli` | Python 3.12 · pytsk3 · brotli · cramjam |
-| `Claude_APP_Parser` | Claude 데스크톱 앱 | `aifp_parse.py` | Python 3.11+ · 표준 라이브러리만 |
+| `Claude_APP_Parser` | Claude 데스크톱 앱 | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python · ccl-chromium-reader · zstandard |
 | `Claude_Web_Parser` | claude.ai (Chrome) | `python -m claude_web_forensics` | Python 3.12 · dissect · ccl-chromium-reader |
 | `Gemini_Web_Parser` | gemini.google.com (Chrome) | `gemini_parser.py` | Python 3.10+ · pytsk3 · libewf-python |
 | `LMstudio_parser` | LM Studio (로컬 LLM) | `lmstudio_parser.py` | Python 3.12 · dissect |
-| `integration` | 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 각자 venv) |
+| `integration` | 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 공용 `.venv312`) |
 
 파서마다 자세한 사용법과 판정 규칙은 각 폴더의 README 에 있다.
 
@@ -34,7 +34,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 
 ```powershell
 cd integration
-powershell -ExecutionPolicy Bypass -File setup.ps1        # 최초 1회: .venv312 / .venv314 생성
+powershell -ExecutionPolicy Bypass -File setup.ps1        # 최초 1회: .venv312 생성
 python llm_forensic.py -i <이미지.E01|.dd> -o out          # 파서 6개 실행 → out\<evidence_id>\
 python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --key validation\scenario_keys\plain_2026-09-15.csv   # 개발 검증 전용 (정답 시트가 있을 때만)
 ```

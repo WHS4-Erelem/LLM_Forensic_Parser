@@ -1,17 +1,4 @@
-"""Command-line entry point.
-
-    python -m claude_web_forensics analyze --image /evidence/case.E01 --output /results/case01
-    python -m claude_web_forensics analyze --image /evidence/disk.dd  --output /results/case01 --extended-fs
-
-Outputs (the only files written to --output):
-    timeline.csv                 확정/의심 user actions with artifact paths
-    recovered_conversations.csv  recovered Claude conversation messages
-
-Exit codes:
-    0  analysis completed (individual artifact failures are logged, not fatal)
-    1  the image itself could not be opened, or a result CSV failed verification
-    2  invalid arguments / refused output location
-"""
+"""Command-line entry point."""
 from __future__ import annotations
 
 import argparse
@@ -30,11 +17,9 @@ EXIT_OK = 0
 EXIT_FATAL = 1
 EXIT_USAGE = 2
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="claude-web-forensics",
-        description=(
+        prog="claude-web-forensics", description=(
             "Single-snapshot forensic parser for Claude Web traces in Google Chrome "
             "on Windows. Input is an E01-family or raw/dd disk image. Writes exactly "
             "two files to --output: timeline.csv and recovered_conversations.csv "
@@ -52,49 +37,37 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--partition-offset", type=int, default=None, help="byte offset of the target partition"
     )
-    analyze.add_argument(
-        "--partition-index", type=int, default=None, help="index of the target partition"
-    )
+    analyze.add_argument("--partition-index", type=int, default=None, help="index of the target partition")
     analyze.add_argument("--windows-user", default="", help="limit analysis to one Windows user")
     analyze.add_argument("--chrome-profile", default="", help="limit analysis to one Chrome profile")
     analyze.add_argument(
-        "--key-material",
-        default="",
-        help=(
+        "--key-material", default="", help=(
             "BitLocker key material: 'recovery:<48-digit>', 'bek:<path>' or 'fvek:<hex>'. "
             "Never logged or written to the CSVs."
         ),
     )
     analyze.add_argument(
-        "--extended-fs",
-        action="store_true",
-        help="additionally analyse $UsnJrnl:$J and $Recycle.Bin",
+        "--extended-fs", action="store_true", help="additionally analyse $UsnJrnl:$J and $Recycle.Bin",
     )
     analyze.add_argument(
         "--keep-staging", action="store_true",
         help="keep the temporary working directory instead of deleting it",
     )
     analyze.add_argument(
-        "--overwrite",
-        action="store_true",
-        help=(
+        "--overwrite", action="store_true", help=(
             "replace timeline.csv / recovered_conversations.csv from a previous run; "
             "other files in the folder are never touched"
         ),
     )
     analyze.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="console log level (no log file is written)",
     )
 
     sub.add_parser("version", help="print version and dependency provenance")
     return parser
 
-
 def parse_key_material(spec: str) -> KeyMaterial:
-    """Parse --key-material. The value itself is never logged."""
     material = KeyMaterial()
     if not spec:
         return material
@@ -113,14 +86,10 @@ def parse_key_material(spec: str) -> KeyMaterial:
     elif kind == "passphrase":
         material.passphrase = value
     else:
-        raise SystemExit(
-            "--key-material must start with recovery:, bek:, fvek: or passphrase:"
-        )
+        raise SystemExit("--key-material must start with recovery:, bek:, fvek: or passphrase:")
     return material
 
-
 def setup_logging(level: str) -> logging.Logger:
-    """Console logging only; nothing is written to the output folder."""
     logger = logging.getLogger("claude_web_forensics")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
@@ -132,16 +101,11 @@ def setup_logging(level: str) -> logging.Logger:
     logger.addHandler(console)
     return logger
 
-
 def _validate_output(image: Path, output: Path) -> None:
-    """Output must never live inside the evidence image's own path."""
     image = image.resolve()
     output = output.resolve()
     if output == image.parent or image.parent in output.parents or output in image.parents:
-        raise SystemExit(
-            f"refusing to write output inside the evidence directory: {output}"
-        )
-
+        raise SystemExit(f"refusing to write output inside the evidence directory: {output}")
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -167,8 +131,6 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
 
-    # Existing result CSVs are replaced only with --overwrite; any other file
-    # in the folder is left untouched.
     from .output.csv_export import OutputDirectoryError, prepare_output_dir
 
     try:
@@ -179,9 +141,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = setup_logging(args.log_level)
     if others:
-        logger.info(
-            "output folder also contains %s (left untouched)", ", ".join(others[:10])
-        )
+        logger.info("output folder also contains %s (left untouched)", ", ".join(others[:10]))
 
     try:
         key_material = parse_key_material(args.key_material)
@@ -190,14 +150,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     options = AnalysisOptions(
-        image_path=image,
-        output_dir=output,
-        partition_offset=args.partition_offset,
-        partition_index=args.partition_index,
-        windows_user=args.windows_user,
-        chrome_profile=args.chrome_profile,
-        key_material=key_material,
-        extended_fs=args.extended_fs,
+        image_path=image, output_dir=output, partition_offset=args.partition_offset,
+        partition_index=args.partition_index, windows_user=args.windows_user,
+        chrome_profile=args.chrome_profile, key_material=key_material, extended_fs=args.extended_fs,
         keep_staging=args.keep_staging,
     )
 
@@ -220,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("result CSV verification failed")
         return EXIT_FATAL
     return EXIT_OK
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
