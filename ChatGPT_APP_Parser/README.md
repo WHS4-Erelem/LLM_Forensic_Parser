@@ -91,10 +91,24 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `auth` | `~/.codex/auth.json` | E01-01/02/03 (토큰 값은 출력하지 않음) |
 | `sqlite` | `~/.codex/state_5.sqlite`(threads) · `thread_history_1.sqlite`(thread_items) · `logs_2.sqlite`(logs) | E03-01/02 대화 생성·보관, E04-01 프롬프트 — **행마다 시각이 있음**, E01-02 `account/logout` 로그 |
 | (이미지 전용) | `$Extend/$UsnJrnl:$J` | 파일 생성·삭제 시각 — 분석표의 "로그아웃 지문 = auth.json FILE_DELETE" 등 |
+| `prefetch` (0.3.6) | `Windows/Prefetch/CODEX.EXE-*.pf` | E08-01 애플리케이션 실행 — OS 가 기록한 최근 8회 실행 시각. MAM 압축 해제는 Windows 에서만 |
+| `recent_lnk` (0.3.6) | `Users/*/AppData/Roaming/Microsoft/Windows/Recent/*.lnk` | E06-02 생성 이미지 다운로드(대상이 `Codex 이미지 …`), E05-05 문서 다운로드(문서 확장자 + 대상이 같은 시각에 새로 생김) |
+| `webcache` (0.3.7) | `…\Packages\OpenAI.Codex_…\LocalCache\Roaming\Codex\web\Codex\Default\Cache\Cache_Data\` (index·data_0~3·f_*) | **채팅 모드** 대화 전체 — conversation 응답 JSON: E03-01 대화 생성, E04-01 프롬프트(본문·시각), E05-01/03 첨부 업로드(metadata.attachments 파일명·MIME), E06-01 이미지 생성(image_asset_pointer·image_gen_title), E03-03/04 분기(대화 수정·재시도), E10-01 임시 채팅(is_temporary_chat), E09-01 모델 변경(default_model_slug 변화, 추정), `estuary/content?…&fn=` 요청 = E05-05/E06-02 파일 내려받기. assistant 응답은 recovered_conversations 로. Chrome Blockfile Cache Reader 는 팀 ChatGPT Web 파서(cache.py)를 옮겨 온 것 (`webcache.py`). **앱을 삭제하면 통째로 사라진다** |
+
+0.3.5~0.3.6 에 추가된 파생 규칙(`derive.py`, `sqlitedb._logs`): 로그인 = 앱 로그 `Reloaded auth, changed: true` + USN `auth.json FILE_CREATE`(±120s) / 계정 전환 = auth.json 삭제→재생성 + 계정 UUID 2개 이상 /
+첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
+2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
+타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.10 (2026-09-29, PL QA 프레임 적용 — Digital Corpora NPS 이미지로 robustness 확인): Codex 아티팩트가 하나도 없는 이미지는 오류(exit 2)가 아니라 0행 timeline/recovered CSV + 경고(exit 0)로 끝난다. 통합 실행기가 negative control 이미지를 '파서 실패'로 집계하던 문제 해소. 이미지 자체를 못 여는 경우(IMAGE_OPEN_FAILED, UNSUPPORTED_FORMAT)는 그대로 exit 2.
+
+0.3.9 (2026-09-28, 삭제 제외 시나리오 raw 분할 이미지로 검증 — 정답 19건 중 12 일치): 애플리케이션 설치 = `Program Files\WindowsApps\OpenAI.Codex_…` 패키지 폴더의 MFT 생성 시각(`package_install.py`, 확인; 실험 시트의 설치 시각은 첫 실행 시각이라 40분 차이). 최근 항목 저장 규칙이 확장자 없는 대상도 머리 바이트(%PDF, PK, PNG…)로 종류를 판별하고, 문서가 아니면 E05-06 파일 다운로드, 이름 뒤 `(4)` 중복 번호는 떼고 대화 언급과 대조. 검증으로 확인된 이 앱의 한계: 임시 채팅(에이전트 모드는 흔적 없음)·공유 링크·계정 이름 변경(로그·파일 변화 없음)·강제 종료(종료 로그 없음; lockfile·Preferences 는 정상 종료 뒤에도 남아 8월 지문 재현 안 됨)·계정 전환(USN 미커버 + auth.json 삭제됨).
+0.3.8 (2026-09-23, 팀원 E01 '삭제 제외 시나리오' 검증): 에이전트 모드 모델 변경 = rollout `turn_context.model` 이 직전 turn 과 달라지는 지점(확인). 이미지 생성 요청 = rollout custom_tool_call 입력에 imagegen/image_gen 도구 탐색·호출(확인). 첨부 업로드 파싱은 `## 파일명: 경로` 줄만 (경로 `/`·`\` 모두). 최근 항목 문서 저장은 Codex 대화·도구 호출에 파일명이 언급될 때만 추정, 아니면 미확정 (다른 앱 다운로드 오귀속 방지 — Claude Desktop PDF 표본).
+로컬 흔적이 없어 못 잡는 것: 공유 링크·대화 공유·계정 이름 변경 (POST 요청은 캐시되지 않음), 강제 종료(정상 종료와 구분 불가), 설치·삭제 (USN 저널이 그 구간을 덮을 때만 가능). 앱을 삭제한 이미지에서는 채팅 모드 전체(webcache)가 사라진다.
 
 탐색 디렉터리(`locate.SCAN_ROOTS`): `Users/*/.codex`, `Users/*/Documents/Codex`,
 `Users/*/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
-`Program Files/WindowsApps/OpenAI.Codex_*`, `ProgramData/Packages/OpenAI.Codex_2p2nqsd0c76g0`.
+`Program Files/WindowsApps/OpenAI.Codex_*`, `ProgramData/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
+`Windows/Prefetch`, `Users/*/AppData/Roaming/Microsoft/Windows/Recent`.
 위 표 이외 파일(SQLite, 채팅창 Chromium 저장소, Helium 하이브 등)은
 **발견 목록(`artifact_inventory`)에만 기록**하고 아직 파싱하지 않는다.
 
@@ -187,7 +201,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `IMAGE_OPEN_FAILED` | 이미지 없음/권한, E01 열기 실패, **E01 첫·끝 섹터 읽기 실패(절단/손상)** |
 | `SEGMENT_MISSING` | E01 확장자 결번(.E01 .E02 .E04), **마지막 E01 세그먼트 누락**(마지막 파일이 `next` 섹션으로 끝남), 분할 RAW 중간 결번 |
 | `UNSUPPORTED_FORMAT` | EWF2(.Ex01), L01, VMDK/VHD/QCOW, 판독 가능한 NTFS 볼륨 없음 |
-| `ARTIFACT_NOT_FOUND` | 이미지는 읽혔으나 대상 경로 0건 (빈 결과와 구분) |
+| (경고) 아티팩트 0건 | 이미지는 읽혔으나 Codex 경로 0건. 0.3.10부터 오류가 아니라 **0행 결과 + 경고**로 끝난다(종료코드 0). 앱을 쓰지 않은 음성 대조(negative control) 이미지에서 '없음'이 정상 결과이기 때문. `ARTIFACT_NOT_FOUND` 코드는 라이브러리 사용 시에만 남아 있다 |
 | 레코드 단위 | `JSON_DECODE_ERROR`, `READ_FAILED` 등 → 해당 레코드만 `status:error`, 같은 파일의 나머지 라인은 계속 파싱 |
 
 실패를 빈 결과나 성공으로 숨기지 않는다. CLI 종료코드: 0=오류 없음, 1=파일 단위

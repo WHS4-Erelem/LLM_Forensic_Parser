@@ -21,6 +21,7 @@
 """
 
 import json
+import re
 from datetime import datetime
 
 from .. import events, model
@@ -55,6 +56,7 @@ SUMMARY_LINE_TYPES = {
     "item_completed/UserMessage", "item_completed/AgentMessage", "item_completed/Reasoning",
     "token_usage_record",
 }
+_IMAGE_GEN_RE = re.compile(r"imagegen|image_gen|generate[ _]image", re.I)
 HANDOFF_PREFIX = "## Referenced ChatGPT conversation"
 HANDOFF_REQUEST_MARK = "## My request:"
 
@@ -290,6 +292,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
     user_events = _user_message_events(lines)
     session_meta = None
     models_seen = []
+    last_turn_model = None
     user_class_counts = {}
     msg_seq = 0
 
@@ -339,6 +342,19 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
         model_name = _find_model(item)
         if model_name and model_name not in models_seen:
             models_seen.append(model_name)
+        # turn_context 의 model 이 앞 turn 과 다르면 그 사이에 모델을 바꾼 것 (E09-01). 2026-09-23 표본: "5.5로 모델 변경 후" 프롬프트 직전 turn 에서 확인
+        if item_type == "turn_context" and model_name:
+            if last_turn_model is not None and model_name != last_turn_model:
+                records.append(model.Record(
+                    rb.next_id(), "E09-01", events.name("E09-01"),
+                    model.timestamp(utc=iso, original=raw_ts, fmt=fmt, meaning="모델이 바뀐 turn_context 라인의 기록 시각",
+                                    source=model.TS_SOURCE_CONTENT, null_reason=note if iso is None else None),
+                    model.user_action(action="모델 변경(%s → %s)" % (last_turn_model, model_name), confidence=model.CONF_CONFIRMED,
+                                      rationale="rollout turn_context.model 이 직전 turn 과 다름 — 이 turn 부터 다른 모델로 요청됨 (에이전트 모드)"),
+                    model.evidence(image_desc, vfile, locator="line=%d" % lineno, extra=ev_extra), status="ok",
+                    details={"artifact": "rollout_jsonl", "thread_id": fmeta.get("thread_id"), "item_type": "turn_context",
+                             "model": model_name, "previous_model": last_turn_model, "key": "%s -> %s" % (last_turn_model, model_name)}))
+            last_turn_model = model_name
 
         # --- 세션 메타 라인 ------------------------------------------
         if item_type in ("session_meta", "session", "meta") or (
@@ -376,6 +392,20 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
             known = line_type in KNOWN_LINE_TYPES
             if not known:
                 obs.unmapped_lines += 1
+            # 에이전트가 이미지 생성 도구를 찾거나 부른 도구 호출 = 사용자가 이미지 생성을 요청한 흔적 (E06-01).
+            # 2026-09-23 표본: imagegen/SKILL.md 읽기 → ALL_TOOLS 에서 /image_gen|generate image/ 검색 (정답 68초 뒤)
+            if line_type.endswith("custom_tool_call") and _IMAGE_GEN_RE.search(json.dumps(item, ensure_ascii=False)):
+                records.append(model.Record(
+                    rb.next_id(), "E06-01", events.name("E06-01"),
+                    model.timestamp(utc=iso, original=raw_ts, fmt=fmt, meaning="이미지 생성 도구 호출 라인의 기록 시각",
+                                    source=model.TS_SOURCE_CONTENT, null_reason=note if iso is None else None),
+                    model.user_action(action="이미지 생성 시도(도구 호출)", confidence=model.CONF_CONFIRMED,
+                                      rationale="rollout custom_tool_call 입력에 이미지 생성 도구(imagegen/image_gen) 탐색·호출 — 직전 user 프롬프트의 생성 요청을 처리한 흔적. 생성 성공 여부는 별개"),
+                    model.evidence(image_desc, vfile, locator="line=%d" % lineno,
+                                   excerpt=excerpt(mask_text(json.dumps(obj, ensure_ascii=False)), max_excerpt), extra=ev_extra),
+                    status="ok", details={"artifact": "rollout_jsonl", "item_type": line_type, "thread_id": fmeta.get("thread_id"),
+                                          "key": "imagegen 도구 호출", "model": model_name}))
+                continue
             if model_name or item_type:
                 records.append(_nonmessage_record(
                     rb, vfile, image_desc, lineno, obj, item_detail or line_type,
