@@ -52,6 +52,28 @@ VERDICT_CONFIRMED = "확정"
 VERDICT_SUSPECTED = "의심"
 EMPTY = "-"
 
+# 서비스 식별자 → 화면 표시명 (GUI 표시 전용 helper. CSV·DB 의 원본 값은 바꾸지 않는다)
+SERVICE_LABELS = {
+    "chatgpt_web": "ChatGPT Web", "chatgpt_desktop": "ChatGPT Desktop",
+    "claude_web": "Claude Web", "claude_desktop": "Claude Desktop",
+    "gemini_web": "Gemini Web", "lmstudio": "LM Studio",
+    # parsers.json 의 model 값으로 들어오는 경우도 같은 표시명을 쓴다
+    "chatgpt-web": "ChatGPT Web", "chatgpt-desktop": "ChatGPT Desktop",
+    "claude-web": "Claude Web", "claude-desktop": "Claude Desktop",
+    "gemini-web": "Gemini Web",
+}
+
+
+def service_label(name):
+    """표시용 서비스명. 매핑에 없으면 구분자만 공백으로 바꿔 쓴다 (없는 이름을 지어내지 않는다)."""
+    if not name or name == EMPTY:
+        return EMPTY
+    key = str(name).strip()
+    if key in SERVICE_LABELS:
+        return SERVICE_LABELS[key]
+    return key.replace("_", " ").replace("-", " ").strip() or EMPTY
+
+
 # 파서가 자기 출력 폴더에 남기는 결과 JSON (warning 목록을 읽기 위해서만 본다)
 PARSER_RESULT_JSON = "result.json"
 # 아래 두 warning 이 **함께** 있을 때만 "분석 제한"으로 표시한다. 원인(암호화 등)은 단정하지 않는다.
@@ -109,12 +131,33 @@ class ConversationSession:
     last_timestamp: str = EMPTY
     messages: list = field(default_factory=list)
 
-    def display_title(self):
+    def display_title(self, limit=58):
+        """표시용 대화 주제. 원본을 고르기만 하고 요약·재작성하지 않는다.
+        (1) conversation_title (2) 첫 user 메시지 앞부분 (3) UUID fallback."""
         if self.title and self.title != EMPTY:
-            return self.title
+            return _shorten(self.title, limit)
+        preview = self.first_user_text()
+        if preview:
+            return _shorten(preview, limit)
         if self.conversation_uuid and self.conversation_uuid != EMPTY:
             return "Untitled · %s" % self.conversation_uuid[:8]
         return "Untitled Conversation"
+
+    def first_user_text(self):
+        """첫 user 메시지의 본문 앞부분 (원문 그대로)."""
+        for message in self.messages:
+            if cell(message, "role").strip().lower() in ("user", "human"):
+                text = " ".join(cell(message, "content").split())
+                if text and text != EMPTY:
+                    return text
+        return ""
+
+    def service_name(self):
+        """이 대화의 서비스 식별자 (source_parser 우선, 없으면 Model)."""
+        return self.service if self.service != EMPTY else self.model
+
+    def service_display(self):
+        return service_label(self.service_name())
 
     def search_text(self):
         """검색 대상: 제목 · UUID · 서비스 · 모델 · role · 메시지 내용."""
@@ -448,9 +491,23 @@ class ResultBundle:
         return list(sessions.values())
 
 
+def message_service(message, fallback=EMPTY):
+    """메시지가 속한 서비스 식별자 (source_parser → Model → 호출자 fallback)."""
+    for key in ("source_parser", "Model"):
+        value = cell(message, key)
+        if value != EMPTY:
+            return value
+    return fallback
+
+
 def message_source(message):
     """메시지의 근거 아티팩트 표기 (경로 마지막 조각). 없으면 '-'."""
     return _path_tail(cell(message, "Artifact_path"))
+
+
+def _shorten(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _summary_text(details, limit=110):

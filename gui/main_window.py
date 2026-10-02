@@ -26,7 +26,8 @@ from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
                            ST_FAILED, ST_LIMITED, ST_NO_RESULT, ST_SKIPPED, TIMELINE_CSV,
                            TIMELINE_VIEW_COLUMNS, UNIFIED_DB, VERDICT_CONFIRMED, VERDICT_SUSPECTED,
                            ResultBundle, ResultLoadError, artifact_type_of, cell,
-                           evidence_dir_conflict, find_result_dirs, message_source)
+                           evidence_dir_conflict, find_result_dirs, message_service,
+                           message_source, service_label)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEAM = "elelem"
@@ -480,6 +481,20 @@ ROLE_USER = ("user", "human")
 ROLE_ASSISTANT = ("assistant", "ai", "model", "bot")
 
 
+def role_label(role, service=EMPTY):
+    """버블 상단에 쓸 라벨. 데이터의 role 값은 바꾸지 않고 화면 표기만 정한다.
+    user→USER, assistant→실제 LLM 서비스명, system→SYSTEM, tool→TOOL, 그 외→원본 또는 UNKNOWN."""
+    folded = str(role).strip().lower()
+    if folded in ROLE_ASSISTANT:
+        label = service_label(service)
+        return label.upper() if label and label != EMPTY else "ASSISTANT"
+    if folded in ROLE_USER:
+        return "USER"
+    if not folded or role == EMPTY:
+        return "UNKNOWN"
+    return folded.upper()                      # system / tool / 그 외 원본 role 표기
+
+
 def _role_style(role):
     """(정렬 오른쪽인가, 버블색, 테두리색, 라벨색)."""
     folded = str(role).strip().lower()
@@ -520,7 +535,10 @@ class ChatBubbleDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         role = cell(row, "role")
+        service = message_service(row)
         right, fill, border, label_color = _role_style(role)
+        if str(role).strip().lower() in ROLE_ASSISTANT and service != EMPTY:
+            label_color = service_color(service)        # 라벨 글자색만 서비스 색으로 (버블은 그대로)
         text = cell(row, "content")
         body_width, body_height = self._body_rect(option, text)
         bubble_width = body_width + BUBBLE_PAD * 2
@@ -540,7 +558,7 @@ class ChatBubbleDelegate(QStyledItemDelegate):
         meta_rect = QRect(bubble.left() + BUBBLE_PAD, bubble.top() + 7, bubble.width() - BUBBLE_PAD * 2, BUBBLE_META)
         painter.setFont(_font(8.5, bold=True))
         painter.setPen(QColor(label_color))
-        role_text = (role if role != EMPTY else "UNKNOWN").upper()
+        role_text = role_label(role, service)
         painter.drawText(meta_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), role_text)
         role_width = QFontMetrics(_font(8.5, bold=True)).horizontalAdvance(role_text) + 8
         painter.setFont(_font(8))
@@ -559,6 +577,70 @@ class ChatBubbleDelegate(QStyledItemDelegate):
         body = QRect(bubble.left() + BUBBLE_PAD, bubble.top() + BUBBLE_PAD + BUBBLE_META,
                      body_width, body_height)
         painter.drawText(body, int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft), text)
+        painter.restore()
+
+
+SESSION_HEIGHT = 62
+
+
+class SessionCardDelegate(QStyledItemDelegate):
+    """세션 1건 = 카드 1장. 대화 주제를 가장 크게, 서비스·시각·메시지 수는 보조 줄에 둔다."""
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), SESSION_HEIGHT)
+
+    def paint(self, painter, option, index):
+        session = index.data(Qt.ItemDataRole.UserRole)
+        if session is None or not hasattr(session, "display_title"):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        if selected or hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(DARK["card_hi"] if selected else DARK["card"]))
+            painter.drawRect(rect)
+        tint = QColor(service_color(session.service_name()))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(tint)                                   # 서비스 색 좌측 바
+        painter.drawRect(QRect(rect.left(), rect.top() + 6, 3, rect.height() - 12))
+        if selected:
+            painter.setBrush(QColor(DARK["accent"]))
+            painter.drawRect(QRect(rect.left(), rect.top(), 2, rect.height()))
+
+        inner_left = rect.left() + 14
+        inner_width = rect.width() - 24
+        # 1줄: 서비스 색 점 + 대화 주제 (가장 눈에 띄게)
+        painter.setBrush(tint)
+        painter.drawEllipse(inner_left, rect.top() + 14, 7, 7)
+        title_font = _font(10, bold=True)
+        painter.setFont(title_font)
+        painter.setPen(QColor(DARK["accent"] if selected else DARK["text"]))
+        title_rect = QRect(inner_left + 13, rect.top() + 8, inner_width - 13, 18)
+        painter.drawText(title_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         QFontMetrics(title_font).elidedText(session.display_title(),
+                                                             Qt.TextElideMode.ElideRight, title_rect.width()))
+        # 2줄: 서비스명 · 시각 · 메시지 수
+        sub_font = _font(8.5)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(DARK["text_dim"]))
+        when = session.first_timestamp if session.first_timestamp != EMPTY else "시각 없음"
+        service_text = session.service_display() if session.service_display() != EMPTY else session.model
+        subtitle = "%s · %s · 💬 %d" % (service_text, when.split(".")[0], len(session.messages))
+        sub_rect = QRect(inner_left, rect.top() + 26, inner_width, 16)
+        painter.drawText(sub_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         QFontMetrics(sub_font).elidedText(subtitle, Qt.TextElideMode.ElideRight, sub_rect.width()))
+        # 3줄: conversation UUID (보조 정보라 흐리게)
+        uuid_font = _font(8, mono=True)
+        painter.setFont(uuid_font)
+        painter.setPen(QColor(DARK["muted"]))
+        uuid_rect = QRect(inner_left, rect.top() + 42, inner_width, 14)
+        painter.drawText(uuid_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         QFontMetrics(uuid_font).elidedText(session.conversation_uuid,
+                                                            Qt.TextElideMode.ElideMiddle, uuid_rect.width()))
         painter.restore()
 
 
@@ -994,7 +1076,8 @@ class MainWindow(QWidget):
         self.session_list.setObjectName("SessionList")
         self.session_list.setMinimumWidth(250)
         self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.session_list.setWordWrap(True)
+        self.session_list.setItemDelegate(SessionCardDelegate(self.session_list))
+        self.session_list.setUniformItemSizes(True)
         self.session_list.currentRowChanged.connect(self._on_session_changed)
         conv_split.addWidget(self.session_list)
         chat_holder = QWidget()
@@ -1611,12 +1694,11 @@ class MainWindow(QWidget):
         self.sessions = self.bundle.conversation_sessions(self.selected_service)
         for session in self.sessions:
             when = session.first_timestamp if session.first_timestamp != EMPTY else "시각 없음"
-            item = QListWidgetItem("%s\n%s · %s · %d개 메시지\n%s" % (
-                session.display_title(),
-                session.service if session.service != EMPTY else session.model,
-                when, len(session.messages),
-                session.conversation_uuid[:18] + ("…" if len(session.conversation_uuid) > 18 else "")))
+            item = QListWidgetItem()                       # 그리기는 SessionCardDelegate 가 한다
             item.setData(Qt.ItemDataRole.UserRole, session)
+            item.setToolTip("%s\n%s · %s · 메시지 %d건\n%s"
+                            % (session.display_title(), session.service_display(), when,
+                               len(session.messages), session.conversation_uuid))
             self.session_list.addItem(item)
         self.session_list.blockSignals(False)
         self._apply_session_search(self.search_box.text())
@@ -1667,8 +1749,7 @@ class MainWindow(QWidget):
         if session.last_timestamp != EMPTY and session.last_timestamp != session.first_timestamp:
             span = "%s ~ %s" % (session.first_timestamp, session.last_timestamp)
         self.chat_header.setText("%s · %s · 메시지 %d건 · conversation_uuid %s"
-                                 % (session.display_title(),
-                                    session.service if session.service != EMPTY else session.model,
+                                 % (session.display_title(), session.service_display(),
                                     len(session.messages), session.conversation_uuid))
         self.chat_header.setToolTip(span)
 
