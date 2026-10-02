@@ -99,13 +99,30 @@ def cell(row, column):
 
 @dataclass
 class ConversationSession:
-    """recovered_conversations.csv 를 conversation_uuid 로 묶은 한 대화."""
+    """recovered_conversations.csv 를 conversation_uuid 로 묶은 한 대화 (원본 행을 그대로 담는다)."""
 
     conversation_uuid: str
     title: str
     model: str
     first_timestamp: str
+    service: str = EMPTY           # source_parser (provenance 열)
+    last_timestamp: str = EMPTY
     messages: list = field(default_factory=list)
+
+    def display_title(self):
+        if self.title and self.title != EMPTY:
+            return self.title
+        if self.conversation_uuid and self.conversation_uuid != EMPTY:
+            return "Untitled · %s" % self.conversation_uuid[:8]
+        return "Untitled Conversation"
+
+    def search_text(self):
+        """검색 대상: 제목 · UUID · 서비스 · 모델 · role · 메시지 내용."""
+        parts = [self.title, self.conversation_uuid, self.service, self.model]
+        for message in self.messages:
+            parts.append(cell(message, "role"))
+            parts.append(cell(message, "content"))
+        return " ".join(parts).lower()
 
 
 @dataclass
@@ -416,15 +433,24 @@ class ResultBundle:
             session = sessions.get(uuid)
             if session is None:
                 session = ConversationSession(conversation_uuid=uuid, title=cell(row, "conversation_title"),
-                                              model=cell(row, "Model"), first_timestamp=cell(row, "timestamp"))
+                                              model=cell(row, "Model"), first_timestamp=cell(row, "timestamp"),
+                                              service=cell(row, "source_parser"))
                 sessions[uuid] = session
             session.messages.append(row)
             ts = cell(row, "timestamp")
-            if ts != EMPTY and (session.first_timestamp == EMPTY or ts < session.first_timestamp):
-                session.first_timestamp = ts
+            if ts != EMPTY:
+                if session.first_timestamp == EMPTY or ts < session.first_timestamp:
+                    session.first_timestamp = ts
+                if session.last_timestamp == EMPTY or ts > session.last_timestamp:
+                    session.last_timestamp = ts
         for session in sessions.values():
             session.messages.sort(key=lambda r: _order_key(cell(r, "message order")))
         return list(sessions.values())
+
+
+def message_source(message):
+    """메시지의 근거 아티팩트 표기 (경로 마지막 조각). 없으면 '-'."""
+    return _path_tail(cell(message, "Artifact_path"))
 
 
 def _summary_text(details, limit=110):

@@ -26,7 +26,7 @@ from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
                            ST_FAILED, ST_LIMITED, ST_NO_RESULT, ST_SKIPPED, TIMELINE_CSV,
                            TIMELINE_VIEW_COLUMNS, UNIFIED_DB, VERDICT_CONFIRMED, VERDICT_SUSPECTED,
                            ResultBundle, ResultLoadError, artifact_type_of, cell,
-                           evidence_dir_conflict, find_result_dirs)
+                           evidence_dir_conflict, find_result_dirs, message_source)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEAM = "elelem"
@@ -469,6 +469,114 @@ def _artifact_label(row):
     return path.replace("/", "\\").rstrip("\\").split("\\")[-1] if path != EMPTY else EMPTY
 
 
+# ------------------------------------------------- 채팅 버블 렌더링 계층
+# 메시지 1건 = 버블 1개. 위젯을 메시지마다 만들지 않고 delegate 로 그려 긴 대화도 가볍게 넘긴다.
+BUBBLE_MARGIN = 14          # 뷰 좌우 여백
+BUBBLE_PAD = 11             # 버블 안쪽 여백
+BUBBLE_META = 16            # 메타 줄 높이
+BUBBLE_GAP = 10             # 메시지 사이 간격
+BUBBLE_MAX_RATIO = 0.74     # 버블 최대 폭 비율
+ROLE_USER = ("user", "human")
+ROLE_ASSISTANT = ("assistant", "ai", "model", "bot")
+
+
+def _role_style(role):
+    """(정렬 오른쪽인가, 버블색, 테두리색, 라벨색)."""
+    folded = str(role).strip().lower()
+    if folded in ROLE_USER:
+        return True, "#223c5c", "#3a68a0", DARK["blue"]
+    if folded in ROLE_ASSISTANT:
+        return False, "#1d2d33", "#2f6975", DARK["teal"]
+    return False, "#242c36", "#394654", DARK["muted"]        # system / tool / unknown
+
+
+class ChatBubbleDelegate(QStyledItemDelegate):
+    """복구된 메시지를 채팅 말풍선으로 그린다 (역할별 정렬·색, 메타 줄, 본문 줄바꿈)."""
+
+    def _view_width(self, option):
+        view = self.parent()
+        if hasattr(view, "viewport") and view.viewport().width() > 40:
+            return view.viewport().width()
+        return max(option.rect.width(), 320)
+
+    def _body_rect(self, option, text):
+        width = max(int(self._view_width(option) * BUBBLE_MAX_RATIO) - BUBBLE_PAD * 2, 120)
+        metrics = QFontMetrics(_font(9.5))
+        flags = int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft)
+        bounds = metrics.boundingRect(QRect(0, 0, width, 10000), flags, text or " ")
+        return width, max(bounds.height(), metrics.height())
+
+    def sizeHint(self, option, index):
+        row = index.data(Qt.ItemDataRole.UserRole)
+        text = cell(row, "content") if isinstance(row, dict) else ""
+        _width, height = self._body_rect(option, text)
+        return QSize(self._view_width(option), height + BUBBLE_META + BUBBLE_PAD * 2 + BUBBLE_GAP)
+
+    def paint(self, painter, option, index):
+        row = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, dict):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        role = cell(row, "role")
+        right, fill, border, label_color = _role_style(role)
+        text = cell(row, "content")
+        body_width, body_height = self._body_rect(option, text)
+        bubble_width = body_width + BUBBLE_PAD * 2
+        bubble_height = body_height + BUBBLE_META + BUBBLE_PAD * 2
+        rect = option.rect
+        span = min(self._view_width(option), rect.width()) if rect.width() > 40 else self._view_width(option)
+        left = rect.left() + span - BUBBLE_MARGIN - bubble_width if right else rect.left() + BUBBLE_MARGIN
+        bubble = QRect(left, rect.top(), bubble_width, bubble_height)
+
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        painter.setPen(QPen(QColor(DARK["accent"] if selected else border), 2 if selected else 1))
+        painter.setBrush(QColor(fill).lighter(112) if (hovered and not selected) else QColor(fill))
+        painter.drawRoundedRect(bubble, 6, 6)
+
+        # 메타 줄: role · 시각 · 근거 아티팩트
+        meta_rect = QRect(bubble.left() + BUBBLE_PAD, bubble.top() + 7, bubble.width() - BUBBLE_PAD * 2, BUBBLE_META)
+        painter.setFont(_font(8.5, bold=True))
+        painter.setPen(QColor(label_color))
+        role_text = (role if role != EMPTY else "UNKNOWN").upper()
+        painter.drawText(meta_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), role_text)
+        role_width = QFontMetrics(_font(8.5, bold=True)).horizontalAdvance(role_text) + 8
+        painter.setFont(_font(8))
+        painter.setPen(QColor(DARK["muted"]))
+        source = message_source(row)
+        meta = " · ".join(part for part in (cell(row, "timestamp"),
+                                            "order %s" % cell(row, "message order"),
+                                            source if source != EMPTY else "") if part and part != EMPTY)
+        painter.drawText(meta_rect.adjusted(role_width, 0, 0, 0),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         _elide(meta, meta_rect.width() - role_width, _font(8)))
+
+        # 본문 (줄바꿈 유지)
+        painter.setFont(_font(9.5))
+        painter.setPen(QColor(DARK["text"]))
+        body = QRect(bubble.left() + BUBBLE_PAD, bubble.top() + BUBBLE_PAD + BUBBLE_META,
+                     body_width, body_height)
+        painter.drawText(body, int(Qt.TextFlag.TextWordWrap) | int(Qt.AlignmentFlag.AlignLeft), text)
+        painter.restore()
+
+
+def make_chat_view():
+    view = QListView()
+    view.setObjectName("ChatView")
+    view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    view.setMouseTracking(True)
+    view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)   # 폭이 흔들리지 않게 고정
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    view.setWordWrap(True)
+    view.setItemDelegate(ChatBubbleDelegate(view))
+    view.setModelColumn(0)
+    return view
+
+
 def make_timeline_view():
     """카드 타임라인 뷰. 모델·프록시는 표와 동일하게 쓰고 0열만 그린다."""
     view = QListView()
@@ -869,21 +977,40 @@ class MainWindow(QWidget):
         tl_box.addWidget(self.timeline_view, 1)
         self.tabs.addTab(timeline_tab, "Timeline")
 
-        # Conversations
+        # Conversations : [세션 목록 | 채팅 버블 뷰]  (오른쪽 근거 상세는 공용 패널을 쓴다)
         conv = QWidget()
-        conv_layout = QHBoxLayout(conv)
+        conv_layout = QVBoxLayout(conv)
         conv_layout.setContentsMargins(12, 12, 12, 12)
+        conv_layout.setSpacing(9)
+        conv_head = QHBoxLayout()
+        self.conversation_title = section_label("복구된 대화")
+        self.conversation_count = muted("-")
+        conv_head.addWidget(self.conversation_title)
+        conv_head.addStretch(1)
+        conv_head.addWidget(self.conversation_count)
+        conv_layout.addLayout(conv_head)
         conv_split = QSplitter(Qt.Orientation.Horizontal)
         self.session_list = QListWidget()
         self.session_list.setObjectName("SessionList")
-        self.session_list.setMinimumWidth(240)
+        self.session_list.setMinimumWidth(250)
+        self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.session_list.setWordWrap(True)
         self.session_list.currentRowChanged.connect(self._on_session_changed)
-        self.message_view = QTextBrowser()
-        self.message_view.setOpenExternalLinks(False)
         conv_split.addWidget(self.session_list)
-        conv_split.addWidget(self.message_view)
-        conv_split.setSizes([280, 700])
-        conv_layout.addWidget(conv_split)
+        chat_holder = QWidget()
+        chat_box = QVBoxLayout(chat_holder)
+        chat_box.setContentsMargins(0, 0, 0, 0)
+        chat_box.setSpacing(9)
+        self.conversation_empty = self._empty_notice()
+        self.chat_header = muted("")
+        self.chat_view = make_chat_view()
+        self.chat_proxy = TableFilterProxy(self)
+        chat_box.addWidget(self.conversation_empty)
+        chat_box.addWidget(self.chat_header)
+        chat_box.addWidget(self.chat_view, 1)
+        conv_split.addWidget(chat_holder)
+        conv_split.setSizes([290, 760])
+        conv_layout.addWidget(conv_split, 1)
         self.tabs.addTab(conv, "Conversations")
 
         # Artifacts / Files : [필터] + [근거 목록]  (오른쪽 상세는 공용 패널을 쓴다)
@@ -1478,21 +1605,103 @@ class MainWindow(QWidget):
         self._refresh_timeline_empty()
 
     def _fill_conversations(self):
+        """세션 목록을 채우고 첫 세션을 연다. 메시지 값은 원본 행 그대로 쓴다."""
+        self.session_list.blockSignals(True)
         self.session_list.clear()
         self.sessions = self.bundle.conversation_sessions(self.selected_service)
         for session in self.sessions:
-            item = QListWidgetItem("%s\n%s · %s" % (
-                session.title if session.title != EMPTY else "(제목 없음)",
-                session.model, session.first_timestamp))
+            when = session.first_timestamp if session.first_timestamp != EMPTY else "시각 없음"
+            item = QListWidgetItem("%s\n%s · %s · %d개 메시지\n%s" % (
+                session.display_title(),
+                session.service if session.service != EMPTY else session.model,
+                when, len(session.messages),
+                session.conversation_uuid[:18] + ("…" if len(session.conversation_uuid) > 18 else "")))
             item.setData(Qt.ItemDataRole.UserRole, session)
             self.session_list.addItem(item)
-        if self.sessions:
-            self.session_list.setCurrentRow(0)
+        self.session_list.blockSignals(False)
+        self._apply_session_search(self.search_box.text())
+        visible = [i for i in range(self.session_list.count()) if not self.session_list.item(i).isHidden()]
+        if visible:
+            self.session_list.setCurrentRow(visible[0])
         else:
-            lines = self.bundle.empty_state_message("conversations", self.selected_service).splitlines()
-            self.message_view.setHtml(_STYLE + "".join(
-                "<p%s>%s</p>" % ("" if i == 0 else " class='muted'", _esc(line))
-                for i, line in enumerate(lines)))
+            self._show_empty_chat()
+        self._refresh_conversation_count()
+
+    def _refresh_conversation_count(self):
+        shown = sum(1 for i in range(self.session_list.count()) if not self.session_list.item(i).isHidden())
+        total_sessions = len(getattr(self, "sessions", []))
+        total_messages = len(self.bundle.conversation_rows) if self.bundle else 0
+        self.conversation_count.setText("세션 %d / %d · 전체 메시지 %d" % (shown, total_sessions, total_messages))
+
+    def _show_empty_chat(self):
+        """0건 안내: 전체 0건 / 서비스 필터 0건 / 검색·필터 0건 을 구분한다."""
+        self.chat_view.setModel(None)
+        self.chat_header.setText("")
+        if not self.sessions:
+            text = self.bundle.empty_state_message("conversations", self.selected_service)
+        else:
+            text = ("현재 검색/필터 조건과 일치하는 대화가 없습니다. (선택 범위 %d세션)"
+                    % len(self.sessions))
+        self.conversation_empty.setText(text)
+        self.conversation_empty.setVisible(True)
+        self.chat_view.setVisible(False)
+
+    def _on_session_changed(self, index):
+        if self.bundle is None or index < 0 or index >= self.session_list.count():
+            return
+        item = self.session_list.item(index)
+        session = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if session is None:
+            return
+        self.conversation_empty.setVisible(False)
+        self.chat_view.setVisible(True)
+        model = QStandardItemModel()
+        for message in session.messages:
+            cell_item = QStandardItem(cell(message, "content"))
+            cell_item.setData(message, Qt.ItemDataRole.UserRole)
+            model.appendRow(cell_item)
+        self.chat_model = model
+        self.chat_view.setModel(model)
+        self.chat_view.selectionModel().selectionChanged.connect(self._on_message_selected)
+        span = session.first_timestamp
+        if session.last_timestamp != EMPTY and session.last_timestamp != session.first_timestamp:
+            span = "%s ~ %s" % (session.first_timestamp, session.last_timestamp)
+        self.chat_header.setText("%s · %s · 메시지 %d건 · conversation_uuid %s"
+                                 % (session.display_title(),
+                                    session.service if session.service != EMPTY else session.model,
+                                    len(session.messages), session.conversation_uuid))
+        self.chat_header.setToolTip(span)
+
+    def _on_message_selected(self, *_args):
+        message = self._selected_row(self.chat_view)
+        if not isinstance(message, dict):
+            return
+        role = cell(message, "role")
+        self._set_badge(role.upper() if role != EMPTY else "MESSAGE", "BadgeTeal")
+        sections = [("Role", role), ("Timestamp", cell(message, "timestamp")),
+                    ("Conversation Title", cell(message, "conversation_title")),
+                    ("Message Order", cell(message, "message order")),
+                    ("Service / Model", "%s / %s" % (cell(message, "source_parser"), cell(message, "Model")))]
+        paths = [("Conversation UUID", cell(message, "conversation_uuid")),
+                 ("Message UUID", cell(message, "message_uuid")),
+                 ("Parent Message UUID", cell(message, "parent_message_uuid")),
+                 ("Artifact Path", cell(message, "Artifact_path")),
+                 ("Artifact Path (normalized)", cell(message, "artifact_path_normalized"))]
+        meta = [(DISPLAY_NAMES.get(k, k), cell(message, k)) for k in
+                ("parser_version", "source_file", "parse_time_utc", "volume_ref", "evidence_id")
+                if k in self.bundle.conversation_columns]
+        pills = ((role, ""), (cell(message, "source_parser"), ""), (cell(message, "Model"), ""),
+                 (message_source(message), ""))
+        self._set_detail(_detail_html("복구된 메시지", sections, paths, meta, pills))
+        self._set_artifact_path(cell(message, "Artifact_path"))
+
+    def _apply_session_search(self, text):
+        """세션 목록 검색: 제목 · UUID · 서비스 · 모델 · role · 메시지 내용."""
+        needle = (text or "").strip().lower()
+        for index in range(self.session_list.count()):
+            item = self.session_list.item(index)
+            session = item.data(Qt.ItemDataRole.UserRole)
+            item.setHidden(bool(needle) and needle not in session.search_text())
 
     ARTIFACT_COLUMNS = ["Timestamp", "Service", "User Behavior", "Verdict", "Summary",
                         "Artifact Type", "Artifact Source"]
@@ -1631,26 +1840,6 @@ class MainWindow(QWidget):
         run_log = raw.get("run_log") or ""
         self._set_artifact_path(run_log if run_log else EMPTY)
 
-    def _on_session_changed(self, index):
-        if index < 0 or index >= len(getattr(self, "sessions", [])):
-            return
-        session = self.sessions[index]
-        html = [_STYLE, "<h3>%s</h3>" % _esc(session.title if session.title != EMPTY else "(제목 없음)"),
-                "<p class='muted'>conversation_uuid: <code>%s</code> · %s · 메시지 %d건</p>"
-                % (_esc(session.conversation_uuid), _esc(session.model), len(session.messages))]
-        for message in session.messages:
-            role = cell(message, "role")
-            tone = " msg-assistant" if role.lower() not in ("user", "human") else ""
-            html.append(
-                ("<div class='msg%s'>" % tone) +
-                "<div class='role'>%s <span class='muted'>· %s · order %s</span></div>"
-                "<div class='content'>%s</div>"
-                "<div class='meta muted'>message_uuid %s<br>parent %s<br>artifact %s</div></div>"
-                % (_esc(role.upper()), _esc(cell(message, "timestamp")), _esc(cell(message, "message order")),
-                   _esc(cell(message, "content")).replace("\n", "<br>"),
-                   _esc(cell(message, "message_uuid")), _esc(cell(message, "parent_message_uuid")),
-                   _esc(cell(message, "Artifact_path"))))
-        self.message_view.setHtml("".join(html))
 
     def _set_badge(self, text, kind):
         self.detail_badge.setText(text or "-")
@@ -1680,13 +1869,16 @@ class MainWindow(QWidget):
         if self.bundle is not None:
             self._refresh_artifact_empty(len(self.bundle.artifact_rows(self.selected_service,
                                                                        self.selected_artifact_type)))
-        needle = (text or "").strip().lower()
-        for index in range(self.session_list.count()):
-            item = self.session_list.item(index)
-            session = item.data(Qt.ItemDataRole.UserRole)
-            hay = " ".join([session.title, session.conversation_uuid, session.model] +
-                           [cell(m, "content") + cell(m, "role") for m in session.messages]).lower()
-            item.setHidden(bool(needle) and needle not in hay)
+        self._apply_session_search(text)
+        visible = [i for i in range(self.session_list.count()) if not self.session_list.item(i).isHidden()]
+        current = self.session_list.currentRow()
+        if not visible:
+            self._show_empty_chat()
+        elif current not in visible:
+            self.session_list.setCurrentRow(visible[0])
+        else:
+            self._on_session_changed(current)   # 같은 행이면 시그널이 없으므로 직접 복구한다
+        self._refresh_conversation_count()
 
     def _open_result_dir(self):
         if self.bundle is None or not open_in_explorer(self.bundle.result_dir):

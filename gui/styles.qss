@@ -524,3 +524,37 @@ QToolTip {
 #SessionList::item {
     padding: 8px 10px;
 }
+
+/* ----------------------------------------------- Conversations (채팅 뷰) */
+#SessionList {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+#SessionList::item {
+    padding: 9px 11px;
+    border-bottom: 1px solid #27333f;
+    color: #b9c6d2;
+}
+
+#SessionList::item:hover {
+    background: #1f2937;
+}
+
+#SessionList::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    border-left: 2px solid #4cc2d6;
+}
+
+#ChatView {
+    background: #151c25;
+    border: 1px solid #2c3947;
+    border-radius: 4px;
+    outline: none;
+}
+
+#ChatView::item {
+    border: none;
+}
