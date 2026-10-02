@@ -473,3 +473,54 @@ QToolTip {
     border: 1px solid #4cc2d6;
     padding: 4px 7px;
 }
+
+/* --------------------------------------------- 전역 서비스 필터 (왼쪽 목록) */
+#ServiceRow {
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 1px 4px;
+}
+
+#ServiceRow:hover {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+}
+
+#ServiceRow[selected="true"] {
+    background: #14353d;
+    border: 1px solid #4cc2d6;
+}
+
+/* ------------------------------------------------ Artifacts 필터 / 복사 버튼 */
+#TypeFilterList {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+#TypeFilterList::item {
+    padding: 6px 9px;
+    border-bottom: 1px solid #27333f;
+    color: #b9c6d2;
+}
+
+#TypeFilterList::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    border-left: 2px solid #4cc2d6;
+}
+
+#CopyButton {
+    padding: 2px 9px;
+    font-size: 8.5pt;
+    color: #8294a5;
+}
+
+#CopyButton:hover {
+    color: #4cc2d6;
+    border: 1px solid #4cc2d6;
+}
+
+#SessionList::item {
+    padding: 8px 10px;
+}

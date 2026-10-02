@@ -12,10 +12,11 @@ import sys
 from PyQt6.QtCore import QRect, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPen,
                          QStandardItem, QStandardItemModel)
-from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
+                             QFileDialog,
                              QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
                              QListView, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QRadioButton, QSizePolicy, QSplitter,
+                             QProgressBar, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
                              QStackedWidget, QStyle, QStyledItemDelegate, QTableView, QTabWidget,
                              QTextBrowser, QVBoxLayout, QWidget)
 
@@ -168,6 +169,87 @@ class StatusRow(QWidget):
         self.dot.setStyleSheet("color: %s;" % colors.get(kind, "#b9c6cb"))
         if detail is not None:
             self.detail.setText(detail)
+
+
+# 서비스 계열 색상 (ChatGPT=주황, Claude=파랑, Gemini=초록, LM Studio=노랑). 다크 톤에 맞춰 조정했다.
+SERVICE_COLORS = {
+    "chatgpt_web": "#e08a4c", "chatgpt_desktop": "#c9763f",
+    "claude_web": "#6ea8e8", "claude_desktop": "#5a8fd0",
+    "gemini_web": "#5ec98b", "lmstudio": "#e3b341",
+}
+SERVICE_FALLBACK = "#8294a5"
+
+
+def service_color(name):
+    return SERVICE_COLORS.get(name, SERVICE_FALLBACK)
+
+
+class BarRow(QWidget):
+    """'색 표시 + 이름 + 가로 Bar + 건수' 한 줄. 차트 라이브러리를 쓰지 않는다."""
+
+    def __init__(self, label, count, total, color, muted=False, parent=None):
+        super().__init__(parent)
+        self.label, self.count, self.color, self.muted = label, count, color, muted
+        self.ratio = (count / total) if total else 0.0
+        self.setFixedHeight(22)
+        self.setToolTip("%s · %d건" % (label, count))
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        tint = QColor(self.color)
+        if self.muted:
+            tint.setAlpha(90)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(tint)
+        painter.drawRoundedRect(QRect(0, 7, 8, 8), 2, 2)              # 색 표시
+        painter.setPen(QColor(DARK["text_dim"] if not self.muted else DARK["muted"]))
+        painter.setFont(_font(9))
+        name_width = 128
+        painter.drawText(QRect(14, 0, name_width, rect.height()),
+                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         _elide(self.label, name_width, _font(9)))
+        bar_left, bar_right = 14 + name_width + 6, rect.width() - 42
+        track = QRect(bar_left, 8, max(bar_right - bar_left, 10), 7)
+        painter.setBrush(QColor(DARK["card_hi"]))
+        painter.drawRect(track)
+        fill = QRect(track.left(), track.top(), max(int(track.width() * self.ratio), 2 if self.count else 0), track.height())
+        painter.setBrush(tint)
+        painter.drawRect(fill)
+        painter.setPen(QColor(DARK["text"] if not self.muted else DARK["muted"]))
+        painter.setFont(_font(9, bold=True))
+        painter.drawText(QRect(rect.width() - 38, 0, 38, rect.height()),
+                         int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), str(self.count))
+
+
+class ServiceFilterRow(StatusRow):
+    """왼쪽 '실행된 서비스' 한 줄. 상태 배지는 그대로 두고 클릭하면 전역 필터가 된다."""
+
+    def __init__(self, service, label, status, detail, on_click, color=None):
+        super().__init__(label, status, detail)
+        self.service = service
+        self._on_click = on_click
+        self._selected = False
+        self.setObjectName("ServiceRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if color:
+            self.dot.setStyleSheet("color: %s;" % color)
+            self._dot_color = color
+        else:
+            self._dot_color = None
+
+    def set_selected(self, selected):
+        self._selected = selected
+        self.setProperty("selected", "true" if selected else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if self._dot_color:                      # 상태 배지 색과 섞이지 않게 서비스 색을 유지한다
+            self.dot.setStyleSheet("color: %s;" % self._dot_color)
+
+    def mousePressEvent(self, event):
+        self._on_click(self.service)
+        super().mousePressEvent(event)
 
 
 class TableFilterProxy(QSortFilterProxyModel):
@@ -459,6 +541,8 @@ class MainWindow(QWidget):
         self.resize(1480, 920)
         self.case = CaseInfo()
         self.bundle = None
+        self.selected_service = None          # 전역 서비스 필터 (None = 전체). source of truth
+        self.selected_artifact_type = None
         self.runner = IntegrationRunner(self)
         self.parsers = registry_parsers()
         self.parser_checks = {}
@@ -745,9 +829,30 @@ class MainWindow(QWidget):
         self.metrics_grid = QGridLayout()
         self.metrics_grid.setSpacing(9)
         overview_outer.addLayout(self.metrics_grid)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        board = QWidget()
+        grid = QGridLayout(board)
+        grid.setContentsMargins(0, 4, 0, 0)
+        grid.setSpacing(10)
+        target_panel, self.target_box = panel("분석 대상")
+        behavior_panel, self.behavior_box = panel("판정 행위")
+        hour_panel, self.hour_box = panel("시간대별 분포")
+        integrity_panel, self.integrity_box = panel("증거·무결성")
+        grid.addWidget(target_panel, 0, 0)
+        grid.addWidget(behavior_panel, 0, 1)
+        grid.addWidget(hour_panel, 1, 0)
+        grid.addWidget(integrity_panel, 1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
         self.overview_notes = QTextBrowser()
         self.overview_notes.setOpenExternalLinks(False)
-        overview_outer.addWidget(self.overview_notes, 1)
+        self.overview_notes.setMinimumHeight(170)
+        grid.addWidget(self.overview_notes, 2, 0, 1, 2)   # 같은 grid 에 넣어 소유권을 board 로 통일
+        scroll.setWidget(board)
+        overview_outer.addWidget(scroll, 1)
         self.tabs.addTab(self.tab_overview, "Overview")
 
         # Timeline (표 → 카드 타임라인. 모델·프록시는 그대로 쓴다)
@@ -770,6 +875,7 @@ class MainWindow(QWidget):
         conv_layout.setContentsMargins(12, 12, 12, 12)
         conv_split = QSplitter(Qt.Orientation.Horizontal)
         self.session_list = QListWidget()
+        self.session_list.setObjectName("SessionList")
         self.session_list.setMinimumWidth(240)
         self.session_list.currentRowChanged.connect(self._on_session_changed)
         self.message_view = QTextBrowser()
@@ -780,10 +886,44 @@ class MainWindow(QWidget):
         conv_layout.addWidget(conv_split)
         self.tabs.addTab(conv, "Conversations")
 
-        # Artifacts
+        # Artifacts / Files : [필터] + [근거 목록]  (오른쪽 상세는 공용 패널을 쓴다)
         self.artifact_view = make_table()
         self.artifact_proxy = TableFilterProxy(self)
-        self.tabs.addTab(self._wrap(self.artifact_view), "Artifacts / Files")
+        self.artifact_empty = self._empty_notice()
+        artifacts_tab = QWidget()
+        art_outer = QVBoxLayout(artifacts_tab)
+        art_outer.setContentsMargins(12, 12, 12, 12)
+        art_outer.setSpacing(9)
+        head = QHBoxLayout()
+        self.artifact_count = muted("-")
+        head.addWidget(section_label("근거 탐색"))
+        head.addStretch(1)
+        head.addWidget(self.artifact_count)
+        art_outer.addLayout(head)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        filter_panel, filter_box = panel("필터")
+        filter_panel.setMinimumWidth(190)
+        filter_panel.setMaximumWidth(260)
+        filter_box.addWidget(section_label("서비스"))
+        self.artifact_service_label = muted("전체 서비스")
+        filter_box.addWidget(self.artifact_service_label)
+        filter_box.addWidget(muted("서비스는 왼쪽 '실행된 서비스'에서 선택합니다."))
+        filter_box.addWidget(section_label("Artifact Type"))
+        self.artifact_type_list = QListWidget()
+        self.artifact_type_list.setObjectName("TypeFilterList")
+        self.artifact_type_list.currentRowChanged.connect(self._on_artifact_type_changed)
+        filter_box.addWidget(self.artifact_type_list, 1)
+        split.addWidget(filter_panel)
+        art_center = QWidget()                      # 이름이 중앙 패널(center)과 겹치지 않게 한다
+        art_center_box = QVBoxLayout(art_center)
+        art_center_box.setContentsMargins(0, 0, 0, 0)
+        art_center_box.setSpacing(9)
+        art_center_box.addWidget(self.artifact_empty)
+        art_center_box.addWidget(self.artifact_view, 1)
+        split.addWidget(art_center)
+        split.setSizes([210, 900])
+        art_outer.addWidget(split, 1)
+        self.tabs.addTab(artifacts_tab, "Artifacts / Files")
 
         # Errors
         errors = QWidget()
@@ -791,6 +931,8 @@ class MainWindow(QWidget):
         errors_layout.setContentsMargins(12, 12, 12, 12)
         self.error_view = make_table()
         self.error_proxy = TableFilterProxy(self)
+        self.error_empty = self._empty_notice()
+        errors_layout.addWidget(self.error_empty)
         errors_layout.addWidget(self.error_view, 2)
         errors_layout.addWidget(section_label("Analysis Limitations"))
         self.limitations_view = QTextBrowser()
@@ -873,25 +1015,57 @@ class MainWindow(QWidget):
             self.service_bar.addWidget(button)
 
     def _select_service(self, value):
-        for key, button in self.service_buttons.items():
-            button.setChecked(key == value)
-        self.timeline_proxy.set_service(value)
+        """전역 서비스 필터. 왼쪽 목록·Timeline pill·모든 탭이 이 한 곳을 거친다."""
+        service = value or None                       # "" (전체 pill) 와 None 을 하나로 본다
+        self.selected_service = service
+        self.selected_artifact_type = None
+        if self.bundle is None:
+            return
+        for key, row in getattr(self, "service_rows", {}).items():
+            row.set_selected(key == service)
+        for key, button in getattr(self, "service_buttons", {}).items():
+            button.setChecked((key or None) == service)
+        self.timeline_proxy.set_service(service or TableFilterProxy.ALL)
+        self._reset_detail()                          # 이전 서비스의 상세가 남지 않게 초기화
+        self._fill_overview()
+        self._fill_conversations()
+        self._fill_artifacts()
+        self._fill_errors()
         self._refresh_timeline_empty()
+        self._refresh_service_header()
+
+    def _reset_detail(self):
+        self.timeline_view.clearSelection()
+        self.artifact_view.clearSelection()
+        self.error_view.clearSelection()
+        self._set_badge("-", "BadgeNeutral")
+        self._set_artifact_path(EMPTY)
+        self._set_detail("<p class='muted'>Timeline 또는 Artifacts·Errors 표에서 행을 선택하면 "
+                         "근거가 여기에 표시됩니다.</p>")
+
+    def _refresh_service_header(self):
+        label = self.selected_service or "전체 서비스"
+        states = self.bundle.display_parser_states() if self.bundle else []
+        services = sum(1 for _n, _shown, _status, tl, cv in states if tl or cv)
+        self.result_badge.setText("현재 필터: %s · %d Parsers · %d with Results"
+                                  % (label, len(states), services))
 
     def _refresh_timeline_empty(self):
         """0건 안내 토글. 데이터가 0건인 경우와 필터로 0건이 된 경우를 구분한다."""
         if self.bundle is None:
             return
-        if not self.bundle.timeline_rows:
-            self.timeline_empty.setText(self.bundle.empty_state_message("timeline"))
+        rows = self.bundle.timeline_rows_of(self.selected_service)
+        if not rows:
+            self.timeline_empty.setText(
+                self.bundle.empty_state_message("timeline", self.selected_service))
             self.timeline_empty.setVisible(True)
             self.timeline_view.setVisible(False)
             return
         self.timeline_view.setVisible(True)
         filtered_out = self.timeline_proxy.rowCount() == 0
         self.timeline_empty.setText(
-            "현재 필터·검색 조건에 맞는 이벤트가 없습니다. (전체 %d건)" % len(self.bundle.timeline_rows)
-            if filtered_out else "")
+            "현재 필터·검색 조건에 맞는 이벤트가 없습니다. (선택 범위 %d건 / 전체 %d건)"
+            % (len(rows), len(self.bundle.timeline_rows)) if filtered_out else "")
         self.timeline_empty.setVisible(filtered_out)
 
     @staticmethod
@@ -1138,15 +1312,17 @@ class MainWindow(QWidget):
         if saved_case is not None and self.case.is_empty():
             self.case = saved_case
         self.search_box.setEnabled(True)
+        self.selected_service = None
+        self.selected_artifact_type = None
+        self.timeline_proxy.set_service(TableFilterProxy.ALL)
         self._fill_left_panel()
         self._fill_overview()
         self._fill_timeline()
         self._fill_conversations()
         self._fill_artifacts()
         self._fill_errors()
-        states = self.bundle.parser_states()
-        services = sum(1 for _n, _s, tl, cv in states if tl or cv)
-        self.result_badge.setText("%d Parsers · %d with Results" % (len(states), services))
+        self._refresh_service_header()
+        self._reset_detail()
 
     def _fill_left_panel(self):
         case = self.case
@@ -1158,8 +1334,19 @@ class MainWindow(QWidget):
             os.path.basename(evidence.get("path", "") or "-"), evidence.get("path", "-"),
             evidence.get("kind", "-"), len(evidence.get("segments", []) or [])))
         _clear_layout(self.services_box)
+        self.service_rows = {}
+        total_tl, total_cv = len(self.bundle.timeline_rows), len(self.bundle.conversation_rows)
+        all_row = ServiceFilterRow(None, "전체 대상", "-", "%d / %d" % (total_tl, total_cv),
+                                   self._select_service, DARK["accent"])
+        self.service_rows[None] = all_row
+        self.services_box.addWidget(all_row)
         for name, shown, _status, tl_rows, cv_rows in self.bundle.display_parser_states():
-            self.services_box.addWidget(StatusRow(name, shown, "%d / %d" % (tl_rows, cv_rows)))
+            row = ServiceFilterRow(name, name, shown, "%d / %d" % (tl_rows, cv_rows),
+                                   self._select_service, service_color(name))
+            self.service_rows[name] = row
+            self.services_box.addWidget(row)
+        for key, row in self.service_rows.items():
+            row.set_selected(key == self.selected_service)
         _clear_layout(self.steps_box)
         report = self.bundle.report or {}
         done = bool(report.get("parsers"))
@@ -1171,19 +1358,92 @@ class MainWindow(QWidget):
             self.steps_box.addWidget(StatusRow(name, "success" if ok else "-"))
 
     def _fill_overview(self):
+        service = self.selected_service
         notice = self.bundle.limitation_notice()        # 실제 warning 2종이 함께 있을 때만 값이 있다
+        show_notice = bool(notice) and (not service or service in self.bundle.limited_parsers())
         self.overview_notice.setText(notice or "")
-        self.overview_notice.setVisible(bool(notice))
+        self.overview_notice.setVisible(show_notice)
         _clear_grid(self.metrics_grid)
-        for index, (label, value) in enumerate(self.bundle.metrics().items()):
+        for index, (label, value) in enumerate(self.bundle.metrics(service).items()):
             self.metrics_grid.addWidget(metric_card(label, value), index // 4, index % 4)
-        rows = self.bundle.timeline_rows
+        self._fill_target_block()
+        self._fill_behavior_block()
+        self._fill_hour_block()
+        self._fill_integrity_block()
+        self._fill_overview_notes()
+
+    def _fill_target_block(self):
+        """분석 대상: 서비스별 Timeline 건수. 총계는 항상 전체 기준이고 선택 서비스만 강조한다."""
+        _clear_layout(self.target_box)
+        counts = self.bundle.service_counts()
+        if not counts:
+            self.target_box.addWidget(muted("Timeline 결과가 있는 서비스가 없습니다."))
+            return
+        top = max(n for _s, n in counts)
+        for name, count in sorted(counts, key=lambda kv: -kv[1]):
+            muted_bar = bool(self.selected_service) and name != self.selected_service
+            self.target_box.addWidget(BarRow(name, count, top, service_color(name), muted_bar))
+        self.target_box.addWidget(muted("서비스별 Timeline Event 수 (전체 %d건)"
+                                        % len(self.bundle.timeline_rows)))
+        self.target_box.addStretch(1)
+
+    def _fill_behavior_block(self):
+        """판정 행위: 실제 User_behavior 집계. 팀 공통 파일에 상위 분류가 없어 임의로 묶지 않는다."""
+        _clear_layout(self.behavior_box)
+        counts = self.bundle.behavior_counts(self.selected_service)
+        if not counts:
+            self.behavior_box.addWidget(muted("집계할 사용자 행위가 없습니다."))
+            return
+        top = counts[0][1]
+        for name, count in counts:
+            self.behavior_box.addWidget(BarRow(name, count, top, DARK["accent"]))
+        self.behavior_box.addWidget(muted("User_behavior 기준 상위 %d개 (상위 행위 분류 정의가 없어 "
+                                          "원본 행위명을 그대로 집계)" % len(counts)))
+        self.behavior_box.addStretch(1)
+
+    def _fill_hour_block(self):
+        """시간대별 분포: Timestamp 가 있는 행만 시간 단위로 집계."""
+        _clear_layout(self.hour_box)
+        buckets, missing = self.bundle.hour_distribution(self.selected_service)
+        if buckets:
+            top = max(n for _b, n in buckets)
+            for bucket, count in buckets[-12:]:         # 최근 12개 구간
+                self.hour_box.addWidget(BarRow(bucket + "시", count, top, DARK["blue"]))
+        else:
+            self.hour_box.addWidget(muted("시각이 기록된 Event가 없습니다."))
+        if missing:
+            self.hour_box.addWidget(muted("시각 없음(-) %d건은 분포에서 제외" % missing))
+        self.hour_box.addStretch(1)
+
+    def _fill_integrity_block(self):
+        """증거·무결성: manifest / report 에 기록된 값만 표시한다 (해시를 새로 계산하지 않는다)."""
+        _clear_layout(self.integrity_box)
+        for key, value, mono in self.bundle.integrity():
+            self.integrity_box.addWidget(section_label(key))
+            if mono and len(value) > 40:
+                wrapped = chr(10).join(value[i:i + 40] for i in range(0, len(value), 40))
+                label = mono_label(wrapped)
+            else:
+                label = mono_label(value) if mono else muted(value)
+            row = QHBoxLayout()
+            row.addWidget(label, 1)
+            if mono and value != "기록 없음":
+                copy = QPushButton("복사")
+                copy.setObjectName("CopyButton")
+                copy.clicked.connect(lambda _c, v=value: QApplication.clipboard().setText(v))
+                row.addWidget(copy, 0, Qt.AlignmentFlag.AlignTop)
+            self.integrity_box.addLayout(row)
+        self.integrity_box.addStretch(1)
+
+    def _fill_overview_notes(self):
+        rows = self.bundle.timeline_rows_of(self.selected_service)
         recent = [r for r in rows if cell(r, "Timestamp") != EMPTY][-5:]
         confirmed = [r for r in rows if cell(r, "Verdict") == VERDICT_CONFIRMED][:5]
         suspected = [r for r in rows if cell(r, "Verdict") == VERDICT_SUSPECTED][:5]
         html = [_STYLE, "<h3>Main Findings</h3>",
                 "<p class='muted'>통합 Runner 는 별도 Finding 을 생성하지 않습니다. "
-                "아래는 timeline.csv 행을 그대로 추린 요약입니다.</p>"]
+                "아래는 timeline.csv 행을 그대로 추린 요약입니다%s.</p>"
+                % (" (필터: %s)" % self.selected_service if self.selected_service else "")]
         for title, subset in (("최근 Event", list(reversed(recent))), ("확정 Event", confirmed),
                               ("의심 Event", suspected)):
             html.append("<h4>%s</h4>" % title)
@@ -1219,7 +1479,7 @@ class MainWindow(QWidget):
 
     def _fill_conversations(self):
         self.session_list.clear()
-        self.sessions = self.bundle.conversation_sessions()
+        self.sessions = self.bundle.conversation_sessions(self.selected_service)
         for session in self.sessions:
             item = QListWidgetItem("%s\n%s · %s" % (
                 session.title if session.title != EMPTY else "(제목 없음)",
@@ -1229,27 +1489,75 @@ class MainWindow(QWidget):
         if self.sessions:
             self.session_list.setCurrentRow(0)
         else:
-            lines = self.bundle.empty_state_message("conversations").splitlines()
+            lines = self.bundle.empty_state_message("conversations", self.selected_service).splitlines()
             self.message_view.setHtml(_STYLE + "".join(
                 "<p%s>%s</p>" % ("" if i == 0 else " class='muted'", _esc(line))
                 for i, line in enumerate(lines)))
 
+    ARTIFACT_COLUMNS = ["Timestamp", "Service", "User Behavior", "Verdict", "Summary",
+                        "Artifact Type", "Artifact Source"]
+
     def _fill_artifacts(self):
-        rows = self.bundle.artifact_rows()
-        columns = ["Artifact Type", "Service", "Model", "Artifact Path", "Related Behavior",
-                   "First Timestamp", "Events"]
-        model = fill_model(columns, rows, display=False)
+        service = self.selected_service
+        self.artifact_service_label.setText(service or "전체 서비스")
+        # Artifact Type 목록 (실제 데이터에 있는 값만, 건수 포함)
+        types = self.bundle.artifact_types(service)
+        self.artifact_type_list.blockSignals(True)
+        self.artifact_type_list.clear()
+        scope_total = len(self.bundle.timeline_rows_of(service))
+        head = QListWidgetItem("전체  %d" % scope_total)
+        head.setData(Qt.ItemDataRole.UserRole, None)
+        self.artifact_type_list.addItem(head)
+        for kind, count in types:
+            item = QListWidgetItem("%s  %d" % (kind if kind != EMPTY else "(미기재)", count))
+            item.setData(Qt.ItemDataRole.UserRole, kind)
+            self.artifact_type_list.addItem(item)
+        wanted = self.selected_artifact_type
+        self.artifact_type_list.setCurrentRow(
+            next((i for i in range(self.artifact_type_list.count())
+                  if self.artifact_type_list.item(i).data(Qt.ItemDataRole.UserRole) == wanted), 0))
+        self.artifact_type_list.blockSignals(False)
+        self._reload_artifact_rows()
+
+    def _reload_artifact_rows(self):
+        rows = self.bundle.artifact_rows(self.selected_service, self.selected_artifact_type)
+        model = fill_model(self.ARTIFACT_COLUMNS, rows, display=False)
         self.artifact_proxy.setSourceModel(model)
         self.artifact_view.setModel(self.artifact_proxy)
         self.artifact_view.selectionModel().selectionChanged.connect(self._on_artifact_selected)
+        self.artifact_proxy.set_needle(self.search_box.text())
+        self._refresh_artifact_empty(len(rows))
+
+    def _on_artifact_type_changed(self, row):
+        if row < 0 or self.bundle is None:
+            return
+        item = self.artifact_type_list.item(row)
+        self.selected_artifact_type = item.data(Qt.ItemDataRole.UserRole) if item else None
+        self._reload_artifact_rows()
+
+    def _refresh_artifact_empty(self, scope_rows):
+        shown = self.artifact_proxy.rowCount()
+        total = len(self.bundle.timeline_rows)
+        self.artifact_count.setText("필터 결과 %d / 전체 %d" % (shown, total))
+        if scope_rows == 0:
+            self.artifact_empty.setText(
+                self.bundle.empty_state_message("artifacts", self.selected_service))
+        elif shown == 0:
+            self.artifact_empty.setText("현재 필터·검색 조건에 맞는 근거가 없습니다. (선택 범위 %d건)" % scope_rows)
+        self.artifact_empty.setVisible(shown == 0)
+        self.artifact_view.setVisible(shown > 0)
 
     def _fill_errors(self):
-        rows = self.bundle.error_rows()
+        rows = self.bundle.error_rows(self.selected_service)
         columns = ["Module", "Severity", "Type", "Message", "Processing Result"]
         model = fill_model(columns, rows, display=False)
         self.error_proxy.setSourceModel(model)
         self.error_view.setModel(self.error_proxy)
         self.error_view.selectionModel().selectionChanged.connect(self._on_error_selected)
+        self.error_empty.setText(self.bundle.empty_state_message("errors", self.selected_service)
+                                 if not rows else "")
+        self.error_empty.setVisible(not rows)
+        self.error_view.setVisible(bool(rows))
         notes = self.bundle.limitations()
         html = [_STYLE, "<ul>"] + ["<li>%s</li>" % _esc(n) for n in notes] + ["</ul>"]
         if not notes:
@@ -1266,8 +1574,10 @@ class MainWindow(QWidget):
 
     def _on_timeline_selected(self, *_args):
         row = self._selected_row(self.timeline_view)
-        if row is None:
-            return
+        if row is not None:
+            self._show_timeline_detail(row)
+
+    def _show_timeline_detail(self, row):
         verdict = cell(row, "Verdict")
         self._set_badge(verdict, VERDICT_BADGE.get(verdict, "BadgeNeutral"))
         sections = [("행위", cell(row, "User_behavior")), ("Timestamp", cell(row, "Timestamp")),
@@ -1288,6 +1598,10 @@ class MainWindow(QWidget):
     def _on_artifact_selected(self, *_args):
         row = self._selected_row(self.artifact_view)
         if row is None:
+            return
+        source = row.get("_row")
+        if isinstance(source, dict):          # Timeline 과 같은 상세 구성을 쓴다
+            self._show_timeline_detail(source)
             return
         self._set_badge("Artifact", "BadgeTeal")
         sections = [("Artifact Type", row.get("Artifact Type", EMPTY)),
@@ -1363,6 +1677,9 @@ class MainWindow(QWidget):
             if proxy.sourceModel() is not None:
                 proxy.set_needle(text)
         self._refresh_timeline_empty()
+        if self.bundle is not None:
+            self._refresh_artifact_empty(len(self.bundle.artifact_rows(self.selected_service,
+                                                                       self.selected_artifact_type)))
         needle = (text or "").strip().lower()
         for index in range(self.session_list.count()):
             item = self.session_list.item(index)

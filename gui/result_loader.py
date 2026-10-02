@@ -153,25 +153,85 @@ class ResultBundle:
             return self.manifest
         return (self.report or {}).get("evidence", {})
 
-    def metrics(self):
+    # ------------------------------------------------- 서비스 범위 (표시 필터)
+    def timeline_rows_of(self, service=None):
+        """service=None 이면 전체. 원본 리스트를 바꾸지 않고 걸러낸 새 리스트만 돌려준다."""
+        if not service:
+            return self.timeline_rows
+        return [r for r in self.timeline_rows if cell(r, "source_parser") == service]
+
+    def conversation_rows_of(self, service=None):
+        if not service:
+            return self.conversation_rows
+        return [r for r in self.conversation_rows if cell(r, "source_parser") == service]
+
+    def behavior_counts(self, service=None, top=8):
+        """User_behavior 별 건수 (많은 순 top 개). 팀 공통 파일에 상위 분류 정의가 없으므로
+        GUI 가 분류를 만들어 내지 않고 실제 행위명을 그대로 집계한다."""
+        counts = Counter(cell(r, "User_behavior") for r in self.timeline_rows_of(service))
+        counts.pop(EMPTY, None)
+        return counts.most_common(top)
+
+    def hour_distribution(self, service=None):
+        """[(YYYY-MM-DD HH, 건수)] — Timestamp 가 있는 행만. 시각이 없는 행 수도 함께 돌려준다."""
+        counts, missing = Counter(), 0
+        for row in self.timeline_rows_of(service):
+            stamp = cell(row, "Timestamp")
+            if stamp == EMPTY or len(stamp) < 13:
+                missing += 1
+                continue
+            counts[stamp[:13]] += 1          # 'YYYY-MM-DD HH'
+        return sorted(counts.items()), missing
+
+    def integrity(self):
+        """증거·무결성 표시 항목. manifest / report 에 기록된 값만 쓴다 (해시를 새로 계산하지 않는다)."""
+        ev = self.evidence()
+        report = self.report or {}
+        size = ev.get("size_bytes")
+        items = [
+            ("Evidence ID", ev.get("evidence_id") or "기록 없음", False),
+            ("이미지", os.path.basename(ev.get("path") or "") or "기록 없음", False),
+            ("경로", ev.get("path") or "기록 없음", True),
+            ("형식", (ev.get("kind") or "기록 없음").upper(), False),
+            ("크기", "%.1f GB (%s B)" % (size / 2 ** 30, format(size, ",")) if size else "기록 없음", False),
+            ("세그먼트", ", ".join(ev.get("segments") or []) or "기록 없음", True),
+            ("SHA-256", ev.get("evidence_sha256") or "기록 없음", True),
+            ("Quick Fingerprint", ev.get("evidence_quick_fingerprint") or "기록 없음", True),
+            ("Run ID", report.get("run_id") or "기록 없음", True),
+            ("분석 모드", report.get("mode") or "기록 없음", False),
+            ("실행 시각 (UTC)", report.get("generated_at_utc") or "기록 없음", False),
+            ("종료 코드", str(report.get("exit_code")) if report.get("exit_code") is not None else "기록 없음", False),
+        ]
+        if report.get("quick"):
+            items.append(("무결성 주의", "--quick 실행 — 전체 SHA-256 미계산", False))
+        return items
+
+    def metrics(self, service=None):
         """Overview 지표. 결과 파일에서 셀 수 있는 값만 담는다."""
-        verdicts = Counter(cell(r, "Verdict") for r in self.timeline_rows)
+        timeline_rows = self.timeline_rows_of(service)
+        conversation_rows = self.conversation_rows_of(service)
+        verdicts = Counter(cell(r, "Verdict") for r in timeline_rows)
         parsers = (self.report or {}).get("parsers", {})
         summary = (self.report or {}).get("summary", {})
-        services = {cell(r, "source_parser") for r in self.timeline_rows} | {
-            cell(r, "source_parser") for r in self.conversation_rows}
+        services = {cell(r, "source_parser") for r in timeline_rows} | {
+            cell(r, "source_parser") for r in conversation_rows}
         services.discard(EMPTY)
-        error_count = sum(int(p.get("error_count") or 0) for p in parsers.values())
-        error_count += len((self.report or {}).get("integration_errors", []))
+        if service:
+            error_count = sum(int(info.get("error_count") or 0)
+                              for name, info in parsers.items() if name == service)
+        else:
+            error_count = sum(int(p.get("error_count") or 0) for p in parsers.values())
+            error_count += len((self.report or {}).get("integration_errors", []))
         return OrderedDict([
             ("Services with Results", str(len(services))),
-            ("Timeline Events", str(len(self.timeline_rows))),
-            ("Recovered Messages", str(len(self.conversation_rows))),
+            ("Timeline Events", str(len(timeline_rows))),
+            ("Recovered Messages", str(len(conversation_rows))),
             (VERDICT_CONFIRMED, str(verdicts.get(VERDICT_CONFIRMED, 0))),
             (VERDICT_SUSPECTED, str(verdicts.get(VERDICT_SUSPECTED, 0))),
             ("Parser Errors", str(error_count)),
-            ("Parsers Run", str(summary.get("parsers_run", len(parsers)))),
-            ("Parsers Succeeded", str(summary.get("success", "-"))),
+            ("Parsers Run", str(1 if service else summary.get("parsers_run", len(parsers)))),
+            ("Parsers Succeeded", str(summary.get("success", "-")) if not service else
+             ("1" if (parsers.get(service) or {}).get("status") == "success" else "0")),
         ])
 
     def parser_states(self):
@@ -240,28 +300,36 @@ class ResultBundle:
     def failed_parsers(self):
         return sorted(name for name, status, _tl, _cv in self.parser_states() if status != "success")
 
-    def empty_state_message(self, kind):
-        """kind='timeline' | 'conversations' — 0건일 때 보여 줄 문구. 실패와 정상 0건을 구분한다."""
-        if kind == "timeline":
-            head = "탐지된 Timeline Event가 없습니다."
-        else:
-            head = "복구된 대화가 없습니다."
+    HEADS = {"timeline": ("탐지된 Timeline Event가 없습니다.",
+                          "선택한 서비스에서 탐지된 Timeline Event가 없습니다."),
+             "conversations": ("복구된 대화가 없습니다.",
+                               "선택한 서비스에서 복구된 대화가 없습니다."),
+             "artifacts": ("탐지된 Artifact 근거가 없습니다.",
+                           "선택한 서비스에서 탐지된 Artifact 근거가 없습니다."),
+             "errors": ("보고된 오류가 없습니다.", "선택한 서비스와 관련된 오류가 없습니다.")}
+
+    def empty_state_message(self, kind, service=None):
+        """0건 안내. '전체 0건' 과 '서비스 필터로 0건' 을 구분하고, 실패와 정상 0건도 구분한다."""
+        head = self.HEADS.get(kind, self.HEADS["timeline"])[1 if service else 0]
         lines = [head]
-        failed = self.failed_parsers()
+        failed = [f for f in self.failed_parsers() if not service or f == service]
         if failed:
             lines.append("일부 Parser가 정상적으로 끝나지 않았습니다 (%s). 0건과 실패는 다릅니다."
                          % ", ".join(failed))
         notice = self.limitation_notice()
-        if notice:
+        if notice and (not service or service in self.limited_parsers()):
             lines.append(notice)
-        lines.append("Errors & Limitations에서 각 Parser의 실행 상태를 확인하세요.")
+        if kind != "errors":
+            lines.append("Errors & Limitations에서 각 Parser의 실행 상태를 확인하세요.")
         return "\n".join(lines)
 
-    def error_rows(self):
+    def error_rows(self, service=None):
         """Errors & Limitations 표. report 의 오류를 그대로 펼친다 (원인 추측 없음)."""
         report = self.report or {}
         out = []
         for name, info in (report.get("parsers") or {}).items():
+            if service and name != service:          # 선택한 서비스의 오류만
+                continue
             status = info.get("status", "-")
             for err in info.get("errors") or []:
                 out.append({"Module": name, "Severity": status, "Type": err.get("type", "-"),
@@ -277,10 +345,15 @@ class ResultBundle:
                             "Message": "보고서에는 앞 100건만 기록됨 (전체는 unified.db runs.violations)",
                             "Processing Result": "일부만 표시", "_raw": {}})
         for err in report.get("integration_errors") or []:
+            # 공통 integration 오류는 전체 모드에서 보여 주고, 특정 파서를 지목한 오류는 그 서비스에서도 보여 준다
+            if service and (err.get("parser") or "integration") != service:
+                continue
             out.append({"Module": err.get("parser") or "integration", "Severity": "integration",
                         "Type": err.get("type", "-"), "Message": _error_text(err),
                         "Processing Result": "통합 단계 실패", "_raw": err})
         for text in report.get("warnings") or []:
+            if service:                              # 통합 전체 경고는 전체 모드에서만
+                continue
             out.append({"Module": "integration", "Severity": "warning", "Type": "WARNING",
                         "Message": str(text), "Processing Result": "계속 진행", "_raw": {}})
         return out
@@ -307,35 +380,38 @@ class ResultBundle:
         return notes
 
     # ----------------------------------------------------------- artifacts
-    def artifact_rows(self):
-        """Timeline 행에서 아티팩트 관점으로 추린 표. 새 사실을 만들지 않고 같은 행을 다르게 모은 것이다."""
-        grouped = OrderedDict()
-        for row in self.timeline_rows:
+    def artifact_rows(self, service=None, artifact_type=None):
+        """근거 탐색용 행 목록. timeline 행 1건 = 1행이며 값은 원본 그대로다
+        (새 판정을 만들지 않고 아티팩트 관점으로 열만 재배치한다)."""
+        rows = []
+        for row in self.timeline_rows_of(service):
+            kind = artifact_type_of(cell(row, "Artifact_details "))
+            if artifact_type and kind != artifact_type:
+                continue
             path = cell(row, "Artifact_path")
-            key = (cell(row, "source_parser"), path)
-            entry = grouped.setdefault(key, {
-                "Artifact Type": artifact_type_of(cell(row, "Artifact_details ")),
-                "Service": cell(row, "source_parser"), "Model": cell(row, "Model"),
-                "Artifact Path": path, "Related Behavior": set(), "First Timestamp": EMPTY,
-                "Events": 0, "_rows": []})
-            entry["Related Behavior"].add(cell(row, "User_behavior"))
-            entry["Events"] += 1
-            entry["_rows"].append(row)
-            ts = cell(row, "Timestamp")
-            if ts != EMPTY and (entry["First Timestamp"] == EMPTY or ts < entry["First Timestamp"]):
-                entry["First Timestamp"] = ts
-        out = []
-        for entry in grouped.values():
-            entry["Related Behavior"] = ", ".join(sorted(entry["Related Behavior"]))
-            entry["Events"] = str(entry["Events"])
-            out.append(entry)
-        return out
+            rows.append({
+                "Timestamp": cell(row, "Timestamp"),
+                "Service": cell(row, "source_parser"),
+                "User Behavior": cell(row, "User_behavior"),
+                "Verdict": cell(row, "Verdict"),
+                "Summary": _summary_text(cell(row, "Behavior_details ")),
+                "Artifact Type": kind,
+                "Artifact Source": _path_tail(path),
+                "_row": row,          # 상세 패널은 원본 dict 를 그대로 쓴다
+            })
+        return rows
+
+    def artifact_types(self, service=None):
+        """[(artifact_type, 건수)] — 실제 데이터에 있는 값만. 없는 타입을 만들지 않는다."""
+        counts = Counter(artifact_type_of(cell(r, "Artifact_details "))
+                         for r in self.timeline_rows_of(service))
+        return sorted(counts.items(), key=lambda kv: (kv[0] == EMPTY, -kv[1], kv[0]))
 
     # -------------------------------------------------------- conversations
-    def conversation_sessions(self):
+    def conversation_sessions(self, service=None):
         """conversation_uuid 별 세션 목록 (파일 순서 유지, 메시지는 message order 로 정렬)."""
         sessions = OrderedDict()
-        for row in self.conversation_rows:
+        for row in self.conversation_rows_of(service):
             uuid = cell(row, "conversation_uuid")
             session = sessions.get(uuid)
             if session is None:
@@ -349,6 +425,19 @@ class ResultBundle:
         for session in sessions.values():
             session.messages.sort(key=lambda r: _order_key(cell(r, "message order")))
         return list(sessions.values())
+
+
+def _summary_text(details, limit=110):
+    """Behavior_details 를 표에 넣을 한 줄로 (값은 자르기만 하고 바꾸지 않는다)."""
+    text = " ".join(str(details).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _path_tail(path):
+    """경로의 마지막 조각 (전체 경로는 상세 패널에서 본다)."""
+    if not path or path == EMPTY:
+        return EMPTY
+    return str(path).replace("/", "\\").rstrip("\\").split("\\")[-1] or EMPTY
 
 
 def _read_parser_warnings(result_dir):
