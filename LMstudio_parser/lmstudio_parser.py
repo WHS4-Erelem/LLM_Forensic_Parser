@@ -1189,6 +1189,125 @@ def recover_deleted_resident(ctx: AnalysisContext, record: Any, path: str, sourc
         "deleted_mft_resident", size, content=content, metadata={"history_kind": "history_delete"}))
 
 
+class SplitRawImageError(ValueError):
+    """A split RAW/DD segment set is incomplete or was entered incorrectly."""
+
+
+def split_raw_segment_number(path: Path) -> int | None:
+    match = re.fullmatch(r".+\.(\d{3})", path.name)
+    return int(match.group(1)) if match is not None else None
+
+
+def discover_split_raw_segments(path: Path) -> list[Path]:
+    if split_raw_segment_number(path) != 1 or path.suffix != ".001":
+        raise SplitRawImageError("분할 RAW/DD 이미지는 첫 segment인 .001을 지정하십시오.")
+    prefix = path.name[:-4]
+    pattern = re.compile(re.escape(prefix) + r"\.(\d{3})\Z")
+    segments: dict[int, Path] = {}
+    try:
+        siblings = path.parent.iterdir()
+        for sibling in siblings:
+            match = pattern.fullmatch(sibling.name)
+            if match is not None and sibling.is_file():
+                segments[int(match.group(1))] = sibling
+    except OSError as exc:
+        raise SplitRawImageError("분할 RAW/DD segment 목록을 읽을 수 없습니다.") from exc
+    if 1 not in segments:
+        raise SplitRawImageError("분할 RAW/DD 이미지의 .001 segment를 찾을 수 없습니다.")
+    for expected in range(1, max(segments) + 1):
+        if expected not in segments:
+            raise SplitRawImageError(
+                f"분할 RAW/DD segment가 연속적이지 않습니다. 예상 segment: .{expected:03d}"
+            )
+    return [segments[index] for index in range(1, max(segments) + 1)]
+
+
+class SegmentedRawStream(io.RawIOBase):
+    """Read-only logical stream over ordered RAW/DD segments without joining them."""
+
+    def __init__(self, segments: Sequence[Path]) -> None:
+        super().__init__()
+        if not segments:
+            raise ValueError("segment가 필요합니다.")
+        self._handles: list[BinaryIO] = []
+        self._ends: list[int] = []
+        self._position = 0
+        total = 0
+        try:
+            for segment in segments:
+                handle = segment.open("rb")
+                self._handles.append(handle)
+                total += int(os.fstat(handle.fileno()).st_size)
+                self._ends.append(total)
+        except Exception:
+            for handle in reversed(self._handles):
+                handle.close()
+            raise
+        self._size = total
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        self._checkClosed()
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._checkClosed()
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        elif whence == os.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError("invalid whence")
+        if position < 0:
+            raise ValueError("negative seek position")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        self._checkClosed()
+        if size == 0 or self._position >= self._size:
+            return b""
+        remaining = self._size - self._position if size is None or size < 0 else min(size, self._size - self._position)
+        chunks: list[bytes] = []
+        while remaining > 0:
+            segment_index = next(index for index, end in enumerate(self._ends) if self._position < end)
+            segment_start = self._ends[segment_index - 1] if segment_index else 0
+            available = self._ends[segment_index] - self._position
+            handle = self._handles[segment_index]
+            handle.seek(self._position - segment_start)
+            chunk = handle.read(min(remaining, available))
+            if not chunk:
+                raise OSError("분할 RAW/DD segment가 분석 중 변경되었습니다.")
+            chunks.append(chunk)
+            self._position += len(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def readinto(self, buffer: Any) -> int:
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def close(self) -> None:
+        if not self.closed:
+            for handle in reversed(self._handles):
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+        super().close()
+
+
 def open_image_stream(path: Path) -> tuple[BinaryIO, list[Any]]:
     keepalive: list[Any] = []
     if path.suffix.lower() in {".e01", ".ex01", ".s01", ".l01"}:
@@ -1197,6 +1316,14 @@ def open_image_stream(path: Path) -> tuple[BinaryIO, list[Any]]:
         ewf = EWF(find_files(path))
         keepalive.append(ewf)
         return ewf.open(), keepalive
+    if path.suffix == ".001":
+        segments = discover_split_raw_segments(path)
+        try:
+            stream = SegmentedRawStream(segments)
+        except OSError as exc:
+            raise SplitRawImageError("분할 RAW/DD segment를 읽기 전용으로 열지 못했습니다.") from exc
+        keepalive.append(stream)
+        return stream, keepalive
     fh = path.open("rb")
     keepalive.append(fh)
     return fh, keepalive
@@ -1211,6 +1338,9 @@ def collect_image(ctx: AnalysisContext) -> None:
         return
     try:
         stream, keepalive = open_image_stream(ctx.input_path)
+    except SplitRawImageError as exc:
+        ctx.issue("split_raw_invalid", str(ctx.input_path), str(exc), True)
+        return
     except Exception:
         ctx.issue("image_open_failed", str(ctx.input_path), "image를 읽기 전용으로 열지 못함", True)
         return
@@ -2636,73 +2766,337 @@ def pointer_order(location: str) -> tuple[int, ...]:
     return tuple(int(part) for part in location.split("/") if part.isdigit())
 
 
+def candidate_message_subject(ctx: AnalysisContext, candidate: CandidateEvent) -> str:
+    paths = {f.provenance.original_artifact_path for f in candidate.facts}
+    titles = sorted({m.title for m in ctx.messages if m.artifact_path in paths and m.title})
+    if titles:
+        return " | ".join(titles)
+    if candidate.conversation_ref:
+        return safe_nonconversation_text(candidate.conversation_ref, max_length=500)
+    filenames = sorted({basename(f.target_path) for f in candidate.facts
+                        if basename(f.target_path).lower().endswith(".conversation.json")})
+    return " | ".join(filenames)
+
+
+def candidate_user_message_first_lines(ctx: AnalysisContext, candidate: CandidateEvent, fact_type: str) -> str:
+    anchors = [f for f in candidate.facts if f.fact_type == fact_type]
+    messages = [m for m in ctx.messages if m.role == "user" and m.content and any(
+        m.artifact_path == f.provenance.original_artifact_path and
+        m.location.startswith(f.key.rstrip("/") + "/") for f in anchors)]
+    values = [first_prompt_line(m.content) for m in sorted(messages, key=lambda m: (m.artifact_path, pointer_order(m.location)))]
+    if not values and fact_type == "user_message":
+        values = [first_prompt_line(f.value) for f in anchors if f.value]
+    return " | ".join(dict.fromkeys(value for value in values if value))
+
+
 def candidate_behavior_details(ctx: AnalysisContext, candidate: CandidateEvent) -> str:
-    """Action content, not a copy of the decision explanation."""
+    """Return a concise, user-facing ``<basis>_<subject>`` description."""
     action = candidate.action
     types = {f.fact_type for f in candidate.facts}
-    if action in {"prompt_interaction", "message_edit"}:
-        wanted = "user_message" if action == "prompt_interaction" else "explicit_message_edit"
-        anchors = [f for f in candidate.facts if f.fact_type == wanted]
-        messages = [m for m in ctx.messages if m.role == "user" and m.content and any(
-            m.artifact_path == f.provenance.original_artifact_path and
-            m.location.startswith(f.key.rstrip("/") + "/") for f in anchors)]
-        if messages:
-            return "\n".join(m.content for m in sorted(messages, key=lambda m: (m.artifact_path, pointer_order(m.location))))
-        return "\n".join(f.value for f in anchors if f.fact_type == "user_message")
+
     def values(*fact_types: str) -> str:
         return " | ".join(sorted({safe_nonconversation_text(f.value, max_length=1000)
                                   for f in candidate.facts if f.fact_type in fact_types and f.value}))
+
+    if action == "prompt_interaction":
+        subject = candidate_user_message_first_lines(ctx, candidate, "user_message")
+        sent = bool(types & {"assistant_response", "generation_metadata", "server_inference"})
+        prefix = "사용자 메시지 전송" if sent else "프롬프트 작성 흔적(전송 미확인)"
+        return prefix + ("_" + subject if subject else "")
+    if action == "message_edit":
+        subject = candidate_user_message_first_lines(ctx, candidate, "explicit_message_edit")
+        return "사용자 메시지 수정 기록" + ("_" + subject if subject else "")
     if action in {"image_upload", "document_upload"}:
-        return values("image_metadata", "document_metadata")
+        subject = values("image_metadata", "document_metadata")
+        linked = "conversation_attachment" in types
+        prefix = "전송 메시지 첨부" if linked else (
+            "이미지 업로드 준비 흔적(전송 불확인)" if action == "image_upload"
+            else "문서 업로드 준비 흔적(전송 불확인)"
+        )
+        return prefix + ("_" + subject if subject else "")
+    if action in {"image_upload_delete", "document_upload_delete"}:
+        subject = " | ".join(sorted({
+            safe_nonconversation_text(basename(f.target_path).removesuffix(".metadata.json"), max_length=500)
+            for f in candidate.facts if f.target_path
+        }))
+        return "첨부 제거 이벤트" + ("_" + subject if subject else "")
     if action == "model_change":
-        return values("model_loaded_state", "conversation_model") or " | ".join(sorted({f.value for f in candidate.facts if f.fact_type == "model_load_log" and f.value != "model_load_log"})) or ("모델 로드 성공 로그" if candidate.direct_evidence else "")
+        subject = values("model_loaded_state", "conversation_model") or " | ".join(sorted({
+            safe_nonconversation_text(f.value, max_length=500) for f in candidate.facts
+            if f.fact_type == "model_load_log" and f.value != "model_load_log"
+        })) or ("LM Studio" if candidate.direct_evidence else "")
+        return "모델 변경 기록" + ("_" + subject if subject else "")
     if action == "model_download":
-        return values("download_completed_record", "download_attempt_record", "final_gguf") or " | ".join(sorted({
-            safe_nonconversation_text(basename(f.target_path), max_length=500) for f in candidate.facts
-            if basename(f.target_path).lower().endswith((".gguf", ".gguf.part"))}))
-    if action in {"conversation_delete", "image_upload_delete", "document_upload_delete", "conversation_export"}:
-        return " | ".join(sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
-                                  for f in candidate.facts if f.target_path}))
+        final_targets = sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
+                                for f in candidate.facts
+                                if basename(f.target_path).lower().endswith(".gguf")})
+        partial_targets = sorted({safe_nonconversation_text(
+            basename(f.target_path).removeprefix("downloading_").removesuffix(".part"), max_length=500)
+            for f in candidate.facts if basename(f.target_path).lower().endswith(".gguf.part")})
+        subject = values("download_completed_record", "download_attempt_record", "final_gguf")
+        subject = subject or " | ".join(final_targets) or " | ".join(partial_targets)
+        history_completed = bool(final_targets and partial_targets and any(
+            basename(f.target_path).lower() in {"download-jobs-info.json", "single-downloads-info.json"}
+            for f in candidate.facts
+        ))
+        completed = "download_completed_record" in types or "final_gguf" in types or history_completed
+        prefix = "다운로드 완료 기록" if completed else "다운로드 시도 흔적(완료 미확인)"
+        return prefix + ("_" + subject if subject else "")
+    if action == "conversation_delete":
+        subject = " | ".join(sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
+                                     for f in candidate.facts if f.target_path}))
+        return "대화 파일 삭제 흔적" + ("_" + subject if subject else "")
+    if action == "conversation_export":
+        subject = " | ".join(sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
+                                     for f in candidate.facts if f.target_path}))
+        prefix = "Export 완료 기록" if "history_create" in types else "Export 파일 흔적(완료 미확인)"
+        return prefix + ("_" + subject if subject else "")
     if action in {"conversation_create", "assistant_retry", "prompt_delete"}:
-        paths = {f.provenance.original_artifact_path for f in candidate.facts}
-        titles = {m.title for m in ctx.messages if m.artifact_path in paths and m.title}
-        subject = " | ".join(sorted(titles)) or candidate.conversation_ref
+        subject = candidate_message_subject(ctx, candidate)
+        prefix = {
+            "conversation_create": "대화 생성 기록",
+            "assistant_retry": "응답 재시도 기록",
+            "prompt_delete": "사용자 메시지 삭제 흔적",
+        }[action]
         if action == "assistant_retry":
             count = values("assistant_retry_structure")
-            subject += ("; " if subject else "") + "assistant versions=" + (count or "-")
-        return safe_nonconversation_text(subject, max_length=1000)
+            subject += ("; " if subject else "") + "versions=" + (count or "-")
+        return prefix + ("_" + safe_nonconversation_text(subject, max_length=1000) if subject else "")
     if action in {"login", "logout", "account_switch"}:
         if candidate.direct_evidence:
-            return {"login": "명시적 로그인 성공", "logout": "명시적 로그아웃 성공", "account_switch": "명시적 계정 전환"}[action]
-        transition = "Before→After " if any("Before/After" in c for c in candidate.matched_conditions) else ""
-        return transition + {"login": "인증된 계정 상태 확인", "logout": "계정 인증 상태 초기화", "account_switch": "계정 식별자 전환 근거"}[action]
-    if action.startswith("application_"):
-        return " | ".join(sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
-                                  for f in candidate.facts if f.target_path})) or candidate.korean_action + " 로그/상태 근거"
-    return ""
+            return {"login": "로그인 성공 기록_명시적 로그인 성공",
+                    "logout": "로그아웃 성공 기록_명시적 로그아웃 성공",
+                    "account_switch": "계정 전환 기록_명시적 계정 전환"}[action]
+        if action == "login":
+            identifiers = values("account_profile_state")
+            return "로그인 상태 확인_" + (identifiers or "인증된 계정 상태")
+        if action == "logout":
+            return "계정 인증 상태 초기화_null/reset 상태 확인"
+        identifiers = list(dict.fromkeys(
+            f.value for f in candidate.facts
+            if f.fact_type == "account_profile_state" and f.value.startswith("sha256:")
+        ))
+        before_after = any("Before/After" in condition for condition in candidate.matched_conditions)
+        if before_after and len(identifiers) == 2:
+            return "계정 전환 기록_" + " → ".join(identifiers)
+        subject = " | ".join(identifiers) or "계정 전환 로그 문구"
+        return "계정 전환 흔적_" + subject
+    if action == "application_install":
+        subject = next((safe_nonconversation_text(f.target_path, max_length=1000) for f in candidate.facts
+                        if f.fact_type == "application_binary" and f.target_path), "")
+        subject = subject or " | ".join(sorted({basename(f.target_path) for f in candidate.facts if f.target_path}))
+        return "설치 기록" + ("_" + subject if subject else "")
+    if action == "application_uninstall":
+        subject = " | ".join(sorted({safe_nonconversation_text(basename(f.target_path), max_length=500)
+                                     for f in candidate.facts if f.target_path}))
+        return "프로그램 삭제 기록" + ("_" + subject if subject else "")
+    if action == "application_launch":
+        prefetch = next((basename(f.target_path) for f in candidate.facts if f.fact_type == "application_prefetch"), "")
+        if prefetch:
+            return "Prefetch 실행 기록_" + safe_nonconversation_text(prefetch, max_length=500)
+        runtime = next((basename(f.provenance.original_artifact_path) for f in candidate.facts
+                        if f.fact_type in {"server_log_artifact", "http_server_runtime", "history_create", "history_modify"}), "")
+        return "애플리케이션 실행 흔적_" + safe_nonconversation_text(runtime or "runtime/server 상태", max_length=500)
+    if action == "application_normal_exit":
+        return "정상 종료 기록_LM Studio" if candidate.direct_evidence else "정상 종료 흔적_state flush 및 runtime 정리"
+    if action == "application_forced_exit":
+        return "강제 종료 기록_LM Studio" if candidate.direct_evidence else "강제 종료 흔적_runtime/state 양성 근거"
+    return candidate.korean_action + "_관찰된 LM Studio 아티팩트"
+
+
+def artifact_display_name(fact: ObservedFact) -> str:
+    source = lower_path(fact.provenance.original_artifact_path)
+    target = lower_path(fact.target_path)
+    location = fact.provenance.evidence_location.lower()
+    name = basename(fact.provenance.original_artifact_path).lower()
+    target_name = basename(fact.target_path).lower()
+    combined = source + " " + target
+    if "offset 0x" in location or "$usnjrnl" in combined:
+        return "$UsnJrnl"
+    if "mft" in location or name in {"$mft", "$mft.copy0"} or fact.provenance.original_artifact_path == "C:\\$MFT":
+        return "$MFT"
+    if fact.fact_type.startswith("history_"):
+        return "History"
+    if name == "conversation-config.json":
+        return "Conversation Config"
+    if name.endswith(".conversation.json") or target_name.endswith(".conversation.json"):
+        return "Conversation"
+    if name in {"local-identity.json", "user-profile.json", "lmstudio-hub.json", "lm-link-account-status-cache.json"}:
+        return "Account"
+    if name.endswith(".metadata.json") or target_name.endswith(".metadata.json"):
+        return "Attachment Metadata"
+    if name == "model-data.json":
+        return "Model Data"
+    if name in {"download-jobs-info.json", "single-downloads-info.json"}:
+        return "Download Record"
+    if name.endswith(".log") and "server-logs" in source:
+        return "Server Log"
+    if name.endswith(".pf") or fact.fact_type == "application_prefetch":
+        return "Prefetch"
+    if name in {"http-server.json", "llmster-pid.lock", "global.json"} or re.fullmatch(r"window-\d+\.json", name):
+        return "Runtime"
+    if name.endswith(":zone.identifier") or fact.fact_type == "zone_identifier":
+        return "Zone.Identifier"
+    if target_name.endswith(".gguf") or target_name.endswith(".gguf.part") or name.endswith(".gguf") or name.endswith(".gguf.part"):
+        return "GGUF"
+    if fact.fact_type == "lmstudio_export" or name.endswith(".md"):
+        return "Export"
+    if name == "lm studio.exe" or target_name == "lm studio.exe":
+        return "Program File"
+    if name.endswith(".lnk") or target_name.endswith(".lnk"):
+        return "Shortcut"
+    if fact.fact_type == "application_installer" or "uninstall" in combined or "updater" in combined:
+        return "Installer"
+    return "Artifact"
+
+
+def artifact_location_detail(location: str) -> str:
+    safe = safe_nonconversation_text(location, max_length=1000)
+    if not safe or safe.lower() == "file":
+        return ""
+    low = safe.lower()
+    if safe.startswith("/"):
+        return "JSON 위치=" + safe
+    if "offset 0x" in low:
+        return "위치=" + safe[safe.lower().index("offset 0x"):]
+    if "mft" in low:
+        return "위치=" + safe
+    if re.search(r"\bline \d+\b", safe, re.I):
+        return "위치=" + re.search(r"\bline \d+\b", safe, re.I).group(0)
+    return "위치=" + safe
+
+
+def fact_event_name(fact_type: str) -> str:
+    return {
+        "history_create": "생성", "history_modify": "수정", "history_delete": "삭제",
+        "history_rename": "이름 변경", "history_observed": "관찰",
+        "account_login_log": "로그인 성공", "account_logout_log": "로그아웃 성공",
+        "account_switch_log": "계정 전환", "account_reauthentication": "재인증",
+        "server_inference": "추론 실행", "model_load_log": "모델 로드 성공",
+        "normal_exit_log": "정상 종료", "forced_exit_log": "강제 종료",
+    }.get(fact_type, "")
+
+
+def fact_artifact_detail(fact: ObservedFact) -> str:
+    label = artifact_display_name(fact)
+    name = basename(fact.provenance.original_artifact_path)
+    target_name = basename(fact.target_path)
+    fields: list[str] = []
+
+    event = fact_event_name(fact.fact_type)
+    if fact.fact_type.startswith("history_"):
+        if target_name:
+            fields.append("대상=" + safe_nonconversation_text(target_name, max_length=500))
+        if label == "$MFT" and fact.target_path:
+            fields.append("경로=" + safe_nonconversation_text(fact.target_path, max_length=1000))
+        if event:
+            fields.append("이벤트=" + event)
+    elif fact.fact_type in {"user_message", "assistant_response", "generation_metadata", "explicit_message_edit",
+                            "conversation_attachment", "assistant_retry_structure", "conversation_selected",
+                            "before_user_message", "after_user_removed", "historical_user_activity",
+                            "conversation_ntfs_creation", "conversation_ntfs_write_context", "conversation_model"}:
+        if name:
+            fields.append("파일=" + safe_nonconversation_text(name, max_length=500))
+        if fact.fact_type == "conversation_attachment":
+            fields.append("이벤트=메시지 첨부 연결")
+        elif fact.fact_type == "explicit_message_edit":
+            fields.append("이벤트=사용자 메시지 수정")
+        elif fact.fact_type == "assistant_retry_structure":
+            fields.append("응답 버전 수=" + safe_nonconversation_text(fact.value, max_length=40))
+        elif fact.fact_type == "conversation_selected":
+            fields.append("이벤트=대화 선택")
+        elif fact.fact_type == "conversation_model" and fact.value:
+            fields.append("모델=" + safe_nonconversation_text(fact.value, max_length=500))
+    elif fact.fact_type in {"image_metadata", "document_metadata"}:
+        fields.append("파일명=" + safe_nonconversation_text(fact.value or target_name, max_length=500))
+    elif fact.fact_type in {"model_loaded_state", "model_load_log"}:
+        if fact.value and fact.value != fact.fact_type:
+            fields.append("모델=" + safe_nonconversation_text(fact.value, max_length=500))
+        else:
+            fields.append("이벤트=모델 로드 성공")
+    elif fact.fact_type in {"download_completed_record", "download_attempt_record"}:
+        fields.append("상태=" + ("완료" if fact.fact_type == "download_completed_record" else "완료 미확인"))
+        fields.append("파일명=" + safe_nonconversation_text(fact.value or target_name, max_length=500))
+    elif fact.fact_type in {"final_gguf", "partial_download_file"}:
+        fields.append("파일명=" + safe_nonconversation_text(fact.value or target_name or name, max_length=500))
+        if fact.fact_type == "partial_download_file":
+            fields.append("상태=부분 다운로드")
+    elif fact.fact_type == "zone_identifier":
+        fields.append("대상=" + safe_nonconversation_text(target_name or name.removesuffix(":Zone.Identifier"), max_length=500))
+        fields.append("상태=인터넷 출처 표시")
+    elif event:
+        fields.append("이벤트=" + event)
+    elif fact.fact_type == "application_prefetch":
+        fields.extend(["실행 파일=LM Studio.exe", "파일=" + safe_nonconversation_text(target_name or name, max_length=500)])
+    elif fact.fact_type in {"application_binary", "application_shortcut", "application_installer"}:
+        fields.append("파일=" + safe_nonconversation_text(target_name or name, max_length=500))
+    elif fact.fact_type in {"server_log_artifact", "http_server_runtime", "pid_lock_runtime",
+                            "ui_final_state_flush", "ui_conversation_cleared", "listing_observed"}:
+        fields.append("상태=" + {
+            "server_log_artifact": "서버 로그 확인", "http_server_runtime": "HTTP 서버 상태 확인",
+            "pid_lock_runtime": "PID lock 확인", "ui_final_state_flush": "UI 상태 저장",
+            "ui_conversation_cleared": "활성 대화 상태 초기화", "listing_observed": "파일 목록 관찰",
+        }[fact.fact_type])
+        if name:
+            fields.append("파일=" + safe_nonconversation_text(name, max_length=500))
+    elif fact.fact_type.startswith("account_") or fact.fact_type == "credential_present_state":
+        state = {
+            "account_logged_in_state": "로그인 상태", "account_profile_state": "계정 프로필 확인",
+            "account_reset_state": "null/reset 상태", "account_status_state": "계정 상태 확인",
+            "credential_present_state": "인증 상태 존재",
+        }.get(fact.fact_type, "계정 상태 확인")
+        fields.append("상태=" + state)
+        if fact.fact_type == "account_profile_state" and fact.value.startswith("sha256:"):
+            fields.append("계정 식별값=" + fact.value)
+    elif fact.fact_type == "lmstudio_export":
+        fields.append("파일=" + safe_nonconversation_text(target_name or name, max_length=500))
+    else:
+        fields.append("파일=" + safe_nonconversation_text(target_name or name or "LM Studio artifact", max_length=500))
+
+    location = artifact_location_detail(fact.provenance.evidence_location)
+    if location:
+        fields.append(location)
+    if not fields:
+        fields.append("파일=" + safe_nonconversation_text(name or target_name or "LM Studio artifact", max_length=500))
+    return f"[{label}] " + ", ".join(dict.fromkeys(fields))
+
+
+def usn_artifact_detail_key(fact: ObservedFact) -> tuple[str, ...] | None:
+    label = artifact_display_name(fact)
+    if (label != "$UsnJrnl" or not fact.fact_type.startswith("history_")
+            or not fact_event_name(fact.fact_type) or not fact.target_path):
+        return None
+    # Keep full target/source paths in the key: equal basenames in different
+    # profiles or journals must not become one displayed evidence group.
+    return (label, fact.fact_type, fact.target_path,
+            fact.provenance.source_image, fact.provenance.original_artifact_path)
 
 
 def candidate_artifact_details(candidate: CandidateEvent) -> str:
-    parts = ["Rule=" + candidate.rule_id, "Evidence Family=" + ",".join(sorted(candidate.evidence_families)),
-             "Direct Evidence=" + str(candidate.direct_evidence)]
-    if candidate.conversation_ref:
-        parts.append("conversation_id=" + safe_nonconversation_text(candidate.conversation_ref, max_length=500))
-    locations = sorted({safe_nonconversation_text(f.provenance.original_artifact_path + ":" + f.provenance.evidence_location,
-                                                max_length=2500) for f in candidate.facts if f.provenance.evidence_location})
-    parts.extend("Evidence=" + location for location in locations)
-    parts.append("Facts=" + ",".join(sorted({f.fact_type for f in candidate.facts})))
-    for f in candidate.facts:
-        if f.fact_type in {"image_metadata", "document_metadata"} and f.key:
-            parts.append("fileIdentifier_fingerprint=" + f.key)
-    if candidate.timestamp:
-        parts.append("timestamp_source=" + candidate.timestamp.semantics)
-        if candidate.timestamp.semantics == "download_started":
-            parts.append("다운로드 완료 시각 미확인; download start timestamp fallback")
-    if candidate.action == "prompt_interaction" and not any(f.fact_type in {"assistant_response", "generation_metadata", "server_inference"} for f in candidate.facts):
-        parts.append("전송 여부 미확인")
-    if candidate.limitation:
-        parts.append("limitation=" + safe_nonconversation_text(candidate.limitation))
-    return "; ".join(dict.fromkeys(parts))
+    segments: set[str] = set()
+    usn_groups: dict[tuple[str, ...], list[ObservedFact]] = defaultdict(list)
+    for fact in candidate.facts:
+        key = usn_artifact_detail_key(fact)
+        if key is None:
+            segments.add(fact_artifact_detail(fact))
+        else:
+            usn_groups[key].append(fact)
+    # Aggregate only the CSV display; all raw Facts/locators remain available
+    # to detection, verdicts and debugging in the unchanged Candidate.
+    details = list(segments)
+    for facts in usn_groups.values():
+        # Lexically first rendered locator, matching the existing output sort.
+        detail = min(fact_artifact_detail(fact) for fact in facts)
+        if len(facts) > 1:
+            detail += f", 동일 근거={len(facts)}건"
+        details.append(detail)
+    details.sort()
+    if candidate.timestamp and candidate.timestamp.semantics == "download_started" and details:
+        for index, detail in enumerate(details):
+            if detail.startswith("[Download Record] "):
+                details[index] = detail + ", 시각 출처=다운로드 시작"
+                break
+    return " | ".join(details)
 
 
 def timeline_rows(ctx: AnalysisContext) -> list[list[str]]:
@@ -2734,7 +3128,7 @@ def timeline_rows(ctx: AnalysisContext) -> list[list[str]]:
 
 
 def conversation_rows(ctx: AnalysisContext) -> list[list[str]]:
-    rows: list[tuple[tuple[Any, ...], list[str]]] = []
+    rows: list[tuple[tuple[Any, ...], str, list[str]]] = []
     seen: set[tuple[Any, ...]] = set()
     for message in ctx.messages:
         key = (
@@ -2749,10 +3143,16 @@ def conversation_rows(ctx: AnalysisContext) -> list[list[str]]:
             continue
         seen.add(key)
         timestamp = format_timestamp_kst(message.timestamp)
+        conversation_uuid = message.conversation_id or (
+            basename(message.artifact_path) if message.artifact_path.lower().endswith(".conversation.json") else ""
+        )
+        conversation_order_key = conversation_uuid
+        if conversation_uuid.endswith(".conversation.json"):
+            conversation_uuid = conversation_uuid.removesuffix(".conversation.json")
         row = [
             SERVICE_NAME,
             timestamp,
-            message.conversation_id or (basename(message.artifact_path) if message.artifact_path.lower().endswith(".conversation.json") else ""),
+            conversation_uuid,
             message.title,
             message.message_id,
             message.parent_message_id,
@@ -2770,11 +3170,11 @@ def conversation_rows(ctx: AnalysisContext) -> list[list[str]]:
             message.role,
             message.message_id,
         )
-        rows.append((sort_key, row))
+        rows.append((sort_key, conversation_order_key, row))
     result = []
     orders: dict[tuple[str, str], int] = defaultdict(int)
-    for _, row in sorted(rows, key=lambda item: item[0]):
-        group = (row[9], row[2])
+    for _, conversation_order_key, row in sorted(rows, key=lambda item: item[0]):
+        group = (row[9], conversation_order_key)
         orders[group] += 1
         row[6] = str(orders[group])
         result.append([csv_value(cell) for cell in row])
@@ -2807,7 +3207,7 @@ def write_outputs(ctx: AnalysisContext, output: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def is_image_path(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in {".dd", ".raw", ".img", ".e01", ".ex01", ".s01", ".l01"}
+    return path.is_file() and path.suffix.lower() in {".dd", ".raw", ".img", ".e01", ".ex01", ".s01", ".l01", ".001"}
 
 
 def research_evidence_root(path: Path) -> Path | None:
@@ -2825,6 +3225,14 @@ def validate_paths(input_path: Path, output_path: Path) -> str:
             return "출력 경로는 보존 Evidence 내부일 수 없습니다."
     if not input_path.exists():
         return "입력 경로가 존재하지 않습니다."
+    segment_number = split_raw_segment_number(input_path) if input_path.is_file() else None
+    if segment_number is not None and segment_number != 1:
+        return "분할 RAW/DD 이미지는 첫 segment인 .001을 지정하십시오."
+    if input_path.is_file() and input_path.suffix == ".001":
+        try:
+            discover_split_raw_segments(input_path)
+        except SplitRawImageError as exc:
+            return str(exc)
     if input_path.is_dir() and is_inside(output_path, input_path):
         return "출력 경로는 Evidence directory 내부일 수 없습니다."
     research_root = research_evidence_root(input_path)
@@ -2926,8 +3334,20 @@ def analyze(input_path: Path, before_path: Path | None = None,
     return ctx
 
 
-def image_stat(path: Path) -> tuple[int, int] | None:
+ImageStatSnapshot = tuple[tuple[str, int, int], ...]
+
+
+def image_stat(path: Path) -> ImageStatSnapshot | None:
     if not is_image_path(path):
+        return None
+    try:
+        paths = discover_split_raw_segments(path) if path.suffix == ".001" else [path]
+        return tuple(
+            (str(segment.resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+            for segment in paths
+            for stat in (segment.stat(),)
+        )
+    except (OSError, SplitRawImageError):
         return None
 
 
@@ -2969,7 +3389,7 @@ def _read_and_validate_csv(path: Path, header: Sequence[str], expected: Sequence
 
 
 def validate_analysis(ctx: AnalysisContext, input_path: Path, output_path: Path,
-                      before_image_stat: tuple[int, int] | None = None) -> dict[str, Any]:
+                      before_image_stat: ImageStatSnapshot | None = None) -> dict[str, Any]:
     """Self-contained production validation; never relies on project fixtures."""
     timeline, timeline_hash = _read_and_validate_csv(
         output_path / "timeline.csv", TIMELINE_HEADER, timeline_rows(ctx))
@@ -3038,18 +3458,13 @@ def validate_analysis(ctx: AnalysisContext, input_path: Path, output_path: Path,
         "protected_rules": protected_rows,
         "image_stat_unchanged": before_image_stat is None or image_stat(input_path) == before_image_stat,
     }
-    try:
-        st = path.stat()
-        return int(st.st_size), int(st.st_mtime_ns)
-    except OSError:
-        return None
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Windows LM Studio forensic artifact parser (read-only evidence access)",
     )
-    parser.add_argument("input", nargs="?", type=Path, help=".lmstudio, User Profile, Windows root, DD, or E01")
+    parser.add_argument("input", nargs="?", type=Path, help=".lmstudio, User Profile, Windows root, DD/RAW/IMG (including split .001), or E01")
     parser.add_argument("--output", type=Path, help="Directory for timeline.csv and recovered_conversation.csv")
     parser.add_argument("--before", type=Path, help="Explicit earlier snapshot of the same subject; no folder-name inference")
     parser.add_argument("--validate", action="store_true", help="Analyze twice and validate CSV, security, integrity, and determinism")
@@ -3119,6 +3534,106 @@ def main(argv: Sequence[str] | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 parser = sys.modules[__name__]
+
+
+class SplitRawImageTests(unittest.TestCase):
+    def _segments(self, contents: Sequence[bytes] = (b"ABCDE", b"FGHIJ", b"KLMNO")) -> tuple[tempfile.TemporaryDirectory[str], list[Path]]:
+        temporary = tempfile.TemporaryDirectory(prefix="SYNTHETIC_SPLIT_RAW_")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        paths = []
+        for index, content in enumerate(contents, 1):
+            path = root / f"evidence.{index:03d}"
+            path.write_bytes(content)
+            paths.append(path)
+        return temporary, paths
+
+    def test_discovery_orders_numeric_segments_and_excludes_sidecar(self) -> None:
+        _, paths = self._segments()
+        sidecar = paths[0].with_name(paths[0].name + ".txt")
+        sidecar.write_text("not a segment", encoding="utf-8")
+        self.assertEqual(paths, parser.discover_split_raw_segments(paths[0]))
+        self.assertNotIn(sidecar, parser.discover_split_raw_segments(paths[0]))
+        self.assertTrue(parser.is_image_path(paths[0]))
+
+    def test_discovery_rejects_gap_with_expected_segment(self) -> None:
+        _, paths = self._segments((b"A", b"B", b"C"))
+        paths[1].unlink()
+        with self.assertRaisesRegex(parser.SplitRawImageError, r"\.002"):
+            parser.discover_split_raw_segments(paths[0])
+
+    def test_direct_nonfirst_segment_input_is_rejected(self) -> None:
+        temporary, paths = self._segments()
+        error = parser.validate_paths(paths[1], Path(temporary.name) / "output")
+        self.assertIn(".001", error)
+        self.assertFalse(parser.is_image_path(paths[1]))
+
+    def test_segmented_stream_reads_and_seeks_across_boundaries(self) -> None:
+        _, paths = self._segments()
+        with parser.SegmentedRawStream(paths) as stream:
+            self.assertTrue(stream.readable())
+            self.assertTrue(stream.seekable())
+            self.assertFalse(stream.writable())
+            self.assertEqual(b"ABC", stream.read(3))
+            self.assertEqual(b"DEFG", stream.read(4))
+            self.assertEqual(7, stream.tell())
+            self.assertEqual(4, stream.seek(-3, os.SEEK_CUR))
+            self.assertEqual(b"EFGH", stream.read(4))
+            self.assertEqual(12, stream.seek(-3, os.SEEK_END))
+            self.assertEqual(b"MNO", stream.read())
+            self.assertEqual(3, stream.seek(3, os.SEEK_SET))
+            buffer = bytearray(5)
+            self.assertEqual(5, stream.readinto(buffer))
+            self.assertEqual(b"DEFGH", bytes(buffer))
+
+    def test_read_only_stream_preserves_all_segment_content_size_and_mtime(self) -> None:
+        _, paths = self._segments()
+        before_content = [path.read_bytes() for path in paths]
+        before_stat = parser.image_stat(paths[0])
+        stream, keepalive = parser.open_image_stream(paths[0])
+        self.assertEqual(b"EFG", (stream.seek(4), stream.read(3))[1])
+        for handle in reversed(keepalive):
+            handle.close()
+        self.assertTrue(stream.closed)
+        self.assertEqual(before_content, [path.read_bytes() for path in paths])
+        self.assertEqual(before_stat, parser.image_stat(paths[0]))
+        self.assertEqual(3, len(before_stat or ()))
+
+    def test_image_stat_detects_change_in_nonfirst_segment(self) -> None:
+        _, paths = self._segments()
+        before = parser.image_stat(paths[0])
+        stat = paths[1].stat()
+        os.utime(paths[1], ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        self.assertNotEqual(before, parser.image_stat(paths[0]))
+
+    def test_segment_open_failure_has_split_raw_error(self) -> None:
+        _, paths = self._segments()
+        with patch.object(parser, "SegmentedRawStream", side_effect=OSError("synthetic")):
+            with self.assertRaisesRegex(parser.SplitRawImageError, "segment.*열지 못했습니다"):
+                parser.open_image_stream(paths[0])
+
+    def test_single_raw_image_open_path_is_unchanged(self) -> None:
+        temporary, _ = self._segments(())
+        raw = Path(temporary.name) / "single.dd"
+        raw.write_bytes(b"SINGLE")
+        stream, keepalive = parser.open_image_stream(raw)
+        try:
+            self.assertEqual(b"SINGLE", stream.read())
+            self.assertEqual([stream], keepalive)
+        finally:
+            stream.close()
+
+    def test_ewf_still_uses_find_files_and_ewf(self) -> None:
+        entry = Path("synthetic.E01")
+        opened = io.BytesIO(b"EWF")
+        ewf = SimpleNamespace(open=lambda: opened)
+        with patch("dissect.evidence.ewf.find_files", return_value=["synthetic.E01", "synthetic.E02"]) as find_files_mock, \
+             patch("dissect.evidence.ewf.EWF", return_value=ewf) as ewf_mock:
+            stream, keepalive = parser.open_image_stream(entry)
+        find_files_mock.assert_called_once_with(entry)
+        ewf_mock.assert_called_once_with(["synthetic.E01", "synthetic.E02"])
+        self.assertIs(opened, stream)
+        self.assertEqual([ewf], keepalive)
 
 
 class RuleContractTests(unittest.TestCase):
@@ -3458,7 +3973,7 @@ class Fix01MetadataTests(FixtureCase):
     def test_absent_title_ids_parents_not_fabricated(self):
         ctx = self.analyze_files({"conversations/1789707934740.conversation.json": conversation(message(id="wrong", identifier="wrong"), message("assistant"), name=None, id="wrong-conv")})
         for row in parser.conversation_rows(ctx):
-            self.assertEqual(["1789707934740.conversation.json", "-", "-", "-"], row[2:6])
+            self.assertEqual(["1789707934740", "-", "-", "-"], row[2:6])
         self.assertEqual("", self.candidates(ctx, "prompt_interaction")[0].conversation_ref)
 
     def test_config_actual_identifier_preserved_and_scoped(self):
@@ -3573,6 +4088,7 @@ class Fix01DecisionTests(FixtureCase):
         candidate = self.candidates(ctx, "model_download")[0]
         self.assertNotEqual("confirmed", candidate.decision_status)
         self.assertEqual({"filesystem"}, candidate.evidence_families)
+        self.assertEqual("다운로드 완료 기록_TEST.gguf", parser.candidate_behavior_details(ctx, candidate))
 
     def test_unrelated_hub_metadata_is_not_authentication(self):
         ctx = self.analyze_files({"local-identity.json": {"type": "loggedInUser"}, "lmstudio-hub.json": {"version": 1, "metadata": "TEST"}})
@@ -3689,7 +4205,7 @@ class EventTimestampRestoreTests(FixtureCase):
         ctx, candidate = self.download(1789498316973)
         self.assertEqual("2026-09-16 03:51:56.973000 KST", parser.format_timestamp_kst(candidate.timestamp))
         row = self.candidates(ctx, "model_download")[0]
-        self.assertEqual("2026-09-16 03:51:56.973000 KST", next(r[1] for r in parser.timeline_rows(ctx) if "Rule=" + row.rule_id in r[6]))
+        self.assertEqual("2026-09-16 03:51:56.973000 KST", next(r[1] for r in parser.timeline_rows(ctx) if r[2] == row.korean_action))
         ctx = self.analyze_files({"http-server.json": {}, "server-logs/runtime.log": "TEST"})
         self.assertRegex(parser.format_timestamp_kst(self.candidates(ctx, "application_launch")[0].timestamp), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST$")
 
@@ -3770,17 +4286,20 @@ class Fix02Tests(FixtureCase):
     def test_protected_rule_function_bodies_unchanged_from_fix02(self):
         import ast
         expected = {
-            'format_timestamp_kst': '881835faf70565cf45a4f25de1e6fa4528a41ccad16274b6138f55bc3740cd63',  # team format .ffffff KST
-            'parse_model_data': 'c97d1a85104373d46e831ce235dfb43f9dde163334baeb687d9979a87d7153ce',
-            'download_node_summary': '9435f3a4866e7fe86273f1a0983c49758d7ae44cb89692f9b3da5c8de3e96011',
-            'parse_downloads': '450a2f51245ad78bba28fcedbbd4fb07a9b5a771f6c659d8d75d0be140aae071',
-            'source_identity': '63a0493e20728b0c7a269e75bab98a51db751f272b9322c1419acf7d5848eb43',
-            'evaluate_decision': '188ebbd7f4f9b78b1b4a42cda3bc21698939dda42da68ca88847bcd77b001ffb',
-            'detect_application': 'd320aceeb5dfcd714ebcd65cef7f90f82e7df77f5a320b23af83b0346e921c82',
-            'history_download_patterns': 'd751f6af24a0c373075ea1d408aa40441ac09727e9c8a451ecee8b39c64fd879',
-            'detect_models': 'fb3718502b1c88ded68402cadd71c34ef65a0fee4cb45a81d9db1fff5f184476',
+            'format_timestamp_kst': 'f4b38cba11fc537c47f1b5f08324639f0a0a414fff62433963b61702052b76d0',  # team format .ffffff KST
+            'parse_model_data': 'cd578a857f57163f4f62453d1560cd6e0a8668934366acc5098f3b4ba5ae74c0',
+            'download_node_summary': '2eb48b132b52133c26633dacc0b2fa4a4ae7e6450eefb123a544643b7aa7c659',
+            'parse_downloads': '02836cb1c2254cf9ee9093c6cf9a0165540d35dfee6076af73d63def306e8b9c',
+            'source_identity': 'e30a16ae7bef5851f4bd4539d5c44bb0c17465c9e8fa3301a42ef33b1e4afd12',
+            'evaluate_decision': '9025f7470d6642f7f54fc0a35448e8d467b9f4070de066e76b2f719d2f43005b',
+            'detect_application': 'b5ddefe72f429d3a06f64ea0d24492b9c79f5ede63563a2e7be103b205aecdd7',
+            'history_download_patterns': 'f72d9f994788a0e92ae86ad1074fce7a361acb98fd514a2ac31ee58620fe08d5',
+            'detect_models': 'fbe6b8b7d7a63f115145b29dfc6a2fa9abf34d59807343bb991a5fc88fb8073c',
         }
-        functions = {n.name: hashlib.sha256(ast.dump(n, include_attributes=False).encode()).hexdigest()
+        functions = {n.name: hashlib.sha256((
+            ast.dump(n, include_attributes=False, show_empty=True)
+            if sys.version_info >= (3, 13) else ast.dump(n, include_attributes=False)
+        ).encode()).hexdigest()
                      for n in ast.parse(Path(parser.__file__).read_text(encoding='utf-8')).body if isinstance(n, ast.FunctionDef)}
         for name, digest in expected.items():
             self.assertEqual(digest, functions[name], name)
@@ -3911,6 +4430,283 @@ class Fix02Tests(FixtureCase):
         self.assertEqual([], self.candidates(ctx, "conversation_export"))
 
 
+class ReadableTimelineDetailsTests(FixtureCase):
+    def details(self, files, action):
+        ctx = self.analyze_files(files)
+        candidate = self.candidates(ctx, action)[0]
+        return ctx, candidate, parser.candidate_behavior_details(ctx, candidate), parser.candidate_artifact_details(candidate)
+
+    def test_model_change_and_conversation_delete_have_explanatory_prefixes(self):
+        _, _, behavior, _ = self.details(
+            {"model-data.json": {"json": [["google/gemma-3-1b", {"lastLoadedTimestamp": 1789708040375}]]}},
+            "model_change",
+        )
+        self.assertEqual("모델 변경 기록_google/gemma-3-1b", behavior)
+        _, _, behavior, _ = self.details(RULE_FIXTURES["conversation_delete"][0], "conversation_delete")
+        self.assertEqual("대화 파일 삭제 흔적_TEST.conversation.json", behavior)
+
+    def test_prompt_sent_and_unsent_wording_uses_first_line(self):
+        sent = self.analyze_files({CONV: conversation(message(text="sent first\nfull body"), message("assistant"))})
+        unsent = self.analyze_files({CONV: conversation(message(text="draft first\nfull body"))})
+        self.assertEqual("사용자 메시지 전송_sent first", parser.candidate_behavior_details(sent, self.candidates(sent, "prompt_interaction")[0]))
+        self.assertEqual("프롬프트 작성 흔적(전송 미확인)_draft first", parser.candidate_behavior_details(unsent, self.candidates(unsent, "prompt_interaction")[0]))
+
+    def test_linked_and_metadata_only_attachments_are_distinguished(self):
+        for media, suffix, mime, action in (("image", "png", "image/png", "image_upload"),
+                                            ("document", "pdf", "application/pdf", "document_upload")):
+            with self.subTest(media=media):
+                metadata = {"originalName": f"TEST.{suffix}", "fileIdentifier": "TEST-FILE", "type": mime, "sizeBytes": 4}
+                linked_message = message()
+                linked_message["versions"][0]["content"].append({"type": "file", "fileIdentifier": "TEST-FILE", "fileType": mime})
+                linked = self.analyze_files({f"user-files/TEST.{suffix}.metadata.json": metadata,
+                                             CONV: conversation(linked_message, conversationId="TEST-CONV")})
+                self.assertEqual(f"전송 메시지 첨부_TEST.{suffix}",
+                                 parser.candidate_behavior_details(linked, self.candidates(linked, action)[0]))
+                metadata_only = self.analyze_files({f"user-files/TEST.{suffix}.metadata.json": metadata})
+                expected = f"{'이미지' if media == 'image' else '문서'} 업로드 준비 흔적(전송 불확인)_TEST.{suffix}"
+                self.assertEqual(expected, parser.candidate_behavior_details(metadata_only, self.candidates(metadata_only, action)[0]))
+
+    def test_completed_and_incomplete_download_wording(self):
+        completed = self.analyze_files({"download-jobs-info.json": JOB})
+        self.assertEqual("다운로드 완료 기록_TEST.gguf",
+                         parser.candidate_behavior_details(completed, self.candidates(completed, "model_download")[0]))
+        incomplete_job = {"jobs": [{"startedTimestamp": 1789708040375, "jobState": {"type": "downloading"},
+                                    "tasks": [{"download": {"filename": "TEST.gguf", "targetPath": "TEST.gguf", "status": "downloading"}}]}]}
+        incomplete = self.analyze_files({"download-jobs-info.json": incomplete_job})
+        self.assertEqual("다운로드 시도 흔적(완료 미확인)_TEST.gguf",
+                         parser.candidate_behavior_details(incomplete, self.candidates(incomplete, "model_download")[0]))
+
+    def test_export_completion_wording_requires_creation_history(self):
+        incomplete = self.analyze_files({"Documents/export.md": EXPORT})
+        complete = self.analyze_files({"Documents/export.md": EXPORT,
+                                       "history.csv": history(("$ROOT\\Documents\\export.md", "File_Created"))})
+        self.assertEqual("Export 파일 흔적(완료 미확인)_export.md",
+                         parser.candidate_behavior_details(incomplete, self.candidates(incomplete, "conversation_export")[0]))
+        self.assertEqual("Export 완료 기록_export.md",
+                         parser.candidate_behavior_details(complete, self.candidates(complete, "conversation_export")[0]))
+
+    def test_account_switch_arrow_uses_only_observed_safe_identifiers(self):
+        before = self.analyze_files({"local-identity.json": {"type": "loggedInUser"},
+                                     "user-profile.json": {"profile": {"id": "ACCOUNT-A"}}})
+        after = self.analyze_files({"local-identity.json": {"type": "loggedInUser"},
+                                    "user-profile.json": {"profile": {"id": "ACCOUNT-B"}},
+                                    "history.csv": history(("$ROOT\\user-profile.json", "Data_Overwrite"))})
+        parser.detect_snapshot_transitions(after, before)
+        behavior = parser.candidate_behavior_details(after, self.candidates(after, "account_switch")[0])
+        self.assertRegex(behavior, r"^계정 전환 기록_sha256:[0-9a-f]{12} → sha256:[0-9a-f]{12}$")
+        self.assertNotIn("ACCOUNT-A", behavior)
+        self.assertNotIn("ACCOUNT-B", behavior)
+
+    def test_artifact_details_are_named_user_facing_segments_without_internal_diagnostics(self):
+        ctx = self.analyze_files({"download-jobs-info.json": JOB, "models/TEST.gguf": b"GGUF",
+                                  "models/TEST.gguf:Zone.Identifier": "[ZoneTransfer]\nZoneId=3\nHostUrl=https://example.org/TEST.gguf"})
+        details = parser.candidate_artifact_details(self.candidates(ctx, "model_download")[0])
+        segments = details.split(" | ")
+        self.assertTrue(all(re.fullmatch(r"\[[^\]]+\] .+", segment) for segment in segments))
+        self.assertIn("[Download Record]", details)
+        self.assertIn("[GGUF]", details)
+        self.assertIn("[Zone.Identifier]", details)
+        self.assertIn("시각 출처=다운로드 시작", details)
+        for forbidden in ("Rule=", "Evidence Family=", "Direct Evidence=", "Facts=", "confidence=",
+                          "DIRECT", "SUPPORTING", "timestamp_source=", "download_started", "history_delete"):
+            self.assertNotIn(forbidden, details)
+
+        create = self.analyze_files(RULE_FIXTURES["conversation_create"][0])
+        self.assertIn("[Conversation Config]", parser.candidate_artifact_details(self.candidates(create, "conversation_create")[0]))
+
+    def test_multiple_artifacts_are_deterministic_and_duplicate_descriptions_are_removed(self):
+        ctx = self.analyze_files({CONV: conversation(message(), message("assistant"), conversationId="TEST-CONV"),
+                                  LOG: "2026-09-20T00:00:00Z inference completed conversationId=TEST-CONV"})
+        candidate = self.candidates(ctx, "prompt_interaction")[0]
+        candidate.facts.append(candidate.facts[0])
+        first = parser.candidate_artifact_details(candidate)
+        second = parser.candidate_artifact_details(candidate)
+        segments = first.split(" | ")
+        self.assertEqual(first, second)
+        self.assertGreater(len(segments), 1)
+        self.assertEqual(len(segments), len(set(segments)))
+
+    def test_formatting_does_not_mutate_candidate_decision_contract(self):
+        ctx = self.analyze_files({CONV: conversation(message(), message("assistant"), conversationId="TEST-CONV"),
+                                  LOG: "2026-09-20T00:00:00Z inference completed conversationId=TEST-CONV"})
+        candidate = self.candidates(ctx, "prompt_interaction")[0]
+        before = (candidate.action, candidate.decision_status, candidate.timestamp, tuple(candidate.facts),
+                  frozenset(candidate.evidence_families), candidate.direct_evidence, candidate.conversation_ref)
+        parser.candidate_behavior_details(ctx, candidate)
+        parser.candidate_artifact_details(candidate)
+        after = (candidate.action, candidate.decision_status, candidate.timestamp, tuple(candidate.facts),
+                 frozenset(candidate.evidence_families), candidate.direct_evidence, candidate.conversation_ref)
+        self.assertEqual(before, after)
+
+    def test_sensitive_values_do_not_reappear_in_readable_details(self):
+        secret = "READABLE_DETAILS_PRIVATE_SECRET"
+        ctx = self.analyze_files({"local-identity.json": {"type": "loggedInUser"},
+                                  "user-profile.json": {"profile": {"email": secret + "@example.test"}},
+                                  "lmstudio-hub.json": {"key": {"accessToken": secret}}})
+        candidate = self.candidates(ctx, "login")[0]
+        emitted = parser.candidate_behavior_details(ctx, candidate) + parser.candidate_artifact_details(candidate)
+        self.assertNotIn(secret, emitted)
+        self.assertIn("sha256:", emitted)
+
+
+class UsnArtifactDetailsTests(FixtureCase):
+    target = r"volume0:\Users\llmtest\.lmstudio\conversations\1790915225165.conversation.json"
+    journal = r"volume0:\$Extend\$UsnJrnl:$J"
+
+    def usn_fact(self, offset, fact_type="history_modify", target=None, source=None):
+        return parser.ObservedFact(
+            fact_type, "filesystem",
+            parser.Provenance("SYNTHETIC_USN.dd", source or self.journal, "", f"offset 0x{offset:x}"),
+            "DATA_OVERWRITE|CLOSE", key="42#1",
+            timestamp=parser.iso_from_datetime("2026-10-02T00:00:00Z", "usn_event"),
+            target_path=self.target if target is None else target,
+        )
+
+    def edit_context(self, count=663):
+        ctx = parser.AnalysisContext(Path("SYNTHETIC_USN.dd"), source_image="SYNTHETIC_USN.dd")
+        content = json.dumps(conversation(message(text="first line\nfull edited body", edited=True))).encode("utf-8")
+        ctx.add_artifact(parser.ArtifactRecord(
+            "SYNTHETIC_CONVERSATION", self.target,
+            parser.Provenance(ctx.source_image, self.target), "ntfs_file", content=content,
+        ))
+        parser.parse_json_artifacts(ctx)
+        summaries = parser.parse_conversations(ctx)
+        for index in range(count):
+            ctx.add_fact(self.usn_fact(0x100 + index * 0x80))
+        parser.detect_conversations(ctx, summaries, {}, [])
+        return ctx, self.candidates(ctx, "message_edit")[0]
+
+    @staticmethod
+    def legacy_details(candidate):
+        # Freeze the pre-aggregation serializer to compare the other columns.
+        details = sorted({parser.fact_artifact_detail(fact) for fact in candidate.facts})
+        if candidate.timestamp and candidate.timestamp.semantics == "download_started" and details:
+            for index, detail in enumerate(details):
+                if detail.startswith("[Download Record] "):
+                    details[index] = detail + ", 시각 출처=다운로드 시작"
+                    break
+        return " | ".join(details)
+
+    def test_663_usn_modifications_keep_all_facts_and_one_counted_group(self):
+        ctx, candidate = self.edit_context()
+        before = copy.deepcopy(ctx)
+        facts_list = candidate.facts
+        self.assertEqual(664, len(self.legacy_details(candidate).split(" | ")))
+        details = parser.candidate_artifact_details(candidate)
+        segments = details.split(" | ")
+        self.assertEqual(2, len(segments))
+        self.assertIn("[$UsnJrnl] 대상=1790915225165.conversation.json, 이벤트=수정, 위치=offset 0x100, 동일 근거=663건", segments)
+        self.assertIn("[Conversation]", details)
+        self.assertIn("JSON 위치=/messages/0/versions/0", details)
+        self.assertNotIn("\r", details)
+        self.assertNotIn("\n", details)
+        self.assertIs(facts_list, candidate.facts)
+        self.assertEqual(664, len(candidate.facts))
+        self.assertEqual(663, sum(f.fact_type == "history_modify" for f in candidate.facts))
+        self.assertEqual(before, ctx)
+
+    def test_other_targets_events_and_fact_types_stay_separate(self):
+        _, candidate = self.edit_context(2)
+        candidate.facts.extend([
+            self.usn_fact(0x200, target=self.target.replace("1790915225165", "OTHER")),
+            self.usn_fact(0x280, "history_create"),
+            self.usn_fact(0x300, "history_observed"),
+            self.usn_fact(0x380, "listing_observed"),
+        ])
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(6, len(details.split(" | ")))
+        self.assertEqual(1, details.count("동일 근거="))
+        for segment in ("대상=OTHER.conversation.json, 이벤트=수정", "이벤트=생성", "이벤트=관찰", "상태=파일 목록 관찰"):
+            self.assertIn(segment, details)
+
+    def test_same_basename_in_other_profile_or_journal_stays_separate(self):
+        _, candidate = self.edit_context(2)
+        for offset in (0x100, 0x180):
+            fact = self.usn_fact(offset)
+            candidate.facts.extend([
+                replace(fact, target_path=self.target.replace("llmtest", "other-user")),
+                replace(fact, provenance=replace(fact.provenance, original_artifact_path=self.journal.replace("volume0", "volume1"))),
+                replace(fact, provenance=replace(fact.provenance, source_image="OTHER.dd")),
+            ])
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(5, len(details.split(" | ")))
+        self.assertEqual(4, details.count("동일 근거=2건"))
+
+    def test_mft_conversation_and_download_locators_are_not_aggregated(self):
+        _, candidate = self.edit_context(2)
+        edit_fact = candidate.facts[0]
+        candidate.facts.append(replace(edit_fact, provenance=replace(edit_fact.provenance, evidence_location="/messages/1/versions/0")))
+        for index in (10, 11):
+            candidate.facts.append(parser.ObservedFact(
+                "history_modify", "filesystem", parser.Provenance("SYNTHETIC_USN.dd", r"volume0:\$MFT", "", f"MFT record {index}"),
+                target_path=self.target,
+            ))
+            candidate.facts.append(parser.ObservedFact(
+                "download_completed_record", "model_state", parser.Provenance("SYNTHETIC_USN.dd", "download-jobs-info.json", "", f"/jobs/{index}"),
+                "TEST.gguf",
+            ))
+        details = parser.candidate_artifact_details(candidate)
+        for label in ("[Conversation]", "[$MFT]", "[Download Record]"):
+            self.assertEqual(2, details.count(label))
+        self.assertEqual(7, len(details.split(" | ")))
+        self.assertEqual(1, details.count("동일 근거="))
+
+    def test_representative_is_deterministic_even_when_fact_order_changes(self):
+        _, candidate = self.edit_context()
+        candidate.facts.append(self.usn_fact(0x80))
+        expected = parser.candidate_artifact_details(candidate)
+        self.assertEqual(expected, parser.candidate_artifact_details(candidate))
+        self.assertEqual(expected, parser.candidate_artifact_details(replace(candidate, facts=list(reversed(candidate.facts)))))
+        self.assertEqual(expected, parser.candidate_artifact_details(replace(candidate, facts=candidate.facts[200:] + candidate.facts[:200])))
+        self.assertIn("위치=offset 0x100, 동일 근거=664건", expected)
+
+    def test_single_usn_and_missing_target_keep_legacy_display(self):
+        _, candidate = self.edit_context(1)
+        self.assertEqual(self.legacy_details(candidate), parser.candidate_artifact_details(candidate))
+        candidate.facts.extend([self.usn_fact(0x180, target=""), self.usn_fact(0x200, target="")])
+        self.assertEqual(self.legacy_details(candidate), parser.candidate_artifact_details(candidate))
+
+    def test_edit_csv_only_changes_artifact_details_and_recovery_bytes_match(self):
+        ctx, _ = self.edit_context()
+        before = copy.deepcopy(ctx)
+        with tempfile.TemporaryDirectory(prefix="SYNTHETIC_USN_CSV_") as temporary:
+            root = Path(temporary)
+            with patch.object(parser, "candidate_artifact_details", side_effect=self.legacy_details):
+                old_rows = parser.timeline_rows(ctx)
+                parser.write_csv(root / "old_timeline.csv", parser.TIMELINE_HEADER, old_rows)
+                parser.write_csv(root / "old_recovered.csv", parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+            new_rows = parser.timeline_rows(ctx)
+            parser.write_csv(root / "new_timeline.csv", parser.TIMELINE_HEADER, new_rows)
+            parser.write_csv(root / "new_recovered.csv", parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+            parser.write_csv(root / "repeat_timeline.csv", parser.TIMELINE_HEADER, parser.timeline_rows(ctx))
+            self.assertEqual([row[:6] for row in old_rows], [row[:6] for row in new_rows])
+            self.assertEqual(1, sum(a[6] != b[6] for a, b in zip(old_rows, new_rows)))
+            self.assertEqual((root / "old_recovered.csv").read_bytes(), (root / "new_recovered.csv").read_bytes())
+            raw = (root / "new_timeline.csv").read_bytes()
+            self.assertEqual(raw, (root / "repeat_timeline.csv").read_bytes())
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(len(new_rows) + 1, raw.count(b"\r\n"))
+            self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+            emitted = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+            self.assertEqual(parser.TIMELINE_HEADER, emitted[0])
+            self.assertEqual(new_rows, emitted[1:])
+            self.assertTrue(all(len(row) == 7 and all(row) for row in emitted))
+        self.assertEqual(before, ctx)
+
+    def test_all_21_rule_fixtures_keep_other_timeline_columns_and_recovery(self):
+        for action, (positive, negative, _) in RULE_FIXTURES.items():
+            for files in (positive, negative):
+                with self.subTest(action=action, files=files):
+                    ctx = self.analyze_files(files)
+                    before = copy.deepcopy(ctx)
+                    with patch.object(parser, "candidate_artifact_details", side_effect=self.legacy_details):
+                        old_rows = parser.timeline_rows(ctx)
+                        old_recovered = parser.conversation_rows(ctx)
+                    self.assertEqual([row[:6] for row in old_rows], [row[:6] for row in parser.timeline_rows(ctx)])
+                    self.assertEqual(old_recovered, parser.conversation_rows(ctx))
+                    self.assertEqual(before, ctx)
+
+
 class FinalContractTests(FixtureCase):
     def test_exact_headers_and_no_empty_cells(self):
         self.assertEqual(['Model', 'Timestamp', 'User_behavior', 'Behavior_details ', 'Verdict', 'Artifact_path', 'Artifact_details '], parser.TIMELINE_HEADER)
@@ -3971,7 +4767,7 @@ class FinalContractTests(FixtureCase):
 
     def test_explicit_model_log_preserves_actual_identifier(self):
         ctx = self.analyze_files({LOG: '2026-09-20T00:00:00Z model loaded: TEST/model'})
-        self.assertEqual('TEST/model', parser.candidate_behavior_details(ctx, self.candidates(ctx, 'model_change')[0]))
+        self.assertEqual('모델 변경 기록_TEST/model', parser.candidate_behavior_details(ctx, self.candidates(ctx, 'model_change')[0]))
 
     def test_nonconversation_secret_and_embedded_preview_redacted(self):
         for text, secret in [('secret=PRIVATE_VALUE', 'PRIVATE_VALUE'), ('preview=' + 'A' * 300, 'A' * 300), ('access_token=PRIVATE_TOKEN', 'PRIVATE_TOKEN')]:
@@ -3993,20 +4789,38 @@ class FinalContractTests(FixtureCase):
         for files in [{'user-profile.json': {'profile': None}}, {'llmster-pid.lock': b'1'}, {'model-data.json': {'json': [['TEST/model', {}]]}}]:
             self.assertFalse(any(c.decision_status == 'confirmed' for c in self.analyze_files(files).candidates))
 
-    def test_full_multiline_prompt_and_edit_details(self):
+    def test_timeline_uses_first_line_and_conversation_keeps_full_multiline_content(self):
         content = '=full prompt\n' + 'long ' * 150
         ctx = self.analyze_files({CONV: conversation(message(text=content, edited=True))})
-        for action in ('prompt_interaction', 'message_edit'):
-            candidate = self.candidates(ctx, action)[0]
-            self.assertEqual(content, parser.candidate_behavior_details(ctx, candidate))
-        self.assertTrue(all('Rule=' in row[6] for row in parser.timeline_rows(ctx)))
+        self.assertEqual("프롬프트 작성 흔적(전송 미확인)_=full prompt",
+                         parser.candidate_behavior_details(ctx, self.candidates(ctx, 'prompt_interaction')[0]))
+        self.assertEqual("사용자 메시지 수정 기록_=full prompt",
+                         parser.candidate_behavior_details(ctx, self.candidates(ctx, 'message_edit')[0]))
+        self.assertIn(content, [row[8].removeprefix("'") for row in parser.conversation_rows(ctx)])
+        self.assertTrue(all('Rule=' not in row[6] for row in parser.timeline_rows(ctx)))
 
-    def test_actual_filename_fallback_not_stem_or_message_id(self):
-        ctx = self.analyze_files({'conversations/1234567890123.conversation.json': conversation(message(), name=None)})
-        row = parser.conversation_rows(ctx)[0]
-        self.assertEqual('1234567890123.conversation.json', row[2])
-        self.assertEqual(['-', '-', '-'], row[3:6])
-        self.assertEqual('-', row[1])
+    def test_conversation_uuid_display_suffix_normalization_only(self):
+        cases = (
+            ('1789494458762.conversation.json', '1789494458762', '1789494458762.conversation.json'),
+            ('', '1789494458762', ''),
+            ('conv-real-id-123', 'conv-real-id-123', 'conv-real-id-123'),
+        )
+        for conversation_id, expected, expected_internal in cases:
+            with self.subTest(conversation_id=conversation_id or 'filename fallback'):
+                fields = {'name': None}
+                if conversation_id:
+                    fields['conversationId'] = conversation_id
+                ctx = self.analyze_files({
+                    'conversations/1789494458762.conversation.json': conversation(message(), **fields),
+                })
+                rows = parser.conversation_rows(ctx)
+                self.assertEqual(1, len(rows))
+                row = rows[0]
+                self.assertEqual(expected, row[2])
+                self.assertEqual('-', row[1])
+                self.assertEqual(['-', '-', '-', '1', 'user', 'TEST text'], row[3:9])
+                self.assertTrue(row[9].endswith(r'conversations\1789494458762.conversation.json'))
+                self.assertEqual(expected_internal, ctx.messages[0].conversation_id)
 
     def test_explicit_id_beats_filename(self):
         ctx = self.analyze_files({CONV: conversation(message(), conversationId='actual-id')})
