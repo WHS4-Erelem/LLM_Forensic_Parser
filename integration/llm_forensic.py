@@ -148,22 +148,36 @@ def evidence_manager(path, quick=False):
     with open(segments[0], "rb") as fh:
         h.update(fh.read(64 * 1024 * 1024))
     quick_fp = h.hexdigest()
-    evidence_sha256, segment_hashes = EMPTY, []
-    if not quick:                                       # 한 번 읽으면서 세그먼트별 해시와 전체 해시를 같이 계산 (36GB 기준 수 분)
-        full = hashlib.sha256()
+    evidence_sha256, evidence_md5, evidence_sha1, segment_hashes = EMPTY, EMPTY, EMPTY, []
+    if not quick:                                       # 한 번 읽으면서 세그먼트별 SHA-256 과 전체 SHA-256·MD5·SHA-1 을 같이 계산 (36GB 기준 수 분)
+        full, full_md5, full_sha1 = hashlib.sha256(), hashlib.md5(), hashlib.sha1()
         for s in segments:
             seg = hashlib.sha256()
             with open(s, "rb") as fh:
                 for chunk in iter(lambda: fh.read(8 << 20), b""):
-                    seg.update(chunk); full.update(chunk)
+                    seg.update(chunk); full.update(chunk); full_md5.update(chunk); full_sha1.update(chunk)
             segment_hashes.append({"file": os.path.basename(s), "size_bytes": os.path.getsize(s), "sha256": seg.hexdigest()})
-        evidence_sha256 = full.hexdigest()
-    sidecars = {}
-    for f in os.listdir(os.path.dirname(path)):        # 동봉 해시 파일은 내용만 기록 (대조는 분석자 몫)
-        if f.lower().endswith((".sha256", ".md5", "_md5.txt", "_sha256.txt")):
-            with open(os.path.join(os.path.dirname(path), f), encoding="utf-8", errors="replace") as fh:
-                sidecars[f] = fh.read().strip()[:300]
+        evidence_sha256, evidence_md5, evidence_sha1 = full.hexdigest(), full_md5.hexdigest(), full_sha1.hexdigest()
+    sidecars, sidecar_hashes = {}, {}
+    stem = os.path.basename(path).rsplit(".", 1)[0].lower()
+    for f in os.listdir(os.path.dirname(path)):
+        fl = f.lower()
+        if fl.endswith((".sha256", ".md5", ".sha1", "_md5.txt", "_sha256.txt")) or (fl.endswith(".txt") and fl.startswith(stem)):
+            with open(os.path.join(os.path.dirname(path), f), encoding="utf-8-sig", errors="replace") as fh:
+                text = fh.read()
+            sidecars[f] = text.strip()[:300]
+            for algo, n in (("md5", 32), ("sha1", 40), ("sha256", 64)):
+                m = re.search(r"(?i)\b%s\b.{0,40}?\b([0-9a-f]{%d})\b" % (algo.replace("sha", "sha-?"), n), text)
+                if m:
+                    sidecar_hashes.setdefault(algo, m.group(1).lower())
+    verification = {}
+    if kind == "raw" and not quick:
+        for algo, mine in (("md5", evidence_md5), ("sha1", evidence_sha1), ("sha256", evidence_sha256)):
+            if algo in sidecar_hashes:
+                verification[algo] = "match" if sidecar_hashes[algo] == mine else "MISMATCH"
     return {"evidence_id": quick_fp[:16], "evidence_quick_fingerprint": quick_fp, "evidence_sha256": evidence_sha256,
+            "evidence_md5": evidence_md5, "evidence_sha1": evidence_sha1,
+            "sidecar_declared_hashes": sidecar_hashes, "sidecar_verification": verification,
             "segment_hashes": segment_hashes, "path": path, "kind": kind,
             "segments": [os.path.basename(s) for s in segments],
             "size_bytes": sum(os.path.getsize(s) for s in segments), "sidecar_hashes": sidecars,
@@ -529,26 +543,6 @@ def _safe(v):
     return "'" + s if s != EMPTY and s[:1] in ("=", "+", "-", "@") else s
 
 
-def _csv_fragments(value, limit=32766):
-    """Excel 한 셀 한계 안에서 가능한 줄바꿈·공백 위치로 나눈다. 원문 줄바꿈은 그대로 보존한다."""
-    parts = []
-    text = EMPTY if value is None or str(value).strip() == "" else str(value)
-    while len(text) > limit:
-        cut = max(text.rfind("\n", 0, limit + 1), text.rfind(" ", 0, limit + 1))
-        cut = cut + 1 if cut > 0 else limit
-        parts.append(text[:cut])
-        text = text[cut:]
-    return parts + [text]
-
-
-def _csv_rows(row):
-    """긴 셀만 다음 물리 행으로 잇고, 나머지 열은 각 행에 유지한다."""
-    fragments = [_csv_fragments(value) for value in row]
-    for i in range(max(map(len, fragments))):
-        yield [_safe(parts[i] if i < len(parts) else (parts[0] if len(parts) == 1 else EMPTY))
-               for parts in fragments]
-
-
 def write_merged(db, evidence_id, out_dir):
     """반환: [(경로, 행 수, {source_parser: 행 수})]."""
     written = []
@@ -565,9 +559,8 @@ def write_merged(db, evidence_id, out_dir):
             by_parser = Counter()
             parser_index = out_cols.index("source_parser")
             for r in rows:
-                for csv_row in _csv_rows(r):
-                    w.writerow(csv_row)
-                    by_parser[r[parser_index]] += 1
+                w.writerow([_safe(v) for v in r])
+                by_parser[r[parser_index]] += 1
         written.append((path, sum(by_parser.values()), dict(sorted(by_parser.items()))))
     return written
 
@@ -674,6 +667,10 @@ def main(argv=None):
     print("[Evidence] id=%s kind=%s segments=%d size=%.1fGB quick_fp=%s sha256=%s" % (
         ev["evidence_id"], ev["kind"], len(ev["segments"]), ev["size_bytes"] / 1e9,
         ev["evidence_quick_fingerprint"][:16] + "...", ev["evidence_sha256"]))
+    if ev.get("sidecar_verification"):
+        print("[Evidence] 취득 해시 대조: %s" % ", ".join("%s=%s" % kv for kv in sorted(ev["sidecar_verification"].items())))
+    elif ev.get("sidecar_declared_hashes") and ev["kind"] == "e01":
+        print("[Evidence] 동봉 해시 %s 는 매체 해시 — E01 컨테이너 해시와 직접 비교 불가 (기록만)" % ", ".join(sorted(ev["sidecar_declared_hashes"])))
 
     reg = load_registry(args.registry)
     only = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else None
@@ -813,8 +810,6 @@ def self_test():
     assert kst_to_utc("2026-09-15 13:20:41.807000 KST") == "2026-09-15T04:20:41.807000Z"
     assert kst_to_utc("-") is None and kst_to_utc("2026-09-15 13:20:41 KST") is None
     assert _safe("=1") == "'=1" and _safe("") == EMPTY and _safe("-") == EMPTY
-    split = list(_csv_rows(["x" * 32767, "keep"]))
-    assert len(split) == 2 and len(split[0][0]) == 32766 and split[1] == ["x", "keep"]
     assert _ewf_ext(1) == "E01" and _ewf_ext(99) == "E99" and _ewf_ext(100) == "EAA"
     assert len(code_hash(HERE)) == 16 and code_hash(HERE) == code_hash(HERE)
     # canonical header · provenance 열
@@ -838,6 +833,13 @@ def self_test():
         assert ev["evidence_sha256"] == hashlib.sha256(data).hexdigest() == ev["segment_hashes"][0]["sha256"]
         assert ev["evidence_quick_fingerprint"] == ev["evidence_sha256"] and ev["evidence_id"] == ev["evidence_sha256"][:16]
         assert evidence_manager(raw, quick=True)["evidence_sha256"] == EMPTY
+        assert ev["evidence_md5"] == hashlib.md5(data).hexdigest() and ev["evidence_sha1"] == hashlib.sha1(data).hexdigest()
+        with open(os.path.join(td, "x.txt"), "w", encoding="utf-8") as fh:
+            fh.write("Created By FTK Imager\n  [Computed Hashes]\n    MD5 Hash:    %s\n    SHA1 Hash:   %s\n" % (hashlib.md5(data).hexdigest(), "0" * 40))
+        ev2 = evidence_manager(raw)
+        assert ev2["sidecar_declared_hashes"] == {"md5": hashlib.md5(data).hexdigest(), "sha1": "0" * 40}, ev2["sidecar_declared_hashes"]
+        assert ev2["sidecar_verification"] == {"md5": "match", "sha1": "MISMATCH"}, ev2["sidecar_verification"]
+        os.remove(os.path.join(td, "x.txt"))
         # raw 분할 (image.001/.002): 세그먼트를 모두 모으고 전체 해시는 이어붙인 값, 결번은 거부
         a, b = os.urandom(700), os.urandom(300)
         for n, chunk in ((1, a), (2, b)):

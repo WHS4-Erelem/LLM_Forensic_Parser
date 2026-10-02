@@ -136,7 +136,7 @@
       "model": "lmstudio",
       "inputs": [".e01", ".ex01", ".s01", ".l01", ".dd", ".raw", ".img", ".001"],
       "_inputs_note": "lmstudio_parser.py 이미지 판별 목록 기준. 목록 밖 확장자는 이미지로 인식되지 않아 0건이 나온다",
-      "python": ".venv314/Scripts/python.exe",
+      "python": ".venv312/Scripts/python.exe",
       "cwd": "../LMstudio_parser",
       "args": [
         "lmstudio_parser.py",

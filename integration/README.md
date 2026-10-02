@@ -4,7 +4,7 @@
 SQLite 에 적재하고 병합 `timeline.csv` / `recovered_conversations.csv` 와 실행 요약 `integration_report.json` 을 만든다.
 
 ```
-powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 / .venv314 생성
+powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 생성
 python llm_forensic.py -i <이미지.E01|.dd> -o out              # 전체 실행
 python llm_forensic.py -i <이미지> -o out --only chatgpt_desktop,lmstudio
 python llm_forensic.py --self-test
@@ -89,4 +89,4 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 - 헤더·열 수·Verdict·Timestamp·빈 셀 계약을 어긴 파서 결과는 고쳐 받지 않고 그 파서 결과 전체를 적재하지 않은 채 `contract_violation` 으로 보고한다 (위 오류 유형 표).
 - 종료코드 0 전부 성공 / 1 일부 실패·위반 / 2 입력 실패 / 3 통합 DB·병합 출력 오류.
 
-실행 환경: `.venv312` = ChatGPT Desktop·ChatGPT Web·Claude Desktop·Claude Web·Gemini, `.venv314` = LM Studio (`setup.ps1` 참조).
+실행 환경: `.venv312` = 모든 파서 (`setup.ps1` 참조).
