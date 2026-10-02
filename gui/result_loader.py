@@ -52,6 +52,20 @@ VERDICT_CONFIRMED = "확정"
 VERDICT_SUSPECTED = "의심"
 EMPTY = "-"
 
+# 파서가 자기 출력 폴더에 남기는 결과 JSON (warning 목록을 읽기 위해서만 본다)
+PARSER_RESULT_JSON = "result.json"
+# 아래 두 warning 이 **함께** 있을 때만 "분석 제한"으로 표시한다. 원인(암호화 등)은 단정하지 않는다.
+WARN_PROFILE_NOT_FOUND = "CHROME_PROFILE_NOT_FOUND"
+WARN_FILESYSTEM_OPEN_FAILED = "IMAGE_FILESYSTEM_OPEN_FAILED"
+
+# 화면에 쓰는 파서 상태 (실제 report status / 행 수 / warning 만 근거로 한다)
+ST_COMPLETED = "Completed"
+ST_NO_RESULT = "Completed / No Result"
+ST_FAILED = "Failed"
+ST_SKIPPED = "Skipped"
+ST_LIMITED = "Unsupported / Limited"
+ST_UNKNOWN = "-"
+
 
 class ResultLoadError(Exception):
     """결과 폴더를 읽을 수 없을 때."""
@@ -106,6 +120,7 @@ class ResultBundle:
     report: dict | None
     manifest: dict | None
     case_info: dict | None
+    parser_warnings: dict = field(default_factory=dict)   # {parser: [warning, ...]} — 파서 result.json 원문
 
     # ------------------------------------------------------------------ load
     @classmethod
@@ -122,7 +137,8 @@ class ResultBundle:
         return cls(result_dir=result_dir, timeline_columns=tl_cols, timeline_rows=tl_rows,
                    conversation_columns=cv_cols, conversation_rows=cv_rows, report=report,
                    manifest=_read_json(os.path.join(result_dir, MANIFEST_JSON)),
-                   case_info=_read_json(os.path.join(result_dir, CASE_JSON)))
+                   case_info=_read_json(os.path.join(result_dir, CASE_JSON)),
+                   parser_warnings=_read_parser_warnings(result_dir))
 
     def path(self, name):
         return os.path.join(self.result_dir, name)
@@ -167,6 +183,67 @@ class ResultBundle:
             counts = Counter(cell(r, "source_parser") for r in self.timeline_rows)
             rows = [(name, "-", n, 0) for name, n in sorted(counts.items()) if name != EMPTY]
         return sorted(rows)
+
+    # ------------------------------------------------- 화면용 상태 / 안내 문구
+    def display_status(self, parser, status, timeline_rows, conversation_rows):
+        """실제 report status · 행 수 · 파서 warning 만으로 화면 상태를 정한다 (추론 금지)."""
+        if status in (None, "", ST_UNKNOWN):
+            return ST_UNKNOWN
+        if status != "success":
+            return ST_FAILED
+        if timeline_rows or conversation_rows:
+            return ST_COMPLETED
+        return ST_LIMITED if parser in self.limited_parsers() else ST_NO_RESULT
+
+    def display_parser_states(self):
+        """[(parser, display_status, report_status, timeline_rows, conversation_rows)]."""
+        executed = [(name, self.display_status(name, status, tl, cv), status, tl, cv)
+                    for name, status, tl, cv in self.parser_states()]
+        known = {row[0] for row in executed}
+        # --only 로 이번 실행에서 돌지 않은 파서는 report 에 없다 → Skipped (실패가 아니다)
+        skipped = [(name, ST_SKIPPED, "-", 0, 0)
+                   for name in sorted((self.report or {}).get("only") or []) if name not in known]
+        return executed + skipped
+
+    def limited_parsers(self):
+        """'분석 제한' 으로 표시할 파서 — result.json 에 두 warning 이 함께 있는 경우만."""
+        limited = {}
+        for parser, warnings in self.parser_warnings.items():
+            if any(w.startswith(WARN_PROFILE_NOT_FOUND) for w in warnings) and \
+                    any(w.startswith(WARN_FILESYSTEM_OPEN_FAILED) for w in warnings):
+                limited[parser] = [w for w in warnings
+                                   if w.startswith((WARN_PROFILE_NOT_FOUND, WARN_FILESYSTEM_OPEN_FAILED))]
+        return limited
+
+    def limitation_notice(self):
+        """제한 안내 문구 (근거가 없으면 None). 원인(암호화 등)을 단정하지 않는다."""
+        limited = self.limited_parsers()
+        if not limited:
+            return None
+        codes = sorted({w.split(":", 1)[0] for ws in limited.values() for w in ws})
+        return ("%s Parser는 실행되었으나 현재 Evidence에서 Chrome Artifact를 획득하지 못했습니다. "
+                "Errors & Limitations를 확인하세요. (근거 warning: %s)"
+                % (", ".join(sorted(limited)), ", ".join(codes)))
+
+    def failed_parsers(self):
+        return sorted(name for name, status, _tl, _cv in self.parser_states() if status != "success")
+
+    def empty_state_message(self, kind):
+        """kind='timeline' | 'conversations' — 0건일 때 보여 줄 문구. 실패와 정상 0건을 구분한다."""
+        if kind == "timeline":
+            head = "탐지된 Timeline Event가 없습니다."
+        else:
+            head = "복구된 대화가 없습니다."
+        lines = [head]
+        failed = self.failed_parsers()
+        if failed:
+            lines.append("일부 Parser가 정상적으로 끝나지 않았습니다 (%s). 0건과 실패는 다릅니다."
+                         % ", ".join(failed))
+        notice = self.limitation_notice()
+        if notice:
+            lines.append(notice)
+        lines.append("Errors & Limitations에서 각 Parser의 실행 상태를 확인하세요.")
+        return "\n".join(lines)
 
     def error_rows(self):
         """Errors & Limitations 표. report 의 오류를 그대로 펼친다 (원인 추측 없음)."""
@@ -260,6 +337,34 @@ class ResultBundle:
         for session in sessions.values():
             session.messages.sort(key=lambda r: _order_key(cell(r, "message order")))
         return list(sessions.values())
+
+
+def _read_parser_warnings(result_dir):
+    """각 파서 폴더의 result.json 에서 warnings 목록만 읽는다 (없으면 건너뛴다)."""
+    found = {}
+    try:
+        names = sorted(os.listdir(result_dir))
+    except OSError:
+        return found
+    for name in names:
+        data = _read_json(os.path.join(result_dir, name, PARSER_RESULT_JSON))
+        if isinstance(data, dict):
+            warnings = data.get("warnings")
+            if isinstance(warnings, list):
+                found[name] = [str(w) for w in warnings]
+    return found
+
+
+def evidence_dir_conflict(image_path, out_dir):
+    """Output 이 Evidence 파일이 있는 디렉터리와 같거나 그 하위면 True (대소문자 무시).
+
+    파서(Claude Web 등)가 증거 폴더 안쪽 출력을 거부하므로 실행 전에 막아야 한다.
+    """
+    if not image_path or not out_dir:
+        return False
+    evidence_dir = os.path.normcase(os.path.abspath(os.path.dirname(os.path.abspath(image_path))))
+    target = os.path.normcase(os.path.abspath(out_dir))
+    return target == evidence_dir or target.startswith(evidence_dir + os.sep)
 
 
 def _order_key(value):

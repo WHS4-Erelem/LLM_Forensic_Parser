@@ -20,9 +20,11 @@ from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QFileDi
 
 from case_manager import CaseInfo
 from integration_runner import EXIT_MEANING, RUNNER, IntegrationRunner, registry_parsers
-from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON, TIMELINE_CSV,
+from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON, ST_COMPLETED,
+                           ST_FAILED, ST_LIMITED, ST_NO_RESULT, ST_SKIPPED, TIMELINE_CSV,
                            TIMELINE_VIEW_COLUMNS, UNIFIED_DB, VERDICT_CONFIRMED, VERDICT_SUSPECTED,
-                           ResultBundle, ResultLoadError, cell, find_result_dirs)
+                           ResultBundle, ResultLoadError, cell, evidence_dir_conflict,
+                           find_result_dirs)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEAM = "elelem"
@@ -31,7 +33,11 @@ STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "Badg
                 "failed": ("실패", "BadgeRed"), "contract_violation": ("계약 위반", "BadgeRed"),
                 "normalization_error": ("정규화 실패", "BadgeRed"), "db_error": ("DB 오류", "BadgeRed"),
                 "output_error": ("출력 오류", "BadgeRed"), "warning": ("주의", "BadgeYellow"),
-                "integration": ("통합", "BadgeRed"), "-": ("정보 없음", "BadgeNeutral")}
+                "integration": ("통합", "BadgeRed"), "-": ("정보 없음", "BadgeNeutral"),
+                # 결과 화면의 파서 상태 (result_loader.display_status 가 실제 근거로 정한 값)
+                ST_COMPLETED: ("Completed", "BadgeGreen"), ST_NO_RESULT: ("No Result", "BadgeNeutral"),
+                ST_FAILED: ("Failed", "BadgeRed"), ST_SKIPPED: ("Skipped", "BadgeNeutral"),
+                ST_LIMITED: ("Limited", "BadgeYellow")}
 VERDICT_BADGE = {VERDICT_CONFIRMED: "BadgeGreen", VERDICT_SUSPECTED: "BadgeYellow"}
 VERDICT_COLOR = {VERDICT_CONFIRMED: "#26734d", VERDICT_SUSPECTED: "#8a6400"}
 
@@ -517,6 +523,8 @@ class MainWindow(QWidget):
         self.tab_overview = QWidget()
         overview_outer = QVBoxLayout(self.tab_overview)
         overview_outer.setContentsMargins(12, 12, 12, 12)
+        self.overview_notice = self._empty_notice()
+        overview_outer.addWidget(self.overview_notice)
         self.metrics_grid = QGridLayout()
         self.metrics_grid.setSpacing(9)
         overview_outer.addLayout(self.metrics_grid)
@@ -529,7 +537,8 @@ class MainWindow(QWidget):
         self.timeline_view = make_table()
         self.timeline_model = QStandardItemModel()
         self.timeline_proxy = TableFilterProxy(self)
-        self.tabs.addTab(self._wrap(self.timeline_view), "Timeline")
+        self.timeline_empty = self._empty_notice()
+        self.tabs.addTab(self._wrap(self.timeline_view, self.timeline_empty), "Timeline")
 
         # Conversations
         conv = QWidget()
@@ -589,12 +598,28 @@ class MainWindow(QWidget):
         return page
 
     @staticmethod
-    def _wrap(widget):
+    def _wrap(widget, empty_label=None):
+        """표를 감싼다. empty_label 을 주면 '0건 안내' 를 표 위에 둘 수 있다 (기본 숨김)."""
         holder = QWidget()
         box = QVBoxLayout(holder)
         box.setContentsMargins(12, 12, 12, 12)
+        box.setSpacing(9)
+        if empty_label is not None:
+            empty_label.setVisible(False)
+            box.addWidget(empty_label)
         box.addWidget(widget)
         return holder
+
+    @staticmethod
+    def _empty_notice():
+        """0건 / 분석 제한 안내용 라벨 (Panel Soft 배경). 실패 표시가 아니다."""
+        label = QLabel("")
+        label.setObjectName("PanelSoft")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        label.setContentsMargins(12, 10, 12, 10)
+        label.setVisible(False)
+        return label
 
     # ------------------------------------------------------------------ 흐름
     def _start_new_case(self):
@@ -657,12 +682,15 @@ class MainWindow(QWidget):
         self.validation_rows["signature"].set_status("success" if kind else "waiting", detail)
 
         ok_out = bool(out_dir) and self._out_writable(out_dir)
-        inside = ok_image and ok_out and os.path.abspath(out_dir).startswith(
-            os.path.dirname(os.path.abspath(image)) + os.sep)
-        self.validation_rows["output"].set_status(
-            "warning" if inside else ("success" if ok_out else ("failed" if out_dir else "waiting")),
-            "증거와 같은 폴더 아래 — 다른 위치를 권장" if inside else
-            ("쓰기 가능" if ok_out else ("쓸 수 없는 경로" if out_dir else "결과 폴더를 선택하세요")))
+        # 증거 폴더(또는 그 하위)에 결과를 쓰면 파서가 출력을 거부하고 증거 폴더도 오염된다 → 실행 차단
+        conflict = bool(image) and bool(out_dir) and evidence_dir_conflict(image, out_dir)
+        if conflict:
+            self.validation_rows["output"].set_status(
+                "failed", "결과 폴더가 증거 폴더 내부입니다 — 다른 위치를 선택하세요")
+        else:
+            self.validation_rows["output"].set_status(
+                "success" if ok_out else ("failed" if out_dir else "waiting"),
+                "쓰기 가능" if ok_out else ("쓸 수 없는 경로" if out_dir else "결과 폴더를 선택하세요"))
 
         selected = self.selected_parsers()
         ok_parsers = selected is None or bool(selected)
@@ -677,7 +705,8 @@ class MainWindow(QWidget):
         self.validation_rows["readonly"].set_status(
             "success", "증거는 읽기만 하고 결과는 결과 폴더에만 생성" if not self.cb_quick.isChecked()
             else "읽기 전용 · --quick 으로 해시 생략")
-        self._ready = ok_image and bool(kind) and ok_out and ok_parsers and ok_runner
+        self._ready = ok_image and bool(kind) and ok_out and not conflict and ok_parsers and ok_runner
+        self._out_conflict = conflict
         self._update_run_button()
 
     @staticmethod
@@ -714,6 +743,11 @@ class MainWindow(QWidget):
             self._start_new_case()
             return
         image, out_dir = self.in_image.text().strip(), self.in_out.text().strip()
+        if getattr(self, "_out_conflict", False):
+            QMessageBox.warning(self, "결과 폴더 위치 확인",
+                                "결과 폴더가 증거 폴더 내부에 있습니다.\n"
+                                "증거와 다른 위치의 폴더를 선택하세요.")
+            return
         if not getattr(self, "_ready", False):
             QMessageBox.warning(self, "입력 확인 필요", "입력 검증에서 실패한 항목을 먼저 해결하세요.")
             return
@@ -840,8 +874,8 @@ class MainWindow(QWidget):
             os.path.basename(evidence.get("path", "") or "-"), evidence.get("path", "-"),
             evidence.get("kind", "-"), len(evidence.get("segments", []) or [])))
         _clear_layout(self.services_box)
-        for name, status, tl_rows, cv_rows in self.bundle.parser_states():
-            self.services_box.addWidget(StatusRow(name, status, "%d / %d" % (tl_rows, cv_rows)))
+        for name, shown, _status, tl_rows, cv_rows in self.bundle.display_parser_states():
+            self.services_box.addWidget(StatusRow(name, shown, "%d / %d" % (tl_rows, cv_rows)))
         _clear_layout(self.steps_box)
         report = self.bundle.report or {}
         done = bool(report.get("parsers"))
@@ -853,6 +887,9 @@ class MainWindow(QWidget):
             self.steps_box.addWidget(StatusRow(name, "success" if ok else "-"))
 
     def _fill_overview(self):
+        notice = self.bundle.limitation_notice()        # 실제 warning 2종이 함께 있을 때만 값이 있다
+        self.overview_notice.setText(notice or "")
+        self.overview_notice.setVisible(bool(notice))
         _clear_grid(self.metrics_grid)
         for index, (label, value) in enumerate(self.bundle.metrics().items()):
             self.metrics_grid.addWidget(metric_card(label, value), index // 4, index % 4)
@@ -884,6 +921,9 @@ class MainWindow(QWidget):
         self.timeline_proxy.setSourceModel(self.timeline_model)
         self.timeline_view.setModel(self.timeline_proxy)
         self.timeline_view.selectionModel().selectionChanged.connect(self._on_timeline_selected)
+        empty = not self.bundle.timeline_rows
+        self.timeline_empty.setText(self.bundle.empty_state_message("timeline") if empty else "")
+        self.timeline_empty.setVisible(empty)
         header = self.timeline_view.horizontalHeader()
         for index, column in enumerate(columns):
             mode = QHeaderView.ResizeMode.Stretch if column in ("Behavior_details ", "Artifact_path") \
@@ -902,8 +942,10 @@ class MainWindow(QWidget):
         if self.sessions:
             self.session_list.setCurrentRow(0)
         else:
-            self.message_view.setHtml(_STYLE + "<p class='muted'>복구된 대화가 없습니다 "
-                                               "(recovered_conversations.csv 0행). 미발견과 미분석은 다릅니다.</p>")
+            lines = self.bundle.empty_state_message("conversations").splitlines()
+            self.message_view.setHtml(_STYLE + "".join(
+                "<p%s>%s</p>" % ("" if i == 0 else " class='muted'", _esc(line))
+                for i, line in enumerate(lines)))
 
     def _fill_artifacts(self):
         rows = self.bundle.artifact_rows()
