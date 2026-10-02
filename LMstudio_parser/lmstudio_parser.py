@@ -3061,8 +3061,36 @@ def fact_artifact_detail(fact: ObservedFact) -> str:
     return f"[{label}] " + ", ".join(dict.fromkeys(fields))
 
 
+def usn_artifact_detail_key(fact: ObservedFact) -> tuple[str, ...] | None:
+    label = artifact_display_name(fact)
+    if (label != "$UsnJrnl" or not fact.fact_type.startswith("history_")
+            or not fact_event_name(fact.fact_type) or not fact.target_path):
+        return None
+    # Keep full target/source paths in the key: equal basenames in different
+    # profiles or journals must not become one displayed evidence group.
+    return (label, fact.fact_type, fact.target_path,
+            fact.provenance.source_image, fact.provenance.original_artifact_path)
+
+
 def candidate_artifact_details(candidate: CandidateEvent) -> str:
-    details = sorted({fact_artifact_detail(fact) for fact in candidate.facts})
+    segments: set[str] = set()
+    usn_groups: dict[tuple[str, ...], list[ObservedFact]] = defaultdict(list)
+    for fact in candidate.facts:
+        key = usn_artifact_detail_key(fact)
+        if key is None:
+            segments.add(fact_artifact_detail(fact))
+        else:
+            usn_groups[key].append(fact)
+    # Aggregate only the CSV display; all raw Facts/locators remain available
+    # to detection, verdicts and debugging in the unchanged Candidate.
+    details = list(segments)
+    for facts in usn_groups.values():
+        # Lexically first rendered locator, matching the existing output sort.
+        detail = min(fact_artifact_detail(fact) for fact in facts)
+        if len(facts) > 1:
+            detail += f", 동일 근거={len(facts)}건"
+        details.append(detail)
+    details.sort()
     if candidate.timestamp and candidate.timestamp.semantics == "download_started" and details:
         for index, detail in enumerate(details):
             if detail.startswith("[Download Record] "):
@@ -4519,6 +4547,164 @@ class ReadableTimelineDetailsTests(FixtureCase):
         emitted = parser.candidate_behavior_details(ctx, candidate) + parser.candidate_artifact_details(candidate)
         self.assertNotIn(secret, emitted)
         self.assertIn("sha256:", emitted)
+
+
+class UsnArtifactDetailsTests(FixtureCase):
+    target = r"volume0:\Users\llmtest\.lmstudio\conversations\1790915225165.conversation.json"
+    journal = r"volume0:\$Extend\$UsnJrnl:$J"
+
+    def usn_fact(self, offset, fact_type="history_modify", target=None, source=None):
+        return parser.ObservedFact(
+            fact_type, "filesystem",
+            parser.Provenance("SYNTHETIC_USN.dd", source or self.journal, "", f"offset 0x{offset:x}"),
+            "DATA_OVERWRITE|CLOSE", key="42#1",
+            timestamp=parser.iso_from_datetime("2026-10-02T00:00:00Z", "usn_event"),
+            target_path=self.target if target is None else target,
+        )
+
+    def edit_context(self, count=663):
+        ctx = parser.AnalysisContext(Path("SYNTHETIC_USN.dd"), source_image="SYNTHETIC_USN.dd")
+        content = json.dumps(conversation(message(text="first line\nfull edited body", edited=True))).encode("utf-8")
+        ctx.add_artifact(parser.ArtifactRecord(
+            "SYNTHETIC_CONVERSATION", self.target,
+            parser.Provenance(ctx.source_image, self.target), "ntfs_file", content=content,
+        ))
+        parser.parse_json_artifacts(ctx)
+        summaries = parser.parse_conversations(ctx)
+        for index in range(count):
+            ctx.add_fact(self.usn_fact(0x100 + index * 0x80))
+        parser.detect_conversations(ctx, summaries, {}, [])
+        return ctx, self.candidates(ctx, "message_edit")[0]
+
+    @staticmethod
+    def legacy_details(candidate):
+        # Freeze the pre-aggregation serializer to compare the other columns.
+        details = sorted({parser.fact_artifact_detail(fact) for fact in candidate.facts})
+        if candidate.timestamp and candidate.timestamp.semantics == "download_started" and details:
+            for index, detail in enumerate(details):
+                if detail.startswith("[Download Record] "):
+                    details[index] = detail + ", 시각 출처=다운로드 시작"
+                    break
+        return " | ".join(details)
+
+    def test_663_usn_modifications_keep_all_facts_and_one_counted_group(self):
+        ctx, candidate = self.edit_context()
+        before = copy.deepcopy(ctx)
+        facts_list = candidate.facts
+        self.assertEqual(664, len(self.legacy_details(candidate).split(" | ")))
+        details = parser.candidate_artifact_details(candidate)
+        segments = details.split(" | ")
+        self.assertEqual(2, len(segments))
+        self.assertIn("[$UsnJrnl] 대상=1790915225165.conversation.json, 이벤트=수정, 위치=offset 0x100, 동일 근거=663건", segments)
+        self.assertIn("[Conversation]", details)
+        self.assertIn("JSON 위치=/messages/0/versions/0", details)
+        self.assertNotIn("\r", details)
+        self.assertNotIn("\n", details)
+        self.assertIs(facts_list, candidate.facts)
+        self.assertEqual(664, len(candidate.facts))
+        self.assertEqual(663, sum(f.fact_type == "history_modify" for f in candidate.facts))
+        self.assertEqual(before, ctx)
+
+    def test_other_targets_events_and_fact_types_stay_separate(self):
+        _, candidate = self.edit_context(2)
+        candidate.facts.extend([
+            self.usn_fact(0x200, target=self.target.replace("1790915225165", "OTHER")),
+            self.usn_fact(0x280, "history_create"),
+            self.usn_fact(0x300, "history_observed"),
+            self.usn_fact(0x380, "listing_observed"),
+        ])
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(6, len(details.split(" | ")))
+        self.assertEqual(1, details.count("동일 근거="))
+        for segment in ("대상=OTHER.conversation.json, 이벤트=수정", "이벤트=생성", "이벤트=관찰", "상태=파일 목록 관찰"):
+            self.assertIn(segment, details)
+
+    def test_same_basename_in_other_profile_or_journal_stays_separate(self):
+        _, candidate = self.edit_context(2)
+        for offset in (0x100, 0x180):
+            fact = self.usn_fact(offset)
+            candidate.facts.extend([
+                replace(fact, target_path=self.target.replace("llmtest", "other-user")),
+                replace(fact, provenance=replace(fact.provenance, original_artifact_path=self.journal.replace("volume0", "volume1"))),
+                replace(fact, provenance=replace(fact.provenance, source_image="OTHER.dd")),
+            ])
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(5, len(details.split(" | ")))
+        self.assertEqual(4, details.count("동일 근거=2건"))
+
+    def test_mft_conversation_and_download_locators_are_not_aggregated(self):
+        _, candidate = self.edit_context(2)
+        edit_fact = candidate.facts[0]
+        candidate.facts.append(replace(edit_fact, provenance=replace(edit_fact.provenance, evidence_location="/messages/1/versions/0")))
+        for index in (10, 11):
+            candidate.facts.append(parser.ObservedFact(
+                "history_modify", "filesystem", parser.Provenance("SYNTHETIC_USN.dd", r"volume0:\$MFT", "", f"MFT record {index}"),
+                target_path=self.target,
+            ))
+            candidate.facts.append(parser.ObservedFact(
+                "download_completed_record", "model_state", parser.Provenance("SYNTHETIC_USN.dd", "download-jobs-info.json", "", f"/jobs/{index}"),
+                "TEST.gguf",
+            ))
+        details = parser.candidate_artifact_details(candidate)
+        for label in ("[Conversation]", "[$MFT]", "[Download Record]"):
+            self.assertEqual(2, details.count(label))
+        self.assertEqual(7, len(details.split(" | ")))
+        self.assertEqual(1, details.count("동일 근거="))
+
+    def test_representative_is_deterministic_even_when_fact_order_changes(self):
+        _, candidate = self.edit_context()
+        candidate.facts.append(self.usn_fact(0x80))
+        expected = parser.candidate_artifact_details(candidate)
+        self.assertEqual(expected, parser.candidate_artifact_details(candidate))
+        self.assertEqual(expected, parser.candidate_artifact_details(replace(candidate, facts=list(reversed(candidate.facts)))))
+        self.assertEqual(expected, parser.candidate_artifact_details(replace(candidate, facts=candidate.facts[200:] + candidate.facts[:200])))
+        self.assertIn("위치=offset 0x100, 동일 근거=664건", expected)
+
+    def test_single_usn_and_missing_target_keep_legacy_display(self):
+        _, candidate = self.edit_context(1)
+        self.assertEqual(self.legacy_details(candidate), parser.candidate_artifact_details(candidate))
+        candidate.facts.extend([self.usn_fact(0x180, target=""), self.usn_fact(0x200, target="")])
+        self.assertEqual(self.legacy_details(candidate), parser.candidate_artifact_details(candidate))
+
+    def test_edit_csv_only_changes_artifact_details_and_recovery_bytes_match(self):
+        ctx, _ = self.edit_context()
+        before = copy.deepcopy(ctx)
+        with tempfile.TemporaryDirectory(prefix="SYNTHETIC_USN_CSV_") as temporary:
+            root = Path(temporary)
+            with patch.object(parser, "candidate_artifact_details", side_effect=self.legacy_details):
+                old_rows = parser.timeline_rows(ctx)
+                parser.write_csv(root / "old_timeline.csv", parser.TIMELINE_HEADER, old_rows)
+                parser.write_csv(root / "old_recovered.csv", parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+            new_rows = parser.timeline_rows(ctx)
+            parser.write_csv(root / "new_timeline.csv", parser.TIMELINE_HEADER, new_rows)
+            parser.write_csv(root / "new_recovered.csv", parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+            parser.write_csv(root / "repeat_timeline.csv", parser.TIMELINE_HEADER, parser.timeline_rows(ctx))
+            self.assertEqual([row[:6] for row in old_rows], [row[:6] for row in new_rows])
+            self.assertEqual(1, sum(a[6] != b[6] for a, b in zip(old_rows, new_rows)))
+            self.assertEqual((root / "old_recovered.csv").read_bytes(), (root / "new_recovered.csv").read_bytes())
+            raw = (root / "new_timeline.csv").read_bytes()
+            self.assertEqual(raw, (root / "repeat_timeline.csv").read_bytes())
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(len(new_rows) + 1, raw.count(b"\r\n"))
+            self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+            emitted = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+            self.assertEqual(parser.TIMELINE_HEADER, emitted[0])
+            self.assertEqual(new_rows, emitted[1:])
+            self.assertTrue(all(len(row) == 7 and all(row) for row in emitted))
+        self.assertEqual(before, ctx)
+
+    def test_all_21_rule_fixtures_keep_other_timeline_columns_and_recovery(self):
+        for action, (positive, negative, _) in RULE_FIXTURES.items():
+            for files in (positive, negative):
+                with self.subTest(action=action, files=files):
+                    ctx = self.analyze_files(files)
+                    before = copy.deepcopy(ctx)
+                    with patch.object(parser, "candidate_artifact_details", side_effect=self.legacy_details):
+                        old_rows = parser.timeline_rows(ctx)
+                        old_recovered = parser.conversation_rows(ctx)
+                    self.assertEqual([row[:6] for row in old_rows], [row[:6] for row in parser.timeline_rows(ctx)])
+                    self.assertEqual(old_recovered, parser.conversation_rows(ctx))
+                    self.assertEqual(before, ctx)
 
 
 class FinalContractTests(FixtureCase):

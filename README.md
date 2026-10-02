@@ -14,7 +14,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 | `Claude_APP_Parser` | Claude 데스크톱 앱 | `aifp_parse.py` | Python 3.11+ · 표준 라이브러리만 |
 | `Claude_Web_Parser` | claude.ai (Chrome) | `python -m claude_web_forensics` | Python 3.12 · dissect · ccl-chromium-reader |
 | `Gemini_Web_Parser` | gemini.google.com (Chrome) | `gemini_parser.py` | Python 3.10+ · pytsk3 · libewf-python |
-| `LMstudio_parser` | LM Studio (로컬 LLM) | `lmstudio_parser.py` | Python 3.14 · dissect |
+| `LMstudio_parser` | LM Studio (로컬 LLM) | `lmstudio_parser.py` | Python 3.12 · dissect |
 | `integration` | 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 각자 venv) |
 
 파서마다 자세한 사용법과 판정 규칙은 각 폴더의 README 에 있다.
