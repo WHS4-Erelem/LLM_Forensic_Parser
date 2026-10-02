@@ -1,0 +1,8 @@
+# Gemini Web v1.3 native Chromium deep-recovery dependencies.
+# Install into the Gemini parser's own Python 3.12 environment.
+# ccl_chromium_reader itself pulls ccl_simplesnappy from GitHub and zstd.
+pytsk3==20260715
+ccl-chromium-reader @ git+https://github.com/cclgroupltd/ccl_chromium_reader.git@ef840de30221c4d65bc96d2f4d9057e9ef2f526d
+Brotli==1.2.0
+# Gemini parser's own zstd fallback decoder uses the 'zstandard' package.
+zstandard==0.25.0
