@@ -9,22 +9,23 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtCore import QSortFilterProxyModel, Qt, QUrl, pyqtSlot
-from PyQt6.QtGui import QColor, QDesktopServices, QFont, QStandardItem, QStandardItemModel
-from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QFileDialog, QFrame,
-                             QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-                             QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar,
-                             QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSplitter,
-                             QStackedWidget, QTableView, QTabWidget, QTextBrowser, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtCore import QRect, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
+from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPen,
+                         QStandardItem, QStandardItemModel)
+from PyQt6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
+                             QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+                             QListView, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit,
+                             QProgressBar, QPushButton, QRadioButton, QSizePolicy, QSplitter,
+                             QStackedWidget, QStyle, QStyledItemDelegate, QTableView, QTabWidget,
+                             QTextBrowser, QVBoxLayout, QWidget)
 
 from case_manager import CaseInfo
 from integration_runner import EXIT_MEANING, RUNNER, IntegrationRunner, registry_parsers
 from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON, ST_COMPLETED,
                            ST_FAILED, ST_LIMITED, ST_NO_RESULT, ST_SKIPPED, TIMELINE_CSV,
                            TIMELINE_VIEW_COLUMNS, UNIFIED_DB, VERDICT_CONFIRMED, VERDICT_SUSPECTED,
-                           ResultBundle, ResultLoadError, cell, evidence_dir_conflict,
-                           find_result_dirs)
+                           ResultBundle, ResultLoadError, artifact_type_of, cell,
+                           evidence_dir_conflict, find_result_dirs)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEAM = "elelem"
@@ -39,7 +40,15 @@ STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "Badg
                 ST_FAILED: ("Failed", "BadgeRed"), ST_SKIPPED: ("Skipped", "BadgeNeutral"),
                 ST_LIMITED: ("Limited", "BadgeYellow")}
 VERDICT_BADGE = {VERDICT_CONFIRMED: "BadgeGreen", VERDICT_SUSPECTED: "BadgeYellow"}
-VERDICT_COLOR = {VERDICT_CONFIRMED: "#26734d", VERDICT_SUSPECTED: "#8a6400"}
+# 다크 테마 팔레트 (styles.qss 와 같은 값을 쓴다. delegate 는 QSS 를 못 쓰므로 여기서 참조)
+DARK = {
+    "bg": "#121820", "shell": "#171f29", "panel": "#1b2430", "card": "#1f2937",
+    "card_hi": "#26323f", "border": "#2c3947", "rail": "#31404f",
+    "text": "#e6edf3", "text_dim": "#b9c6d2", "muted": "#8294a5",
+    "accent": "#4cc2d6", "teal": "#4cc2d6", "blue": "#6ea8e8",
+    "green": "#5ec98b", "yellow": "#e3b341", "red": "#ef6b6b",
+}
+VERDICT_COLOR = {VERDICT_CONFIRMED: DARK["green"], VERDICT_SUSPECTED: DARK["yellow"]}
 
 
 # --------------------------------------------------------------------- 공통 위젯
@@ -162,26 +171,234 @@ class StatusRow(QWidget):
 
 
 class TableFilterProxy(QSortFilterProxyModel):
-    """모든 열에 대한 대소문자 무시 부분 일치 (Global Search 용)."""
+    """검색어(모든 열 부분 일치) + 서비스 + Verdict 필터. 원본 모델은 그대로 둔다."""
+
+    ALL = ""        # 전체 (필터 없음)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._needle = ""
+        self._service = self.ALL
+        self._verdict = self.ALL
 
     def set_needle(self, text):
         self._needle = (text or "").strip().lower()
         self.invalidateFilter()
 
+    def set_service(self, service):
+        self._service = service or self.ALL
+        self.invalidateFilter()
+
+    def set_verdict(self, verdict):
+        self._verdict = verdict or self.ALL
+        self.invalidateFilter()
+
+    def source_row(self, row, parent):
+        """그 행의 원본 dict (fill_model 이 UserRole 에 넣어 둔 값)."""
+        model = self.sourceModel()
+        return model.data(model.index(row, 0, parent), Qt.ItemDataRole.UserRole)
+
     def filterAcceptsRow(self, row, parent):
+        model = self.sourceModel()
+        if model is None:
+            return True
+        if self._service or self._verdict:
+            data = self.source_row(row, parent)
+            if isinstance(data, dict):
+                if self._service and cell(data, "source_parser") != self._service:
+                    return False
+                if self._verdict and cell(data, "Verdict") != self._verdict:
+                    return False
         if not self._needle:
             return True
-        model = self.sourceModel()
         for column in range(model.columnCount()):
             value = model.data(model.index(row, column, parent)) or ""
             if self._needle in str(value).lower():
                 return True
         return False
+
+
+# --------------------------------------------------- 타임라인 카드 렌더링 계층
+# 모델(QStandardItemModel)·프록시(검색/필터)는 표와 똑같이 쓰고, 그리는 방법만 바꾼다.
+# 위젝을 행마다 만들지 않고 delegate 로 직접 그려서 행이 많아도 스크롤이 무겁지 않다.
+CARD_HEIGHT = 124
+RAIL_X = 92                 # 시간축 세로선 x 좌표
+CARD_LEFT = 108
+CARD_PAD = 12
+
+
+class TimelineCardDelegate(QStyledItemDelegate):
+    """이벤트 1건 = 카드 1장. 왼쪽 시간축 + 행위명 + 배지 + 설명 + 경로."""
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), CARD_HEIGHT)
+
+    def paint(self, painter, option, index):
+        row = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, dict):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = option.rect
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        # ---- 왼쪽 시간축 (세로 레일 + 점)
+        painter.setPen(QPen(QColor(DARK["rail"]), 1))
+        painter.drawLine(rect.left() + RAIL_X, rect.top(), rect.left() + RAIL_X, rect.bottom())
+        verdict = cell(row, "Verdict")
+        dot = QColor(VERDICT_COLOR.get(verdict, DARK["muted"]))
+        painter.setBrush(dot)
+        painter.setPen(QPen(QColor(DARK["bg"]), 2))
+        painter.drawEllipse(rect.left() + RAIL_X - 5, rect.top() + 26, 10, 10)
+
+        # ---- 시간 (날짜 / 시각 2줄)
+        stamp = cell(row, "Timestamp")
+        date_text, time_text = _split_timestamp(stamp)
+        time_rect = QRect(rect.left() + 8, rect.top() + 18, RAIL_X - 24, 18)
+        painter.setPen(QColor(DARK["text"]))
+        painter.setFont(_font(9.5, bold=True))
+        painter.drawText(time_rect, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), time_text)
+        painter.setPen(QColor(DARK["muted"]))
+        painter.setFont(_font(8))
+        painter.drawText(time_rect.translated(0, 16),
+                         int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter), date_text)
+
+        # ---- 카드 본체
+        card = QRect(rect.left() + CARD_LEFT, rect.top() + 6, rect.width() - CARD_LEFT - 14, CARD_HEIGHT - 14)
+        painter.setPen(QPen(QColor(DARK["accent"] if selected else DARK["border"]), 2 if selected else 1))
+        painter.setBrush(QColor(DARK["card_hi"] if (selected or hovered) else DARK["card"]))
+        painter.drawRoundedRect(card, 4, 4)
+        # verdict 색 왼쪽 강조선
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(dot)
+        painter.drawRoundedRect(QRect(card.left(), card.top() + 1, 3, card.height() - 2), 2, 2)
+
+        inner = card.adjusted(CARD_PAD + 4, 10, -CARD_PAD, -10)
+        # 1행: 행위명 + verdict 배지 (오른쪽)
+        badge_w = _badge_width(verdict, 9)
+        painter.setPen(QColor(DARK["text"]))
+        painter.setFont(_font(11, bold=True))
+        title_rect = QRect(inner.left(), inner.top(), inner.width() - badge_w - 10, 20)
+        painter.drawText(title_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         _elide(cell(row, "User_behavior"), title_rect.width(), _font(11, bold=True)))
+        _draw_badge(painter, QRect(inner.right() - badge_w, inner.top() + 1, badge_w, 18), verdict,
+                    VERDICT_COLOR.get(verdict, DARK["muted"]))
+
+        # 2행: 서비스 / Model / 아티팩트 배지
+        x = inner.left()
+        y = inner.top() + 26
+        for text, color in ((cell(row, "source_parser"), DARK["blue"]),
+                            (cell(row, "Model"), DARK["muted"]),
+                            (_artifact_label(row), DARK["teal"])):
+            if text == EMPTY:
+                continue
+            width = _badge_width(text, 8.5)
+            if x + width > inner.right():
+                break
+            _draw_badge(painter, QRect(x, y, width, 17), text, color, soft=True)
+            x += width + 6
+
+        # 3~4행: 핵심 설명 (2줄까지)
+        painter.setPen(QColor(DARK["text_dim"]))
+        painter.setFont(_font(9))
+        detail_rect = QRect(inner.left(), inner.top() + 48, inner.width(), 32)
+        _draw_wrapped(painter, detail_rect, cell(row, "Behavior_details "), _font(9), lines=2)
+
+        # 5행: Artifact Path (monospace 1줄)
+        painter.setPen(QColor(DARK["muted"]))
+        mono = _font(8.5, mono=True)
+        painter.setFont(mono)
+        path_rect = QRect(inner.left(), inner.bottom() - 14, inner.width(), 14)
+        painter.drawText(path_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                         _elide(cell(row, "Artifact_path"), path_rect.width(), mono))
+        painter.restore()
+
+
+def _font(point, bold=False, mono=False):
+    font = QFont("Cascadia Mono" if mono else "Segoe UI")
+    font.setPointSizeF(point)
+    font.setBold(bold)
+    return font
+
+
+def _elide(text, width, font):
+    return QFontMetrics(font).elidedText(str(text), Qt.TextElideMode.ElideMiddle, max(width, 20))
+
+
+def _badge_width(text, point):
+    return QFontMetrics(_font(point, bold=True)).horizontalAdvance(str(text)) + 18
+
+
+def _draw_badge(painter, rect, text, color, soft=False):
+    painter.save()
+    tint = QColor(color)
+    fill = QColor(tint)
+    fill.setAlpha(38 if soft else 56)
+    painter.setPen(QPen(QColor(tint.red(), tint.green(), tint.blue(), 120), 1))
+    painter.setBrush(fill)
+    painter.drawRoundedRect(rect, 3, 3)
+    painter.setPen(tint)
+    painter.setFont(_font(8.5 if soft else 9, bold=True))
+    painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), str(text))
+    painter.restore()
+
+
+def _draw_wrapped(painter, rect, text, font, lines=2):
+    """최대 lines 줄까지만 그린다 (마지막 줄은 … 로 자른다)."""
+    metrics = QFontMetrics(font)
+    words, line, drawn = str(text).split(), "", 0
+    y = rect.top()
+    for word in words + [None]:
+        candidate = word if not line else line + " " + word if word else line
+        if word is not None and metrics.horizontalAdvance(candidate) <= rect.width():
+            line = candidate
+            continue
+        if line:
+            drawn += 1
+            last = drawn >= lines or word is None
+            painter.drawText(QRect(rect.left(), y, rect.width(), metrics.height()),
+                             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                             metrics.elidedText(line, Qt.TextElideMode.ElideRight, rect.width()) if last else line)
+            y += metrics.height() + 1
+            if drawn >= lines:
+                return
+        line = word or ""
+
+
+def _split_timestamp(stamp):
+    """'2026-08-25 18:47:16.514888 KST' → ('2026-08-25', '18:47:16'). 없으면 ('', '-')."""
+    if not stamp or stamp == EMPTY:
+        return "시각 없음", EMPTY
+    parts = str(stamp).split()
+    date = parts[0] if parts else ""
+    clock = parts[1].split(".")[0] if len(parts) > 1 else ""
+    return date, clock or EMPTY
+
+
+def _artifact_label(row):
+    """Artifact_details 의 artifact_type= 값, 없으면 경로의 마지막 조각 (추론하지 않는다)."""
+    kind = artifact_type_of(cell(row, "Artifact_details "))
+    if kind != EMPTY:
+        return kind
+    path = cell(row, "Artifact_path")
+    return path.replace("/", "\\").rstrip("\\").split("\\")[-1] if path != EMPTY else EMPTY
+
+
+def make_timeline_view():
+    """카드 타임라인 뷰. 모델·프록시는 표와 동일하게 쓰고 0열만 그린다."""
+    view = QListView()
+    view.setObjectName("TimelineView")
+    view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    view.setMouseTracking(True)
+    view.setUniformItemSizes(True)              # 고정 높이 → 스크롤 성능
+    view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+    view.setItemDelegate(TimelineCardDelegate(view))
+    view.setModelColumn(0)
+    return view
 
 
 def make_table():
@@ -533,12 +750,19 @@ class MainWindow(QWidget):
         overview_outer.addWidget(self.overview_notes, 1)
         self.tabs.addTab(self.tab_overview, "Overview")
 
-        # Timeline
-        self.timeline_view = make_table()
+        # Timeline (표 → 카드 타임라인. 모델·프록시는 그대로 쓴다)
+        self.timeline_view = make_timeline_view()
         self.timeline_model = QStandardItemModel()
         self.timeline_proxy = TableFilterProxy(self)
         self.timeline_empty = self._empty_notice()
-        self.tabs.addTab(self._wrap(self.timeline_view, self.timeline_empty), "Timeline")
+        timeline_tab = QWidget()
+        tl_box = QVBoxLayout(timeline_tab)
+        tl_box.setContentsMargins(12, 12, 12, 12)
+        tl_box.setSpacing(9)
+        tl_box.addWidget(self._build_timeline_filters())
+        tl_box.addWidget(self.timeline_empty)
+        tl_box.addWidget(self.timeline_view, 1)
+        self.tabs.addTab(timeline_tab, "Timeline")
 
         # Conversations
         conv = QWidget()
@@ -609,6 +833,66 @@ class MainWindow(QWidget):
             box.addWidget(empty_label)
         box.addWidget(widget)
         return holder
+
+    def _build_timeline_filters(self):
+        """서비스 pill + Verdict 선택. 검색은 TopBar 검색창을 그대로 쓴다."""
+        bar = QFrame()
+        bar.setObjectName("FilterBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(6)
+        self.service_bar = QHBoxLayout()
+        self.service_bar.setSpacing(6)
+        self.service_buttons = {}
+        row.addLayout(self.service_bar)
+        row.addStretch(1)
+        verdict_caption = QLabel("Verdict")
+        verdict_caption.setObjectName("SectionLabel")
+        row.addWidget(verdict_caption)
+        self.verdict_filter = QComboBox()
+        self.verdict_filter.setObjectName("FilterCombo")
+        self.verdict_filter.addItem("전체", TableFilterProxy.ALL)
+        self.verdict_filter.currentIndexChanged.connect(
+            lambda _i: self.timeline_proxy.set_verdict(self.verdict_filter.currentData()))
+        row.addWidget(self.verdict_filter)
+        return bar
+
+    def _rebuild_service_filter(self):
+        """실제 결과에 있는 서비스만 pill 로 만든다 (건수 포함). '전체' 로 복귀 가능."""
+        _clear_layout(self.service_bar)
+        self.service_buttons = {}
+        counts = self.bundle.service_counts()
+        items = [(TableFilterProxy.ALL, "전체", len(self.bundle.timeline_rows))] +                 [(name, name, n) for name, n in counts]
+        for value, label, count in items:
+            button = QPushButton("%s  %d" % (label, count))
+            button.setObjectName("ServicePill")
+            button.setCheckable(True)
+            button.setChecked(value == TableFilterProxy.ALL)
+            button.clicked.connect(lambda _c, v=value: self._select_service(v))
+            self.service_buttons[value] = button
+            self.service_bar.addWidget(button)
+
+    def _select_service(self, value):
+        for key, button in self.service_buttons.items():
+            button.setChecked(key == value)
+        self.timeline_proxy.set_service(value)
+        self._refresh_timeline_empty()
+
+    def _refresh_timeline_empty(self):
+        """0건 안내 토글. 데이터가 0건인 경우와 필터로 0건이 된 경우를 구분한다."""
+        if self.bundle is None:
+            return
+        if not self.bundle.timeline_rows:
+            self.timeline_empty.setText(self.bundle.empty_state_message("timeline"))
+            self.timeline_empty.setVisible(True)
+            self.timeline_view.setVisible(False)
+            return
+        self.timeline_view.setVisible(True)
+        filtered_out = self.timeline_proxy.rowCount() == 0
+        self.timeline_empty.setText(
+            "현재 필터·검색 조건에 맞는 이벤트가 없습니다. (전체 %d건)" % len(self.bundle.timeline_rows)
+            if filtered_out else "")
+        self.timeline_empty.setVisible(filtered_out)
 
     @staticmethod
     def _empty_notice():
@@ -915,20 +1199,23 @@ class MainWindow(QWidget):
         self.overview_notes.setHtml("".join(html))
 
     def _fill_timeline(self):
+        # 모델은 표에서 쓰던 것과 동일하다 (열 구성·UserRole 원본 dict 유지). 그리는 쪽만 카드다.
         columns = [c for c in TIMELINE_VIEW_COLUMNS if c in self.bundle.timeline_columns] or \
                   self.bundle.timeline_columns
         self.timeline_model = fill_model(columns, self.bundle.timeline_rows)
+        self.timeline_proxy.set_service(TableFilterProxy.ALL)
+        self.timeline_proxy.set_verdict(TableFilterProxy.ALL)
         self.timeline_proxy.setSourceModel(self.timeline_model)
         self.timeline_view.setModel(self.timeline_proxy)
         self.timeline_view.selectionModel().selectionChanged.connect(self._on_timeline_selected)
-        empty = not self.bundle.timeline_rows
-        self.timeline_empty.setText(self.bundle.empty_state_message("timeline") if empty else "")
-        self.timeline_empty.setVisible(empty)
-        header = self.timeline_view.horizontalHeader()
-        for index, column in enumerate(columns):
-            mode = QHeaderView.ResizeMode.Stretch if column in ("Behavior_details ", "Artifact_path") \
-                else QHeaderView.ResizeMode.ResizeToContents
-            header.setSectionResizeMode(index, mode)
+        self._rebuild_service_filter()
+        self.verdict_filter.blockSignals(True)
+        self.verdict_filter.clear()
+        self.verdict_filter.addItem("전체", TableFilterProxy.ALL)
+        for value in self.bundle.verdict_values():       # 실제 등장한 값만 선택지로 둔다
+            self.verdict_filter.addItem(value, value)
+        self.verdict_filter.blockSignals(False)
+        self._refresh_timeline_empty()
 
     def _fill_conversations(self):
         self.session_list.clear()
@@ -971,7 +1258,8 @@ class MainWindow(QWidget):
 
     # ----------------------------------------------------------- 선택 → 상세
     def _selected_row(self, view):
-        indexes = view.selectionModel().selectedRows() if view.selectionModel() else []
+        model = view.selectionModel()
+        indexes = model.selectedIndexes() if model else []   # 표·카드 리스트 둘 다 동작
         if not indexes:
             return None
         return indexes[0].data(Qt.ItemDataRole.UserRole)
@@ -991,7 +1279,10 @@ class MainWindow(QWidget):
         meta = [(DISPLAY_NAMES.get(k, k), cell(row, k)) for k in
                 ("volume_ref", "parser_version", "source_file", "parse_time_utc", "evidence_id")
                 if k in self.bundle.timeline_columns]
-        self._set_detail(_detail_html(cell(row, "User_behavior"), sections, paths, meta))
+        tone = {VERDICT_CONFIRMED: "pill-green", VERDICT_SUSPECTED: "pill-yellow"}.get(verdict, "")
+        pills = ((verdict, tone), (cell(row, "source_parser"), ""), (cell(row, "Model"), ""),
+                 (artifact_type_of(cell(row, "Artifact_details ")), ""))
+        self._set_detail(_detail_html(cell(row, "User_behavior"), sections, paths, meta, pills))
         self._set_artifact_path(cell(row, "Artifact_path"))
 
     def _on_artifact_selected(self, *_args):
@@ -1021,7 +1312,8 @@ class MainWindow(QWidget):
                     ("Processing Result", row.get("Processing Result", EMPTY))]
         paths = [("Message", row.get("Message", EMPTY))]
         meta = [(k, str(v)) for k, v in raw.items() if k != "message" and v is not None]
-        self._set_detail(_detail_html(row.get("Type", EMPTY), sections, paths, meta))
+        self._set_detail(_detail_html(row.get("Type", EMPTY), sections, paths, meta,
+                                      ((row.get("Module", EMPTY), ""), (severity, "pill-red"))))
         run_log = raw.get("run_log") or ""
         self._set_artifact_path(run_log if run_log else EMPTY)
 
@@ -1034,8 +1326,10 @@ class MainWindow(QWidget):
                 % (_esc(session.conversation_uuid), _esc(session.model), len(session.messages))]
         for message in session.messages:
             role = cell(message, "role")
+            tone = " msg-assistant" if role.lower() not in ("user", "human") else ""
             html.append(
-                "<div class='msg'><div class='role'>%s <span class='muted'>· %s · order %s</span></div>"
+                ("<div class='msg%s'>" % tone) +
+                "<div class='role'>%s <span class='muted'>· %s · order %s</span></div>"
                 "<div class='content'>%s</div>"
                 "<div class='meta muted'>message_uuid %s<br>parent %s<br>artifact %s</div></div>"
                 % (_esc(role.upper()), _esc(cell(message, "timestamp")), _esc(cell(message, "message order")),
@@ -1068,6 +1362,7 @@ class MainWindow(QWidget):
         for proxy in (self.timeline_proxy, self.artifact_proxy, self.error_proxy):
             if proxy.sourceModel() is not None:
                 proxy.set_needle(text)
+        self._refresh_timeline_empty()
         needle = (text or "").strip().lower()
         for index in range(self.session_list.count()):
             item = self.session_list.item(index)
@@ -1096,22 +1391,31 @@ class MainWindow(QWidget):
 
 # ----------------------------------------------------------------- HTML 조각
 _STYLE = """<style>
-body { font-family: "Segoe UI", "Malgun Gothic", sans-serif; font-size: 10pt; color: #17202a; }
-h3 { font-size: 11pt; margin: 2px 0 6px 0; }
-h4 { font-size: 9.5pt; color: #1c5f70; margin: 10px 0 3px 0; }
-.muted { color: #667381; font-size: 9pt; }
+body { font-family: "Segoe UI", "Malgun Gothic", sans-serif; font-size: 10pt; color: #e6edf3;
+       background-color: #1b2430; }
+h3 { font-size: 11.5pt; margin: 2px 0 8px 0; color: #e6edf3; }
+h4 { font-size: 9.5pt; color: #4cc2d6; margin: 12px 0 4px 0; letter-spacing: 0.3px; }
+.muted { color: #8294a5; font-size: 9pt; }
 code, .path { font-family: "Cascadia Mono", "Consolas", monospace; font-size: 9pt;
-              word-break: break-all; }
-.sec { border-top: 1px solid #d9dee5; padding-top: 7px; margin-top: 7px; }
-.key { color: #667381; font-size: 8.5pt; font-weight: 600; }
-.msg { border: 1px solid #d9dee5; border-radius: 3px; padding: 7px 9px; margin-bottom: 7px;
-       background: #ffffff; }
-.role { font-weight: 600; color: #1c5f70; font-size: 9pt; margin-bottom: 3px; }
-.content { white-space: pre-wrap; }
-.meta { margin-top: 5px; font-family: "Cascadia Mono", "Consolas", monospace; font-size: 8pt;
-        word-break: break-all; }
+              color: #b9c6d2; word-break: break-all; }
+.sec { border-top: 1px solid #2c3947; padding-top: 8px; margin-top: 8px; }
+.key { color: #8294a5; font-size: 8.5pt; font-weight: 600; letter-spacing: 0.4px; }
+.val { color: #e6edf3; }
+.pill { background-color: #26323f; color: #6ea8e8; font-size: 8.5pt; font-weight: 600;
+        padding: 1px 7px; }
+.pill-green { background-color: #1e3a2b; color: #5ec98b; }
+.pill-yellow { background-color: #3a3220; color: #e3b341; }
+.pill-red { background-color: #3a2424; color: #ef6b6b; }
+.msg { border: 1px solid #2c3947; border-left: 3px solid #4cc2d6; padding: 9px 11px;
+       margin-bottom: 9px; background-color: #1f2937; }
+.msg-assistant { border-left: 3px solid #6ea8e8; }
+.role { font-weight: 700; color: #4cc2d6; font-size: 9pt; margin-bottom: 4px;
+        letter-spacing: 0.5px; }
+.content { white-space: pre-wrap; color: #e6edf3; }
+.meta { margin-top: 6px; font-family: "Cascadia Mono", "Consolas", monospace; font-size: 8pt;
+        color: #8294a5; word-break: break-all; }
 ul { margin: 2px 0 2px 16px; padding: 0; }
-li { margin-bottom: 3px; }
+li { margin-bottom: 4px; color: #b9c6d2; }
 </style>"""
 
 
@@ -1119,8 +1423,15 @@ def _esc(text):
     return (str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def _detail_html(heading, sections, paths, meta):
+def _pill(text, tone=""):
+    return "<span class='pill %s'>&nbsp;%s&nbsp;</span>" % (tone, _esc(text))
+
+
+def _detail_html(heading, sections, paths, meta, pills=()):
     html = ["<h3>%s</h3>" % _esc(heading or "-")]
+    shown = [_pill(text, tone) for text, tone in pills if text and text != EMPTY]
+    if shown:
+        html.append("<p>" + " ".join(shown) + "</p>")
     for key, value in sections:
         html.append("<div class='sec'><div class='key'>%s</div><div>%s</div></div>"
                     % (_esc(key), _esc(value).replace("\n", "<br>")))

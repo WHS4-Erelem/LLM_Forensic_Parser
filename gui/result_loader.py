@@ -225,6 +225,18 @@ class ResultBundle:
                 "Errors & Limitations를 확인하세요. (근거 warning: %s)"
                 % (", ".join(sorted(limited)), ", ".join(codes)))
 
+    def service_counts(self):
+        """[(service, timeline 행 수)] — timeline.csv 의 source_parser 기준. 전체 건수는 len(timeline_rows)."""
+        counts = Counter(cell(r, "source_parser") for r in self.timeline_rows)
+        counts.pop(EMPTY, None)
+        return sorted(counts.items())
+
+    def verdict_values(self):
+        """timeline.csv 에 실제로 등장한 Verdict 값만 (없는 값을 선택지로 만들지 않는다)."""
+        values = {cell(r, "Verdict") for r in self.timeline_rows}
+        values.discard(EMPTY)
+        return sorted(values)
+
     def failed_parsers(self):
         return sorted(name for name, status, _tl, _cv in self.parser_states() if status != "success")
 
@@ -302,7 +314,7 @@ class ResultBundle:
             path = cell(row, "Artifact_path")
             key = (cell(row, "source_parser"), path)
             entry = grouped.setdefault(key, {
-                "Artifact Type": _artifact_type(cell(row, "Artifact_details ")),
+                "Artifact Type": artifact_type_of(cell(row, "Artifact_details ")),
                 "Service": cell(row, "source_parser"), "Model": cell(row, "Model"),
                 "Artifact Path": path, "Related Behavior": set(), "First Timestamp": EMPTY,
                 "Events": 0, "_rows": []})
@@ -374,7 +386,7 @@ def _order_key(value):
         return (1, str(value))
 
 
-def _artifact_type(details):
+def artifact_type_of(details):
     """Artifact_details 안에 'artifact_type=' 가 실제로 있으면 그 값, 없으면 '-' (추론하지 않는다)."""
     for part in str(details).split("|"):
         part = part.strip()
