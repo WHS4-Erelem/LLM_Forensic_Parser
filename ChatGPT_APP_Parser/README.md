@@ -30,13 +30,14 @@ result = pipeline.run(path, input_type="auto", kinds=pipeline.DEFAULT_KINDS,
 
 **검증 상태**: 합성 테스트 43건 통과. 실제 E01 2개 실행 검증 완료 — `IMG_MRK_VER.E01`(단일, 마커 시나리오)
 과 `Scenario_Image.E01~E23`(**23분할**, 평서문 시나리오, 분기 파일 E03-03 포함). 둘 다 저장 해시 일치, 오류 0.
-미검증: 삭제 파일 복구·분할 RAW 는 실제 표본에 대상이 없었다. 상세: `verification/`.
+미검증: 삭제 파일 복구·분할 RAW 는 실제 표본에 대상이 없었다.
+테스트 코드·테스트 이미지 생성 도구·대조 결과 문서는 이 저장소에 없다(6절).
 
-**환경 제약**: Python **3.12 고정**(libewf-python 휠), `pytsk3`·`libewf-python` 필요.
-테스트 이미지는 저장소에 없다 — `tools/make_test_image.py` 로 생성하며 **WSL(Ubuntu)** 이 필요하다.
+**환경 제약**: 이미지 입력은 Python **3.12 고정**(libewf-python 휠), `pytsk3`·`libewf-python` 필요 (BitLocker 이미지는 `dissect.fve` 도).
+폴더 입력은 표준 라이브러리만으로 돈다(0.3.12).
 
 **알려진 미해결**(팀 확인 대기): ① 분석표의 E03-04 재시도 기술이 표본과 불일치 ②
-시나리오 표 로그인 01:27:25 vs 앱 로그 01:10:46 ③ 계정 전환 26초 차. `CLAUDE.md` 8절 참조.
+시나리오 표 로그인 01:27:25 vs 앱 로그 01:10:46 ③ 계정 전환 26초 차.
 
 **출력물 취급**: 결과 JSON 에는 대화 원문·프롬프트·계정 UUID 가 평문으로 들어간다(토큰 값은 마스킹).
 사건 자료와 동일하게 취급할 것.
@@ -49,6 +50,7 @@ result = pipeline.run(path, input_type="auto", kinds=pipeline.DEFAULT_KINDS,
 |---|---|
 | E01 읽기 | libewf (`libewf-python` → `import pyewf`) |
 | RAW/분할 RAW 읽기, 파티션, NTFS | The Sleuth Kit (`pytsk3`) |
+| BitLocker 볼륨 해제 | `dissect.fve` (BitLocker 이미지일 때만 불러온다) |
 
 `libewf-python` 의 Windows 휠이 **Python 3.10~3.12** 만 있으므로 3.12 가상환경을 권장한다.
 
@@ -58,16 +60,22 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 .venv/Scripts/python.exe run_parser.py --input <image.E01|image.dd|추출폴더> --out-dir out
 ```
 
+팀 저장소에서는 따로 만들지 않고 `../integration/setup.ps1` 이 만드는 `integration/.venv312` 를 쓴다.
+`run_parser.py` 대신 이 폴더에서 `python -m cxparser` 로 실행해도 같다.
+
 | 옵션 | 설명 |
 |---|---|
 | `--input, -i` | E01(분할 `.E01/.E02…` 포함) / RAW `.dd` `.raw`(분할 `.001` 포함) / 추출 디렉터리 |
 | `--input-type` | `auto`(기본) / `image` / `dir` |
 | `--out-dir, -o` | 결과 폴더 (기본 `cx_out`) |
 | `--format` | `csv`(기본, 팀 공통 CSV 2종) / `json`(cx_result.json 전체 레코드) / `both` |
-| `--kinds` | `rollout,rollout_loose,session_index,global_state,auth,sqlite` 중 선택 |
+| `--kinds` | `rollout,rollout_loose,session_index,global_state,auth,sqlite,prefetch,recent_lnk,webcache` 중 선택 (기본 전체) |
 | `--no-usn` | `$UsnJrnl:$J` 파싱 생략 (기본: 이미지 입력이면 파싱) |
 | `--usn-max-bytes` | `$J` 에서 읽을 최대 바이트 (기본 전체) |
 | `--max-excerpt` | 근거 발췌 최대 문자 수 (기본 500) |
+| `--key-material` | BitLocker 볼륨의 키: `recovery:<48자리 복구 키>` / `passphrase:<암호>` / `bek:<.BEK 경로>` / `fvek:<hex>`. 일시 중단·활성화 대기(clear key) 상태는 키 없이 풀린다. 환경변수 `ERELM_KEY_MATERIAL` 로 줘도 된다 |
+| `--overwrite` | 출력 폴더에 기존 결과 파일이 있어도 덮어쓴다 (기본: 거부, 종료코드 2) |
+| `--quiet` | 콘솔 요약 생략 |
 
 출력 파일
 
@@ -99,6 +107,14 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
 타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.15 (2026-10-04): 채팅 모드 첨부 업로드 행의 `Behavior_details` 가 파일명 대신 대화 제목으로 찍히던 문제 수정(`output.py` 의 내용 우선순위에서 파일명을 제목 앞으로). 첨부가 여러 개면 7열이 모두 같은 행이 되어 통합기가 한 행으로 합치던 것도 함께 해결된다. 대화 제목은 `Artifact_details` 에 그대로 남는다. 채팅 모드 첨부가 없는 이미지(삭제 제외)의 출력은 0.3.14 와 동일.
+
+0.3.14 (2026-10-04, 앱 26.928 대응 — `WHS_project_FINAL.E01`, 실험 2026-10-02): 채팅 모드 대화 응답의 주소와 형식이 바뀌어 대화·프롬프트가 0건이던 문제 수정(`webcache_conv.py`). 새 앱은 `conversations/<id>?num_turns=…`(복수형 + 쿼리)로 받고 본문이 `mapping`(트리) 대신 `messages`(목록)다. 주소 패턴을 넓히고 목록을 기존 mapping 형태로 바꿔 넘겨, 대화 생성·프롬프트·첨부 업로드·대화 복원 규칙을 그대로 쓴다. 이 이미지의 정답 9건 대조: 일치 4 → 8 (새 대화 생성 11:44:21, 첨부 2개 프롬프트 11:44:28, 프롬프트 11:45:09 · 11:46:36), 복원 메시지 0 → 6. 설치만 부분(패키지 폴더 생성 11:27:19 vs 시트의 다운로드 완료 11:35:30). 대화 목록 응답과 `~/.codex/sqlite/codex-dev.db` 의 `local_thread_catalog` 는 계정의 서버 대화 목록(다른 기기에서 만든 대화 포함)이라 행위 근거로 쓰지 않는다. 이전 형식 이미지(삭제 제외)의 출력은 0.3.13 과 동일.
+
+0.3.13 (2026-10-04, BitLocker 볼륨 지원 — 팀 Claude Web 파서 `image/volumes.py` 의 방식을 옮김): 파티션 선두가 `-FVE-FS-` 면 `dissect.fve` 로 풀고, 복호화 스트림을 TSK 이미지로 노출해 그 위에 NTFS 를 그대로 읽는다(`bitlocker.py`, `vfs.py`). 해제 순서는 복호화 완료 상태 → clear key(일시 중단·장치 암호화 활성화 대기, 키 불필요) → `--key-material` 로 받은 키. 풀지 못하면 `VOLUME_LOCKED`(종료코드 2)로 끝나고 볼륨의 보호기 종류를 알려 준다 — 복구 파티션 같은 평문 NTFS 만 읽고 "앱 미사용"으로 결론 내리지 않기 위해서다. 키 값은 결과·로그에 남기지 않고, 볼륨 정보(`filesystem.volumes[].encryption` / `unlock_method`)에 해제 방법 이름만 남긴다. `dissect.fve` 의 AES-XTS 복호화는 약 5MB/s 인데 이 파서는 이미지 하나에서 3GB 쯤 읽으므로(미할당 MFT 엔트리·USN) 섹터 묶음 단위 복호화로 바꿔 끼웠다(같은 결과, 약 160MB/s). 검증: `dissect.fve` 공개 테스트 볼륨(일시 중단·암호·복구 키·복호화 완료)에서 해제와 복호화 내용 일치, 삭제 제외 이미지의 NTFS 볼륨을 해제 경로(볼륨 기준 이미지)로 읽혀 출력이 이전과 동일. **파일시스템이 온전한 실제 BitLocker 이미지로는 아직 검증하지 못했다**(공개 테스트 볼륨은 부트 영역만 남긴 것이라 NTFS 로 읽히지 않는다). 암호화되지 않은 이미지의 출력은 0.3.12 와 동일.
+
+0.3.12 (2026-10-03, Autopsy add-on 을 설정 없이 배포하기 위한 변경): 폴더 입력은 **표준 라이브러리만으로 실행**된다. pytsk3·libewf-python 은 이미지 입력일 때만 불러오고(`pipeline.py`, `vfs.py`), 없는 환경에서 이미지를 주면 `UNSUPPORTED_FORMAT` 으로 알린다. brotli·zstandard 는 이전처럼 선택(없으면 웹 캐시 압축 구간만 건너뜀). 출력은 0.3.11 과 동일. 폴더 입력은 확장 길이 경로 접두를 붙여 읽어, Windows 기본 설정(LongPathsEnabled=0)에서도 260자를 넘는 추출 경로를 놓치지 않는다.
+
 0.3.11 (2026-10-03, Autopsy thin adapter PoC — PL 'DFIR 생태계 확장' 문서 기준): 폴더 입력에서 호스트 DFIR 도구가 넘긴 메타데이터를 근거로 쓴다. 추출 폴더 루트에 `_host_metadata.json`(경로별 MFT 시각·레코드 번호, 꺼내지 않은 폴더·바로가기 대상 파일의 시각·크기·첫 8바이트)이 있으면 `DirectoryVfs` 가 읽어 설치(패키지 폴더 생성 시각)·다운로드(바로가기 대상 생성 시각)·MFT 근거를 이미지 입력과 같게 만든다 — 이미지를 다시 읽지 않는다(`vfs.py`, `recent_lnk.py`, `package_install.py`, 약 60줄). 파일이 없으면 이전 폴더 입력과 출력이 동일. 버그 수정: 같은 경로의 **삭제된 옛 `-wal`/캐시 조각이 현존 파일을 덮어쓰던 문제**(이미지 입력에서 logs_2.sqlite 가 옛 WAL 과 짝지어져 최신 트랜잭션이 빠짐) — 현존 파일 우선. 삭제 제외 이미지에서 마지막 프로세스 구간이 14:09:05~14:14:51 → 14:09:34~14:15:23 로 바뀌고(WAL 반영), 정답지 대조는 12/2/5 그대로.
 
 0.3.10 (2026-09-29, PL QA 프레임 적용 — Digital Corpora NPS 이미지로 robustness 확인): Codex 아티팩트가 하나도 없는 이미지는 오류(exit 2)가 아니라 0행 timeline/recovered CSV + 경고(exit 0)로 끝난다. 통합 실행기가 negative control 이미지를 '파서 실패'로 집계하던 문제 해소. 이미지 자체를 못 여는 경우(IMAGE_OPEN_FAILED, UNSUPPORTED_FORMAT)는 그대로 exit 2.
@@ -111,7 +127,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 `Users/*/AppData/Local/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
 `Program Files/WindowsApps/OpenAI.Codex_*`, `ProgramData/Packages/OpenAI.Codex_2p2nqsd0c76g0`,
 `Windows/Prefetch`, `Users/*/AppData/Roaming/Microsoft/Windows/Recent`.
-위 표 이외 파일(SQLite, 채팅창 Chromium 저장소, Helium 하이브 등)은
+위 표 이외 파일(나머지 SQLite, HTTP 캐시 이외의 채팅창 Chromium 저장소, Helium 하이브 등)은
 **발견 목록(`artifact_inventory`)에만 기록**하고 아직 파싱하지 않는다.
 
 ## 3. 출력 레코드 구조
@@ -203,6 +219,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `IMAGE_OPEN_FAILED` | 이미지 없음/권한, E01 열기 실패, **E01 첫·끝 섹터 읽기 실패(절단/손상)** |
 | `SEGMENT_MISSING` | E01 확장자 결번(.E01 .E02 .E04), **마지막 E01 세그먼트 누락**(마지막 파일이 `next` 섹션으로 끝남), 분할 RAW 중간 결번 |
 | `UNSUPPORTED_FORMAT` | EWF2(.Ex01), L01, VMDK/VHD/QCOW, 판독 가능한 NTFS 볼륨 없음 |
+| `VOLUME_LOCKED` | BitLocker 볼륨을 하나도 풀지 못함 (키 없음·키 틀림·`dissect.fve` 미설치). `context.volumes[].protectors` 에 그 볼륨이 받는 키 종류 |
 | (경고) 아티팩트 0건 | 이미지는 읽혔으나 Codex 경로 0건. 0.3.10부터 오류가 아니라 **0행 결과 + 경고**로 끝난다(종료코드 0). 앱을 쓰지 않은 음성 대조(negative control) 이미지에서 '없음'이 정상 결과이기 때문. `ARTIFACT_NOT_FOUND` 코드는 라이브러리 사용 시에만 남아 있다 |
 | 레코드 단위 | `JSON_DECODE_ERROR`, `READ_FAILED` 등 → 해당 레코드만 `status:error`, 같은 파일의 나머지 라인은 계속 파싱 |
 
@@ -216,53 +233,67 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 - 이미지: EWF v1 `.E01`(분할 `.E02…/.EAA…`) — libewf / RAW `.dd/.raw/.img`, 분할 RAW `.001…` — TSK
 - 파티션: TSK 가 판독하는 MBR/GPT, 파티션 테이블 없는 볼륨 이미지
 - 파일시스템: **NTFS 만** (TSK). 다른 FS 파티션은 `skipped_partitions` 에 사유와 함께 기록
+- BitLocker 볼륨: clear key(일시 중단·활성화 대기)·복호화 완료 상태는 키 없이, 그 외는 `--key-material` 로 (0.3.13)
 - 삭제 파일: ① 디렉터리 인덱스에 남은 삭제 이름 ② 인덱스에서도 지워진 경우
   미할당 MFT 엔트리의 `$FILE_NAME` 부모 참조(MFT#+seq)가 탐색 디렉터리와 일치하면 경로 복원
   (`allocated:false`, `path_source` 기재)
 
 **미지원 / 한계**
 
-- EWF2(`.Ex01`), L01, VMDK/VHD/QCOW, BitLocker 등 암호화 볼륨
+- EWF2(`.Ex01`), L01, VMDK/VHD/QCOW, BitLocker 이외의 암호화 볼륨, TPM 만으로 보호된 BitLocker(복구 키 없이는 풀 수 없다)
 - FAT/exFAT/ReFS
 - 부모 디렉터리까지 삭제·재할당된 파일은 경로 복원 불가 / 클러스터가 덮어써진 삭제 파일은 내용 불일치 가능
 - 파일 카빙(미할당 영역 스캔) 미구현
-- 채팅창 Chromium 저장소(IndexedDB/Cache), `SystemAppData\Helium\User.dat`, `$LogFile` → 범위 밖
+- 채팅창 Chromium 저장소 중 HTTP 캐시 이외(IndexedDB 등), `SystemAppData\Helium\User.dat`, `$LogFile` → 범위 밖
 - `~/.codex` 의 나머지 SQLite(goals/memories/queue)는 발견 목록에만 기록
 - USN 레코드에는 **경로가 없다** — 이름·부모 MFT# 만 있어 동명 파일 가능성을 배제 못 하므로 최대 `추정`.
   저널은 오래된 기록부터 잘리므로 "USN 에 없음 = 행위 없음"이 아니다.
 
-## 6. 테스트
+## 6. 테스트·검증
 
-```bash
-.venv/Scripts/python.exe tools/make_test_image.py      # tests/data 생성 (WSL Ubuntu 필요, sudo 불필요)
-.venv/Scripts/python.exe -m unittest discover -s tests -v
+이 저장소에는 파서 소스만 있다. 개발 때 쓰던 단위 테스트(`tests/`), 테스트 이미지 생성 도구(`tools/`),
+분석표 대조 결과(`verification/`)는 포함되어 있지 않다. 0절의 "합성 테스트 43건"은 그 테스트의 결과다.
+
+저장소 안에서 할 수 있는 검증은 통합 실행기의 정답지 대조다 (`integration/` 에서 실행, 정답 시트가 있는 실험 이미지 전용).
+
+```powershell
+python llm_forensic.py -i <이미지> -o out --only chatgpt_desktop
+python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --key validation\scenario_keys\plain_nodelete_2026-09-23.csv
 ```
 
-- 테스트 이미지는 WSL 에서 **실제 도구**로 만든다: `mkntfs`/`ntfs-3g` 로 NTFS(MBR) 작성,
-  rollout 1개 삭제, `ewfacquire` 로 E01(단일 압축 / 1MiB 6분할), `split` 으로 분할 RAW.
-  (`ntfs-3g` 는 `apt-get download` + `dpkg -x` 로 사용자 폴더에 풀어 쓰고,
-  사용자 네임스페이스에서 mount 한다.)
-- 42개 테스트: DD↔E01↔분할E01↔분할RAW 결과 동일성, 필수 3항목, 라인번호·ordinal·MFT·$SI/$FN 근거,
-  자동 주입 user 문맥 제외, 채팅→작업 인계 추정, 상태 라인 집계·미관찰 라인 보존, 중첩 prompt-history,
-  분기 파일 E03-03, 깨진 JSON 라인 격리, 비상주 `$DATA`, 삭제 rollout 복구·표시,
-  탐색 범위 제한, 토큰 미출력, 타임라인 정렬/시각미상 분리, `--kinds`, 디렉터리 입력,
-  예외(경로 없음·VMDK·EWF2·E01 중간/마지막 세그먼트 누락·분할 RAW 결번·E01 절단·FS 없음·아티팩트 없음).
-
-> **검증 상태(중요)**: 이미지 컨테이너(NTFS·E01)는 실제 도구로 만들었지만
-> **파일 내용은 합성**이다(라인·키 구조만 실제 폴더 표본에 맞춤). 실제 폴더 표본으로
-> 필드 매핑은 반영했지만, 실제 앱 E01/DD 이미지 검증과 분석표 원문 1:1 대조는 남아 있다.
+정답지의 `chatgpt-desktop` 행과 ±120초 창으로 대조해 일치 / 부분 차이 / 불일치를 `verify_report.md` 로 낸다.
+폴더 입력 경로는 Autopsy add-on(`../Autopsy_Addon`)이 쓰며, 같은 이미지에서 이미지 입력과 결과가 같은지로 확인한다.
 
 ## 7. 소스 구성
 
 ```
+run_parser.py          어디서든 실행할 수 있는 런처 (cxparser.cli.main 호출)
+requirements.txt       pytsk3, libewf-python, dissect.fve — 이미지 입력일 때만 필요
 cxparser/
-  image.py     E01(pyewf)/RAW(pytsk3) 열기, 세그먼트 누락·절단 검사
-  vfs.py       TSK NTFS 탐색(SCAN_ROOTS, 삭제 파일 경로 복원) / 추출 디렉터리
-  artifacts/   rollout.py(주기능)  session_index.py  global_state.py  auth.py  jsontree.py
-  locate.py  model.py  timeline.py  output.py  pipeline.py  cli.py  events.py  util.py  errors.py
-tools/make_test_image.py(.sh)   tests/test_parser.py   run_parser.py   requirements.txt
-  usn.py       $Extend/$UsnJrnl:$J — Codex 아티팩트 이름 기준 변경 기록
-  artifacts/sqlitedb.py           state_5 / thread_history_1 / logs_2 SQLite
-tools/verify_sheet.py           대조 도구 — 폴더 표본은 `--snap`, 이미지는 `--image --scenario marker|plain`
-verification/                   대조 결과 (sheet_check.md, e01_IMG_MRK_VER.md, scenario_check_*.md)
+  cli.py               명령행 인자, 덮어쓰기 보호, 종료코드 (__main__.py: python -m cxparser)
+  pipeline.py          입력 열기 → 탐색 → 파싱 → 파생 규칙 → 타임라인. 버전 상수
+  image.py             E01(pyewf)/RAW(pytsk3) 열기, 세그먼트 누락·절단 검사
+  vfs.py               TSK NTFS 탐색(삭제 파일 경로 복원) / 추출 디렉터리(+ _host_metadata.json)
+  bitlocker.py         BitLocker 볼륨 해제(dissect.fve) → 복호화 스트림을 TSK 이미지로. 자체 점검: python -m cxparser.bitlocker
+  locate.py            탐색 디렉터리(SCAN_ROOTS), 경로 → kind 분류
+  usn.py               $Extend/$UsnJrnl:$J — Codex 아티팩트 이름 기준 변경 기록
+  derive.py            파생 규칙 — 레코드 간 대조로 로그인·계정 전환·첨부 업로드
+  events.py            행위 카탈로그 (E01-01 …)
+  model.py             정규화 레코드 — 시각·사용자 행위·근거 3항목
+  timeline.py          시각순 정렬, 시각 미상 분리
+  output.py            cx_result.json + 팀 공통 CSV 2종, 타임라인 정리 규칙
+  util.py              시각 해석, 발췌, 민감정보 마스킹
+  errors.py            오류 분류
+  artifacts/
+    rollout.py           sessions/…/rollout-*.jsonl (주기능)
+    session_index.py     session_index.jsonl
+    global_state.py      .codex-global-state.json
+    auth.py              auth.json (토큰 값 미출력)
+    sqlitedb.py          state_5 / thread_history_1 / logs_2 SQLite
+    webcache.py          채팅창 HTTP 캐시 — Chrome Blockfile Cache Reader
+    webcache_conv.py     캐시 안 ChatGPT API 응답 → 채팅 모드 행위·대화
+    prefetch.py          CODEX.EXE-*.pf 실행 기록
+    recent_lnk.py        최근 항목 바로가기 → 다운로드
+    package_install.py   패키지 폴더 생성 시각 → 설치
+    jsontree.py          JSON 키 재귀 탐색, JSON Pointer
 ```

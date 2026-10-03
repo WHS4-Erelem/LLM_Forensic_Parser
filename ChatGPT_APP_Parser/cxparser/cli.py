@@ -12,6 +12,9 @@ from . import output, pipeline
 from .errors import CxError
 
 
+KEY_ENV = "ERELM_KEY_MATERIAL"   # BitLocker 키를 받는 환경변수 (팀 파서 공용으로 쓸 수 있게 파서 이름을 넣지 않았다)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="cxparser",
@@ -32,6 +35,10 @@ def build_parser():
                    help="$UsnJrnl:$J 파싱 생략 (이미지 입력일 때만 해당)")
     p.add_argument("--usn-max-bytes", type=int, default=None,
                    help="$J 에서 읽을 최대 바이트 (기본: 전체)")
+    p.add_argument("--key-material", default=os.environ.get(KEY_ENV),
+                   help="BitLocker 볼륨의 키: recovery:<48자리 복구 키> | passphrase:<암호> | bek:<.BEK 경로> | "
+                        "fvek:<hex>. 일시 중단·활성화 대기 상태는 키 없이 풀린다. "
+                        "환경변수 %s 로 줘도 된다 (명령행 기록에 남기지 않을 때)" % KEY_ENV)
     p.add_argument("--overwrite", action="store_true",
                    help="출력 폴더에 기존 결과 파일이 있어도 덮어쓴다 (기본: 거부, 종료코드 2)")
     p.add_argument("--quiet", action="store_true")
@@ -54,7 +61,7 @@ def main(argv=None):
     try:
         result = pipeline.run(args.input, input_type=args.input_type, kinds=kinds,
                               max_excerpt=args.max_excerpt, usn=not args.no_usn,
-                              usn_max_bytes=args.usn_max_bytes)
+                              usn_max_bytes=args.usn_max_bytes, key_material=args.key_material)
     except CxError as exc:
         payload = {"status": "failed", **exc.to_dict()}
         print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)

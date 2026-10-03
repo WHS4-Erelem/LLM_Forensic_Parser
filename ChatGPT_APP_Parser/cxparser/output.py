@@ -32,8 +32,9 @@ _ROLE = {"user": "user", "assistant": "assistant",
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
         "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache", "package_dir": "PackageDir",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
-# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
-_CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")
+# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위).
+# file_name 이 title 보다 앞: 채팅 모드 첨부 업로드 레코드는 대화 제목도 갖고 있어, 제목이 앞서면 파일명이 가려지고 첨부 여러 개가 같은 행이 된다
+_CORE_KEYS = ("text", "prompt_text", "file_name", "title", "model_slug", "key", "log_body")
 
 
 def write_json(path, payload):
