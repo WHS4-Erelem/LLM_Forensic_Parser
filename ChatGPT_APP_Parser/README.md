@@ -33,7 +33,7 @@ result = pipeline.run(path, input_type="auto", kinds=pipeline.DEFAULT_KINDS,
 미검증: 삭제 파일 복구·분할 RAW 는 실제 표본에 대상이 없었다.
 테스트 코드·테스트 이미지 생성 도구·대조 결과 문서는 이 저장소에 없다(6절).
 
-**환경 제약**: 이미지 입력은 Python **3.12 고정**(libewf-python 휠), `pytsk3`·`libewf-python` 필요.
+**환경 제약**: 이미지 입력은 Python **3.12 고정**(libewf-python 휠), `pytsk3`·`libewf-python` 필요 (BitLocker 이미지는 `dissect.fve` 도).
 폴더 입력은 표준 라이브러리만으로 돈다(0.3.12).
 
 **알려진 미해결**(팀 확인 대기): ① 분석표의 E03-04 재시도 기술이 표본과 불일치 ②
@@ -50,6 +50,7 @@ result = pipeline.run(path, input_type="auto", kinds=pipeline.DEFAULT_KINDS,
 |---|---|
 | E01 읽기 | libewf (`libewf-python` → `import pyewf`) |
 | RAW/분할 RAW 읽기, 파티션, NTFS | The Sleuth Kit (`pytsk3`) |
+| BitLocker 볼륨 해제 | `dissect.fve` (BitLocker 이미지일 때만 불러온다) |
 
 `libewf-python` 의 Windows 휠이 **Python 3.10~3.12** 만 있으므로 3.12 가상환경을 권장한다.
 
@@ -72,6 +73,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `--no-usn` | `$UsnJrnl:$J` 파싱 생략 (기본: 이미지 입력이면 파싱) |
 | `--usn-max-bytes` | `$J` 에서 읽을 최대 바이트 (기본 전체) |
 | `--max-excerpt` | 근거 발췌 최대 문자 수 (기본 500) |
+| `--key-material` | BitLocker 볼륨의 키: `recovery:<48자리 복구 키>` / `passphrase:<암호>` / `bek:<.BEK 경로>` / `fvek:<hex>`. 일시 중단·활성화 대기(clear key) 상태는 키 없이 풀린다. 환경변수 `ERELM_KEY_MATERIAL` 로 줘도 된다 |
 | `--overwrite` | 출력 폴더에 기존 결과 파일이 있어도 덮어쓴다 (기본: 거부, 종료코드 2) |
 | `--quiet` | 콘솔 요약 생략 |
 
@@ -105,6 +107,8 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
 타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.13 (2026-10-04, BitLocker 볼륨 지원 — 팀 Claude Web 파서 `image/volumes.py` 의 방식을 옮김): 파티션 선두가 `-FVE-FS-` 면 `dissect.fve` 로 풀고, 복호화 스트림을 TSK 이미지로 노출해 그 위에 NTFS 를 그대로 읽는다(`bitlocker.py`, `vfs.py`). 해제 순서는 복호화 완료 상태 → clear key(일시 중단·장치 암호화 활성화 대기, 키 불필요) → `--key-material` 로 받은 키. 풀지 못하면 `VOLUME_LOCKED`(종료코드 2)로 끝나고 볼륨의 보호기 종류를 알려 준다 — 복구 파티션 같은 평문 NTFS 만 읽고 "앱 미사용"으로 결론 내리지 않기 위해서다. 키 값은 결과·로그에 남기지 않고, 볼륨 정보(`filesystem.volumes[].encryption` / `unlock_method`)에 해제 방법 이름만 남긴다. `dissect.fve` 의 AES-XTS 복호화는 약 5MB/s 인데 이 파서는 이미지 하나에서 3GB 쯤 읽으므로(미할당 MFT 엔트리·USN) 섹터 묶음 단위 복호화로 바꿔 끼웠다(같은 결과, 약 160MB/s). 검증: `dissect.fve` 공개 테스트 볼륨(일시 중단·암호·복구 키·복호화 완료)에서 해제와 복호화 내용 일치, 삭제 제외 이미지의 NTFS 볼륨을 해제 경로(볼륨 기준 이미지)로 읽혀 출력이 이전과 동일. **파일시스템이 온전한 실제 BitLocker 이미지로는 아직 검증하지 못했다**(공개 테스트 볼륨은 부트 영역만 남긴 것이라 NTFS 로 읽히지 않는다). 암호화되지 않은 이미지의 출력은 0.3.12 와 동일.
+
 0.3.12 (2026-10-03, Autopsy add-on 을 설정 없이 배포하기 위한 변경): 폴더 입력은 **표준 라이브러리만으로 실행**된다. pytsk3·libewf-python 은 이미지 입력일 때만 불러오고(`pipeline.py`, `vfs.py`), 없는 환경에서 이미지를 주면 `UNSUPPORTED_FORMAT` 으로 알린다. brotli·zstandard 는 이전처럼 선택(없으면 웹 캐시 압축 구간만 건너뜀). 출력은 0.3.11 과 동일. 폴더 입력은 확장 길이 경로 접두를 붙여 읽어, Windows 기본 설정(LongPathsEnabled=0)에서도 260자를 넘는 추출 경로를 놓치지 않는다.
 
 0.3.11 (2026-10-03, Autopsy thin adapter PoC — PL 'DFIR 생태계 확장' 문서 기준): 폴더 입력에서 호스트 DFIR 도구가 넘긴 메타데이터를 근거로 쓴다. 추출 폴더 루트에 `_host_metadata.json`(경로별 MFT 시각·레코드 번호, 꺼내지 않은 폴더·바로가기 대상 파일의 시각·크기·첫 8바이트)이 있으면 `DirectoryVfs` 가 읽어 설치(패키지 폴더 생성 시각)·다운로드(바로가기 대상 생성 시각)·MFT 근거를 이미지 입력과 같게 만든다 — 이미지를 다시 읽지 않는다(`vfs.py`, `recent_lnk.py`, `package_install.py`, 약 60줄). 파일이 없으면 이전 폴더 입력과 출력이 동일. 버그 수정: 같은 경로의 **삭제된 옛 `-wal`/캐시 조각이 현존 파일을 덮어쓰던 문제**(이미지 입력에서 logs_2.sqlite 가 옛 WAL 과 짝지어져 최신 트랜잭션이 빠짐) — 현존 파일 우선. 삭제 제외 이미지에서 마지막 프로세스 구간이 14:09:05~14:14:51 → 14:09:34~14:15:23 로 바뀌고(WAL 반영), 정답지 대조는 12/2/5 그대로.
@@ -211,6 +215,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `IMAGE_OPEN_FAILED` | 이미지 없음/권한, E01 열기 실패, **E01 첫·끝 섹터 읽기 실패(절단/손상)** |
 | `SEGMENT_MISSING` | E01 확장자 결번(.E01 .E02 .E04), **마지막 E01 세그먼트 누락**(마지막 파일이 `next` 섹션으로 끝남), 분할 RAW 중간 결번 |
 | `UNSUPPORTED_FORMAT` | EWF2(.Ex01), L01, VMDK/VHD/QCOW, 판독 가능한 NTFS 볼륨 없음 |
+| `VOLUME_LOCKED` | BitLocker 볼륨을 하나도 풀지 못함 (키 없음·키 틀림·`dissect.fve` 미설치). `context.volumes[].protectors` 에 그 볼륨이 받는 키 종류 |
 | (경고) 아티팩트 0건 | 이미지는 읽혔으나 Codex 경로 0건. 0.3.10부터 오류가 아니라 **0행 결과 + 경고**로 끝난다(종료코드 0). 앱을 쓰지 않은 음성 대조(negative control) 이미지에서 '없음'이 정상 결과이기 때문. `ARTIFACT_NOT_FOUND` 코드는 라이브러리 사용 시에만 남아 있다 |
 | 레코드 단위 | `JSON_DECODE_ERROR`, `READ_FAILED` 등 → 해당 레코드만 `status:error`, 같은 파일의 나머지 라인은 계속 파싱 |
 
@@ -224,13 +229,14 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 - 이미지: EWF v1 `.E01`(분할 `.E02…/.EAA…`) — libewf / RAW `.dd/.raw/.img`, 분할 RAW `.001…` — TSK
 - 파티션: TSK 가 판독하는 MBR/GPT, 파티션 테이블 없는 볼륨 이미지
 - 파일시스템: **NTFS 만** (TSK). 다른 FS 파티션은 `skipped_partitions` 에 사유와 함께 기록
+- BitLocker 볼륨: clear key(일시 중단·활성화 대기)·복호화 완료 상태는 키 없이, 그 외는 `--key-material` 로 (0.3.13)
 - 삭제 파일: ① 디렉터리 인덱스에 남은 삭제 이름 ② 인덱스에서도 지워진 경우
   미할당 MFT 엔트리의 `$FILE_NAME` 부모 참조(MFT#+seq)가 탐색 디렉터리와 일치하면 경로 복원
   (`allocated:false`, `path_source` 기재)
 
 **미지원 / 한계**
 
-- EWF2(`.Ex01`), L01, VMDK/VHD/QCOW, BitLocker 등 암호화 볼륨
+- EWF2(`.Ex01`), L01, VMDK/VHD/QCOW, BitLocker 이외의 암호화 볼륨, TPM 만으로 보호된 BitLocker(복구 키 없이는 풀 수 없다)
 - FAT/exFAT/ReFS
 - 부모 디렉터리까지 삭제·재할당된 파일은 경로 복원 불가 / 클러스터가 덮어써진 삭제 파일은 내용 불일치 가능
 - 파일 카빙(미할당 영역 스캔) 미구현
@@ -258,12 +264,13 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 
 ```
 run_parser.py          어디서든 실행할 수 있는 런처 (cxparser.cli.main 호출)
-requirements.txt       pytsk3, libewf-python — 이미지 입력일 때만 필요
+requirements.txt       pytsk3, libewf-python, dissect.fve — 이미지 입력일 때만 필요
 cxparser/
   cli.py               명령행 인자, 덮어쓰기 보호, 종료코드 (__main__.py: python -m cxparser)
   pipeline.py          입력 열기 → 탐색 → 파싱 → 파생 규칙 → 타임라인. 버전 상수
   image.py             E01(pyewf)/RAW(pytsk3) 열기, 세그먼트 누락·절단 검사
   vfs.py               TSK NTFS 탐색(삭제 파일 경로 복원) / 추출 디렉터리(+ _host_metadata.json)
+  bitlocker.py         BitLocker 볼륨 해제(dissect.fve) → 복호화 스트림을 TSK 이미지로. 자체 점검: python -m cxparser.bitlocker
   locate.py            탐색 디렉터리(SCAN_ROOTS), 경로 → kind 분류
   usn.py               $Extend/$UsnJrnl:$J — Codex 아티팩트 이름 기준 변경 기록
   derive.py            파생 규칙 — 레코드 간 대조로 로그인·계정 전환·첨부 업로드

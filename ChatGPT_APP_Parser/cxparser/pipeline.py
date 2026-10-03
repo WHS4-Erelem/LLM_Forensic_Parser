@@ -38,7 +38,7 @@ class Result(dict):
 
 
 def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
-        max_file_bytes=64 * 1024 * 1024, usn=True, usn_max_bytes=None):
+        max_file_bytes=64 * 1024 * 1024, usn=True, usn_max_bytes=None, key_material=None):
     started = time.time()
     warnings = []
     errors = []
@@ -63,8 +63,11 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         img = open_image(input_path)
         image_desc = img.describe()
         warnings.extend(image_desc.pop("warnings"))
-        vfs = TskImageVfs(img)
+        vfs = TskImageVfs(img, key_material=key_material)
         fs_desc = vfs.describe()
+        if vfs.locked:
+            warnings.append("BitLocker 볼륨 %d개는 풀지 못해 분석하지 않았습니다 (오프셋 %s)"
+                            % (len(vfs.locked), ", ".join(str(v["offset_bytes"]) for v in vfs.locked)))
 
     # --- 2. 아티팩트 탐색 --------------------------------------------
     targets = []
@@ -173,7 +176,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.12",
+        "tool": {"name": "cxparser", "version": "0.3.13",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

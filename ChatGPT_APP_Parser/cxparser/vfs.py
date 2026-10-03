@@ -12,7 +12,7 @@ try:
 except ImportError:      # 폴더 입력만 쓸 때는 없어도 된다 (호스트 DFIR 도구가 파일을 꺼내 주는 경우)
     pytsk3 = None
 
-from .errors import FilesystemError, UnsupportedFormatError
+from .errors import FilesystemError, UnsupportedFormatError, VolumeLockedError
 from .locate import SCAN_ROOTS
 
 READ_CHUNK = 1024 * 1024
@@ -75,10 +75,13 @@ class VfsFile:
 class TskImageVfs:
     """디스크 이미지의 NTFS 볼륨에서 SCAN_ROOTS 하위 파일을 열거 (삭제 엔트리 포함)."""
 
-    def __init__(self, image):
+    def __init__(self, image, key_material=None):
+        from . import bitlocker            # 이미지 입력일 때만 (pytsk3 필요)
         img = image.img
         self.volumes = []      # [(volume_desc, FS_Info)]
         self.skipped = []
+        self.locked = []       # 풀지 못한 BitLocker 볼륨 (skipped 에도 들어간다)
+        self._plain_images = []   # 복호화 이미지 — FS_Info 가 쓰는 동안 살아 있어야 한다
         try:
             vs = pytsk3.Volume_Info(img)
             bs = vs.info.block_size
@@ -91,11 +94,23 @@ class TskImageVfs:
         for idx, (off, length, desc, scheme) in enumerate(parts):
             vd = {"index": idx, "scheme": scheme, "offset_bytes": off,
                   "length_bytes": length, "type": desc}
+            fs_img, fs_off = img, off
+            if bitlocker.is_bitlocker(img, off):
+                vd["encryption"] = "BitLocker"
+                try:
+                    fs_img, vd["unlock_method"] = bitlocker.open_volume(img, off, length, key_material)
+                except VolumeLockedError as exc:
+                    self.locked.append({**vd, "reason": exc.message, **exc.context})
+                    self.skipped.append(self.locked[-1])
+                    continue
+                fs_off = 0
+                self._plain_images.append(fs_img)
             try:
-                fs = pytsk3.FS_Info(img, offset=off)
+                fs = pytsk3.FS_Info(fs_img, offset=fs_off)
             except TSK_ERRORS as exc:
-                self.skipped.append({**vd, "reason": "파일시스템 판독 불가: %s"
-                                     % str(exc).splitlines()[0][:200]})
+                self.skipped.append({**vd, "reason": "%s파일시스템 판독 불가: %s"
+                                     % ("BitLocker 해제 후 " if "unlock_method" in vd else "",
+                                        str(exc).splitlines()[0][:200])})
                 continue
             if int(fs.info.ftype) != int(pytsk3.TSK_FS_TYPE_NTFS):
                 self.skipped.append({**vd, "reason": "미지원 파일시스템: %s" % fs.info.ftype})
@@ -103,6 +118,10 @@ class TskImageVfs:
             vd.update(filesystem="NTFS", cluster_size=fs.info.block_size)
             self.volumes.append((vd, fs))
 
+        # ponytail: 잠긴 볼륨이 있는데 하나도 못 풀었으면 중단한다 — 복구 파티션 같은 평문 NTFS 만 읽고
+        # "앱 미사용" 으로 결론 내리는 것을 막기 위해서다. 평문 OS 볼륨 + 잠긴 데이터 볼륨 조합도 같이 막힌다 (키를 주면 풀림).
+        if self.locked and not any("unlock_method" in vd for vd, _fs in self.volumes):
+            raise VolumeLockedError(self.locked[0]["reason"], volumes=self.locked)
         if not self.volumes:
             raise UnsupportedFormatError(
                 "이미지에서 판독 가능한 NTFS 볼륨을 찾지 못했습니다",
