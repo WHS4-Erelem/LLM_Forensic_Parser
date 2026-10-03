@@ -2,6 +2,7 @@
 
 import fnmatch
 import hashlib
+import json
 import os
 import struct
 from datetime import datetime, timedelta, timezone
@@ -283,13 +284,32 @@ def _filetime(v):
     return _iso(datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=v // 10))
 
 
+HOST_META_NAME = "_host_metadata.json"
+
+
 class DirectoryVfs:
-    """추출된 파일 트리(개발/중간 테스트용). MFT 정보는 없음."""
+    """추출된 파일 트리. 파일만 있으면 MFT 정보가 없다.
+
+    호스트 DFIR 도구(Autopsy 등)가 파일을 꺼내 주면서 루트에 `_host_metadata.json` 을 같이 두면
+    그 도구가 이미 읽어 둔 파일시스템 메타데이터(MFT 시각·레코드 번호)를 근거로 쓴다 — 이미지를 다시 읽지 않는다.
+      {"provider": "...", "entries": {"<소문자 경로>": {"path", "times": {created, modified, mft_modified, accessed},
+                                                    "mft_record", "size", "dir", "head_hex"}}}
+    entries 에는 꺼내지 않은 항목(폴더, 바로가기 대상 파일)의 메타데이터도 들어올 수 있다 (host_stat 로 조회)."""
 
     def __init__(self, root):
         self.root = os.path.abspath(root)
         if not os.path.isdir(self.root):
             raise FilesystemError("디렉터리가 아닙니다", path=self.root)
+        self.host_provider, self.host_meta = None, {}
+        meta_path = os.path.join(self.root, HOST_META_NAME)
+        if os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.host_provider, self.host_meta = doc.get("provider"), doc.get("entries") or {}
+
+    def host_stat(self, path):
+        """'/Users/x/Downloads/f' → 호스트가 준 메타데이터 dict, 없으면 None."""
+        return self.host_meta.get(path.replace("\\", "/").lower())
 
     def iter_files(self):
         for dirpath, _dirs, files in os.walk(self.root):
@@ -300,12 +320,19 @@ class DirectoryVfs:
                 except OSError:
                     continue
                 rel = "/" + os.path.relpath(full, self.root).replace(os.sep, "/")
-                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=full)
+                if rel == "/" + HOST_META_NAME:
+                    continue
+                m = self.host_meta.get(rel.lower()) or {}
+                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=full,
+                              mft_record=m.get("mft_record"), si_times=m.get("times"))
 
     def _read_file(self, vfile):
         with open(vfile.native_path, "rb") as fh:
             return fh.read()
 
     def describe(self):
+        if self.host_meta:
+            return {"filesystem": "host-directory", "root": self.root, "host_metadata_provider": self.host_provider,
+                    "note": "호스트 DFIR 도구가 꺼낸 파일 트리 — MFT 근거는 호스트가 넘긴 %s" % HOST_META_NAME}
         return {"filesystem": "host-directory", "root": self.root,
                 "note": "디스크 이미지가 아닌 추출 파일 트리 — MFT 근거 없음"}

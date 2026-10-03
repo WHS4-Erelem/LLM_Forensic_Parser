@@ -55,10 +55,17 @@ def _open_target(vfile, win_path):
 
 
 def _target_info(vfile, win_path):
-    """대상 파일의 (MFT 생성 시각 ISO, 크기, 머리 바이트로 판별한 종류). 이미지(TSK)일 때만. 못 열면 (None, None, None)."""
+    """대상 파일의 (MFT 생성 시각 ISO, 크기, 머리 바이트로 판별한 종류). 이미지(TSK)면 직접 열고,
+    폴더 입력이면 호스트 도구가 넘긴 메타데이터(_host_metadata.json)를 쓴다. 둘 다 없으면 (None, None, None)."""
     f = _open_target(vfile, win_path)
     if f is None:
-        return None, None, None
+        host_stat = getattr(vfile._source, "host_stat", None)
+        m = host_stat(win_path[2:]) if host_stat and win_path and len(win_path) > 2 else None
+        if not m:
+            return None, None, None
+        head = bytes.fromhex(m.get("head_hex") or "")
+        return ((m.get("times") or {}).get("created"), m.get("size"),
+                next((k for magic, k in _MAGIC if head.startswith(magic)), "unknown" if head else None))
     meta = f.info.meta
     created = datetime.fromtimestamp(meta.crtime, tz=timezone.utc).isoformat().replace("+00:00", "Z") if meta.crtime else None
     kind = None
