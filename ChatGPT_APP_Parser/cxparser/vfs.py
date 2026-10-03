@@ -7,15 +7,18 @@ import os
 import struct
 from datetime import datetime, timedelta, timezone
 
-import pytsk3
+try:
+    import pytsk3
+except ImportError:      # 폴더 입력만 쓸 때는 없어도 된다 (호스트 DFIR 도구가 파일을 꺼내 주는 경우)
+    pytsk3 = None
 
 from .errors import FilesystemError, UnsupportedFormatError
 from .locate import SCAN_ROOTS
 
 READ_CHUNK = 1024 * 1024
 TSK_ERRORS = (OSError, RuntimeError)   # pytsk3 는 이미지 읽기 오류를 RuntimeError 로 감싸기도 한다
-DIR = int(pytsk3.TSK_FS_META_TYPE_DIR)
-REG = int(pytsk3.TSK_FS_META_TYPE_REG)
+DIR = int(pytsk3.TSK_FS_META_TYPE_DIR) if pytsk3 else None
+REG = int(pytsk3.TSK_FS_META_TYPE_REG) if pytsk3 else None
 
 
 class VfsFile:
@@ -311,23 +314,31 @@ class DirectoryVfs:
         """'/Users/x/Downloads/f' → 호스트가 준 메타데이터 dict, 없으면 None."""
         return self.host_meta.get(path.replace("\\", "/").lower())
 
+    @staticmethod
+    def _long(path):
+        """Windows 기본 설정(LongPathsEnabled=0)은 260자를 넘는 경로를 열지 못한다. 확장 길이 접두(\\\\?\\)를 붙이면
+        그 설정과 무관하게 열린다 — 사건 폴더가 깊은 곳에 있어도 추출 파일을 놓치지 않게."""
+        return "\\\\?\\" + path if os.name == "nt" and not path.startswith("\\\\") else path
+
     def iter_files(self):
-        for dirpath, _dirs, files in os.walk(self.root):
+        walk_root = self._long(self.root)
+        for dirpath, _dirs, files in os.walk(walk_root):
             for fn in files:
                 full = os.path.join(dirpath, fn)
                 try:
                     st = os.stat(full)
                 except OSError:
                     continue
-                rel = "/" + os.path.relpath(full, self.root).replace(os.sep, "/")
+                tail = os.path.relpath(full, walk_root)
+                rel = "/" + tail.replace(os.sep, "/")
                 if rel == "/" + HOST_META_NAME:
                     continue
                 m = self.host_meta.get(rel.lower()) or {}
-                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=full,
+                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=os.path.join(self.root, tail),
                               mft_record=m.get("mft_record"), si_times=m.get("times"))
 
     def _read_file(self, vfile):
-        with open(vfile.native_path, "rb") as fh:
+        with open(self._long(vfile.native_path), "rb") as fh:
             return fh.read()
 
     def describe(self):

@@ -13,8 +13,7 @@ from .artifacts import rollout as rollout_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
 from .artifacts import webcache_conv as webcache_art
-from .errors import CxError
-from .image import open_image
+from .errors import CxError, UnsupportedFormatError
 from .model import RecordBuilder
 from .vfs import DirectoryVfs, TskImageVfs
 
@@ -56,6 +55,11 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         img = None
         fs_desc = vfs.describe()
     else:
+        try:                                   # 이미지 라이브러리는 이미지 입력일 때만 불러온다 — 폴더 입력은 표준 라이브러리만으로 돈다
+            from .image import open_image
+        except ImportError as exc:
+            raise UnsupportedFormatError("디스크 이미지를 열려면 pytsk3 와 libewf-python 이 필요합니다 (폴더 입력에는 필요 없음)",
+                                         path=input_path, missing=str(exc))
         img = open_image(input_path)
         image_desc = img.describe()
         warnings.extend(image_desc.pop("warnings"))
@@ -169,7 +173,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.11",
+        "tool": {"name": "cxparser", "version": "0.3.12",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
