@@ -75,10 +75,13 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             continue
         inventory.append({"kind": kind, **vfile.location()})
         if kind == "sqlite" and (vfile.path.endswith("-wal") or vfile.path.endswith("-shm")):
-            sqlite_siblings[vfile.path] = vfile
+            if vfile.allocated or vfile.path not in sqlite_siblings:   # 같은 경로의 삭제된 옛 WAL 이 현존 WAL 을 덮어쓰지 않게
+                sqlite_siblings[vfile.path] = vfile
             continue
         if kind == "webcache_part":
-            cache_parts.setdefault(vfile.path.rsplit("/", 1)[0].lower(), {})[meta["fn"]] = vfile
+            parts = cache_parts.setdefault(vfile.path.rsplit("/", 1)[0].lower(), {})
+            if vfile.allocated or meta["fn"] not in parts:             # 캐시 조각도 같은 이유로 현존 파일 우선
+                parts[meta["fn"]] = vfile
             continue
         if kind == "sqlite" and not sqlite_art.is_main_db(vfile.path):
             continue          # 처리 대상 아닌 DB 는 발견 목록에만
@@ -166,7 +169,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.10",
+        "tool": {"name": "cxparser", "version": "0.3.11",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
