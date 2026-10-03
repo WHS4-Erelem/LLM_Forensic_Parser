@@ -11,6 +11,14 @@
   estuary/content?…&fn=<파일명> : 파일을 이름 붙여 내려받은 요청 03:40:53 → 생성 이미지 다운로드 (정답 03:40~03:41) ✓
   files/download/<id>?conversation_id= 는 표시용 fetch(JSON) 라 관찰로만.
 계정 이름 변경·공유 링크는 캐시에 흔적 없음 (POST 는 캐시되지 않음).
+
+2026-10-04 앱 26.928 (WHS_project_FINAL.E01, 실험 2026-10-02) — 대화 응답의 주소와 형식이 바뀌었다:
+  conversations/<id>?num_turns=10&include_has_versions=true  (복수형 + 쿼리)
+  본문은 mapping(트리) 대신 messages(목록). 메시지 필드(author·create_time·content.parts·metadata.attachments)는 같고,
+  부모는 metadata.parent_id (user 메시지는 없음). page_info.has_previous_page=true 면 앞쪽 turn 이 응답에 없다.
+  정답 대조: 대화 생성 11:44:21 (정답 11:43:26), 첨부 2개 프롬프트 11:44:28 (11:44:38), 프롬프트 11:45:09 (11:45:20) · 11:46:36 (11:46:56) ✓
+  대화 목록 응답(conversations?offset=…)과 ~/.codex/sqlite/codex-dev.db 의 local_thread_catalog 는 서버 계정의 대화 목록이라
+  다른 기기에서 만든 대화도 들어 있다 → 이 PC 의 행위 근거로 쓰지 않는다.
 """
 
 import re
@@ -21,7 +29,7 @@ from .. import events, model
 from ..util import excerpt, mask_text
 from .webcache import BlockfileCache, decode_json
 
-_CONV_URL = re.compile(r"^https://chatgpt\.com/backend-api/conversation/([0-9A-Za-z-]+)$")
+_CONV_URL = re.compile(r"^https://chatgpt\.com/backend-api/conversations?/([0-9A-Za-z-]+)(?:\?.*)?$")
 _ESTUARY_URL = re.compile(r"^https://chatgpt\.com/backend-api/estuary/content\?")
 _IMAGE_MIME = ("image/",)
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
@@ -50,6 +58,18 @@ def _has_image_part(message):
     return any(isinstance(p, dict) and p.get("content_type") == "image_asset_pointer" for p in (content.get("parts") or []))
 
 
+def _mapping_from_messages(conv):
+    """새 형식(messages 목록) → 기존 mapping 형태 {id: {message, parent, children}}. 응답에 없는 부모는 연결하지 않는다."""
+    nodes = {}
+    for m in conv.get("messages") or []:
+        if isinstance(m, dict) and m.get("id"):
+            nodes[m["id"]] = {"message": m, "parent": (m.get("metadata") or {}).get("parent_id"), "children": []}
+    for nid, node in nodes.items():
+        if node["parent"] in nodes:
+            nodes[node["parent"]]["children"].append(nid)
+    return nodes
+
+
 class _Ctx:
     def __init__(self, image_desc, rb, index_vfile, siblings, max_excerpt):
         self.image_desc, self.rb, self.index, self.sib, self.max = image_desc, rb, index_vfile, siblings or {}, max_excerpt
@@ -70,6 +90,8 @@ def _conversation_records(ctx, conv, resp):
     base = {"artifact": "webcache", "thread_id": cid, "title": title, "conversation_id": cid,
             "default_model_slug": conv.get("default_model_slug"), "is_temporary_chat": conv.get("is_temporary_chat"),
             "cache_created_utc": resp["created_utc"]}
+    if (conv.get("page_info") or {}).get("has_previous_page"):
+        base["partial"] = "응답이 최근 turn 만 담고 있음 (page_info.has_previous_page) — 앞쪽 메시지는 이 캐시에 없다"
     ev = ctx.evidence(resp)
     out.append(ctx.rec("E03-01", _ts(conv.get("create_time"), "대화 JSON 의 create_time"),
                        model.user_action(action="새 대화 생성(채팅 모드)", confidence=model.CONF_CONFIRMED,
@@ -204,6 +226,8 @@ def parse(vfile, image_desc, rb, max_excerpt=500, siblings=None):
         m = _CONV_URL.match(url)
         if m:
             obj = decode_json(resp)
+            if isinstance(obj, dict) and not isinstance(obj.get("mapping"), dict) and isinstance(obj.get("messages"), list):
+                obj["mapping"] = _mapping_from_messages(obj)     # 앱 26.928 이후 형식
             if isinstance(obj, dict) and isinstance(obj.get("mapping"), dict):
                 cid = obj.get("conversation_id") or m.group(1)
                 prev = convs.get(cid)
