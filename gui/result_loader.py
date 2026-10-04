@@ -87,6 +87,20 @@ ST_FAILED = "Failed"
 ST_SKIPPED = "Skipped"
 ST_LIMITED = "Unsupported / Limited"
 ST_UNKNOWN = "-"
+# Integration 이 쓰는 status 를 화면 라벨로 옮긴다 (없는 상태를 새로 만들지 않는다).
+# llm_forensic.py 의 ERROR_STATUS / _STATUS_ORDER 기준: success · failed · contract_violation ·
+# normalization_error · db_error · output_error
+ST_CONTRACT_VIOLATION = "Contract Violation"
+ST_NORMALIZATION_ERROR = "Normalization Error"
+ST_DB_ERROR = "DB Error"
+ST_OUTPUT_ERROR = "Output Error"
+INTEGRATION_STATUS_LABELS = {
+    "failed": ST_FAILED,
+    "contract_violation": ST_CONTRACT_VIOLATION,
+    "normalization_error": ST_NORMALIZATION_ERROR,
+    "db_error": ST_DB_ERROR,
+    "output_error": ST_OUTPUT_ERROR,
+}
 
 
 class ResultLoadError(Exception):
@@ -130,6 +144,8 @@ class ConversationSession:
     service: str = EMPTY           # source_parser (provenance 열)
     last_timestamp: str = EMPTY
     messages: list = field(default_factory=list)
+    has_uuid: bool = True          # False = conversation_uuid 가 없어 GUI 내부 기준으로 묶은 그룹
+    group_key: str = ""            # UI 내부용 그룹 키. 결과 파일·Export 에 쓰지 않는다
 
     def display_title(self, limit=58):
         """표시용 대화 주제. 원본을 고르기만 하고 요약·재작성하지 않는다.
@@ -139,9 +155,11 @@ class ConversationSession:
         preview = self.first_user_text()
         if preview:
             return _shorten(preview, limit)
-        if self.conversation_uuid and self.conversation_uuid != EMPTY:
+        if self.has_uuid and self.conversation_uuid != EMPTY:
             return "Untitled · %s" % self.conversation_uuid[:8]
-        return "Untitled Conversation"
+        if self.service != EMPTY:          # UUID 가 없으면 서비스·출처만 적는다 (식별자를 만들지 않는다)
+            return "Untitled (%s · conversation_uuid 없음)" % self.service
+        return "Untitled (conversation_uuid 없음)"
 
     def first_user_text(self):
         """첫 user 메시지의 본문 앞부분 (원문 그대로)."""
@@ -205,6 +223,10 @@ class ResultBundle:
 
     def has_db(self):
         return os.path.isfile(self.path(UNIFIED_DB))
+
+    def has_merged_outputs(self):
+        """Integration 이 병합 CSV 를 실제로 만들었는지 (report 키에 의존하지 않는다)."""
+        return os.path.isfile(self.path(TIMELINE_CSV)) and os.path.isfile(self.path(CONVERSATIONS_CSV))
 
     # --------------------------------------------------------------- summary
     def evidence(self):
@@ -310,7 +332,8 @@ class ResultBundle:
         if status in (None, "", ST_UNKNOWN):
             return ST_UNKNOWN
         if status != "success":
-            return ST_FAILED
+            # Integration 의 실제 status 를 그대로 옮긴다 (모르는 값이면 원문을 보여 준다)
+            return INTEGRATION_STATUS_LABELS.get(status, status)
         if timeline_rows or conversation_rows:
             return ST_COMPLETED
         return ST_LIMITED if parser in self.limited_parsers() else ST_NO_RESULT
@@ -469,16 +492,24 @@ class ResultBundle:
 
     # -------------------------------------------------------- conversations
     def conversation_sessions(self, service=None):
-        """conversation_uuid 별 세션 목록 (파일 순서 유지, 메시지는 message order 로 정렬)."""
+        """대화 세션 목록 (파일 순서 유지, 메시지는 message order 로 정렬).
+
+        conversation_uuid 가 있으면 그 값으로 묶는다. 없으면(`-`/빈 값) **전부 한 대화로 합치지 않고**
+        provenance(source_parser · source_file · Artifact_path · 제목) 로 GUI 내부 그룹 키를 만든다.
+        그 키는 화면 안에서만 쓰고 결과 파일·Export 에는 쓰지 않으며 사용자에게 UUID 로 보여 주지도 않는다.
+        """
         sessions = OrderedDict()
         for row in self.conversation_rows_of(service):
             uuid = cell(row, "conversation_uuid")
-            session = sessions.get(uuid)
+            has_uuid = uuid != EMPTY
+            key = uuid if has_uuid else gui_group_key(row)
+            session = sessions.get(key)
             if session is None:
                 session = ConversationSession(conversation_uuid=uuid, title=cell(row, "conversation_title"),
                                               model=cell(row, "Model"), first_timestamp=cell(row, "timestamp"),
-                                              service=cell(row, "source_parser"))
-                sessions[uuid] = session
+                                              service=cell(row, "source_parser"),
+                                              has_uuid=has_uuid, group_key=key)
+                sessions[key] = session
             session.messages.append(row)
             ts = cell(row, "timestamp")
             if ts != EMPTY:
@@ -489,6 +520,21 @@ class ResultBundle:
         for session in sessions.values():
             session.messages.sort(key=lambda r: _order_key(cell(r, "message order")))
         return list(sessions.values())
+
+
+GUI_GROUP_KEY_FIELDS = ("source_parser", "source_file", "conversation_title")
+
+
+def gui_group_key(message):
+    """conversation_uuid 가 없을 때 쓰는 **UI 내부 전용** 그룹 키.
+
+    실제 식별자가 아니다. 결과 CSV·Export·화면의 UUID 칸에 쓰지 않는다. 묶을 근거(provenance)가
+    하나도 없으면 메시지마다 다른 키를 돌려줘 서로 다른 대화로 둔다 (억지로 합치지 않는다).
+    """
+    parts = [cell(message, key) for key in GUI_GROUP_KEY_FIELDS]
+    if all(part == EMPTY for part in parts):
+        return "__gui_group_key:unique:%d" % id(message)
+    return "__gui_group_key:" + "|".join(parts)
 
 
 def message_service(message, fallback=EMPTY):

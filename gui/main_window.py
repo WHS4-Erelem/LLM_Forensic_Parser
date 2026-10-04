@@ -22,7 +22,9 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QChe
 
 from case_manager import CaseInfo
 from integration_runner import EXIT_MEANING, RUNNER, IntegrationRunner, registry_parsers
-from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON, ST_COMPLETED,
+from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
+                           ST_COMPLETED, ST_CONTRACT_VIOLATION, ST_DB_ERROR,
+                           ST_NORMALIZATION_ERROR, ST_OUTPUT_ERROR,
                            ST_FAILED, ST_LIMITED, ST_NO_RESULT, ST_SKIPPED, TIMELINE_CSV,
                            TIMELINE_VIEW_COLUMNS, UNIFIED_DB, VERDICT_CONFIRMED, VERDICT_SUSPECTED,
                            ResultBundle, ResultLoadError, artifact_type_of, cell,
@@ -40,7 +42,11 @@ STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "Badg
                 # 결과 화면의 파서 상태 (result_loader.display_status 가 실제 근거로 정한 값)
                 ST_COMPLETED: ("Completed", "BadgeGreen"), ST_NO_RESULT: ("No Result", "BadgeNeutral"),
                 ST_FAILED: ("Failed", "BadgeRed"), ST_SKIPPED: ("Skipped", "BadgeNeutral"),
-                ST_LIMITED: ("Limited", "BadgeYellow")}
+                ST_LIMITED: ("Limited", "BadgeYellow"),
+                # Integration status 를 그대로 옮긴 라벨 (실행 실패와 계약 위반을 구분해서 보여 준다)
+                ST_CONTRACT_VIOLATION: ("Contract", "BadgeRed"),
+                ST_NORMALIZATION_ERROR: ("Normalize", "BadgeRed"),
+                ST_DB_ERROR: ("DB Error", "BadgeRed"), ST_OUTPUT_ERROR: ("Output", "BadgeRed")}
 VERDICT_BADGE = {VERDICT_CONFIRMED: "BadgeGreen", VERDICT_SUSPECTED: "BadgeYellow"}
 # 다크 테마 팔레트 (styles.qss 와 같은 값을 쓴다. delegate 는 QSS 를 못 쓰므로 여기서 참조)
 DARK = {
@@ -481,18 +487,11 @@ ROLE_USER = ("user", "human")
 ROLE_ASSISTANT = ("assistant", "ai", "model", "bot")
 
 
-def role_label(role, service=EMPTY):
-    """버블 상단에 쓸 라벨. 데이터의 role 값은 바꾸지 않고 화면 표기만 정한다.
-    user→USER, assistant→실제 LLM 서비스명, system→SYSTEM, tool→TOOL, 그 외→원본 또는 UNKNOWN."""
-    folded = str(role).strip().lower()
-    if folded in ROLE_ASSISTANT:
-        label = service_label(service)
-        return label.upper() if label and label != EMPTY else "ASSISTANT"
-    if folded in ROLE_USER:
-        return "USER"
-    if not folded or role == EMPTY:
-        return "UNKNOWN"
-    return folded.upper()                      # system / tool / 그 외 원본 role 표기
+def role_label(role):
+    """버블 메타 줄에 쓸 role 표기. Integration 의 role 값을 대문자로만 바꿔 그대로 보여 준다.
+    user→USER, assistant→ASSISTANT, tool→TOOL, system→SYSTEM, UNKNOWN→UNKNOWN.
+    서비스명으로 바꾸거나 user/assistant 로 추론하지 않는다 (서비스는 같은 줄의 출처 표기에 남는다)."""
+    return str(role).upper() if str(role).strip() else EMPTY
 
 
 def _role_style(role):
@@ -558,7 +557,7 @@ class ChatBubbleDelegate(QStyledItemDelegate):
         meta_rect = QRect(bubble.left() + BUBBLE_PAD, bubble.top() + 7, bubble.width() - BUBBLE_PAD * 2, BUBBLE_META)
         painter.setFont(_font(8.5, bold=True))
         painter.setPen(QColor(label_color))
-        role_text = role_label(role, service)
+        role_text = role_label(role)
         painter.drawText(meta_rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), role_text)
         role_width = QFontMetrics(_font(8.5, bold=True)).horizontalAdvance(role_text) + 8
         painter.setFont(_font(8))
@@ -1560,11 +1559,13 @@ class MainWindow(QWidget):
         _clear_layout(self.steps_box)
         report = self.bundle.report or {}
         done = bool(report.get("parsers"))
-        merged = report.get("merged_output") or {}
-        for name, ok in (("수집 (Evidence)", bool(report.get("evidence"))),
+        # 병합 결과는 report 의 merged_output(이전 Integration 에만 있던 키) 대신
+        # 실제로 만들어진 병합 CSV·DB 로 판단한다.
+        merged = self.bundle.has_merged_outputs()
+        for name, ok in (("수집 (Evidence)", bool(report.get("evidence")) or bool(self.bundle.manifest)),
                          ("파싱 (Parsers)", done),
-                         ("정규화 (Common Schema)", bool(merged)),
-                         ("결과 생성 (Merged CSV · DB)", bool(merged) and self.bundle.has_db())):
+                         ("정규화 (Common Schema)", merged),
+                         ("결과 생성 (Merged CSV · DB)", merged and self.bundle.has_db())):
             self.steps_box.addWidget(StatusRow(name, "success" if ok else "-"))
 
     def _fill_overview(self):
@@ -1698,7 +1699,9 @@ class MainWindow(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, session)
             item.setToolTip("%s\n%s · %s · 메시지 %d건\n%s"
                             % (session.display_title(), session.service_display(), when,
-                               len(session.messages), session.conversation_uuid))
+                               len(session.messages),
+                               session.conversation_uuid if session.has_uuid
+                               else "conversation_uuid 없음 (출처 기준으로 묶은 화면 전용 그룹)"))
             self.session_list.addItem(item)
         self.session_list.blockSignals(False)
         self._apply_session_search(self.search_box.text())
@@ -1738,7 +1741,8 @@ class MainWindow(QWidget):
         self.conversation_empty.setVisible(False)
         self.chat_view.setVisible(True)
         model = QStandardItemModel()
-        for message in session.messages:
+        shown = session.messages                    # CSV 의 모든 메시지를 그대로 보여 준다 (숨기지 않는다)
+        for message in shown:
             cell_item = QStandardItem(cell(message, "content"))
             cell_item.setData(message, Qt.ItemDataRole.UserRole)
             model.appendRow(cell_item)
@@ -1748,9 +1752,12 @@ class MainWindow(QWidget):
         span = session.first_timestamp
         if session.last_timestamp != EMPTY and session.last_timestamp != session.first_timestamp:
             span = "%s ~ %s" % (session.first_timestamp, session.last_timestamp)
-        self.chat_header.setText("%s · %s · 메시지 %d건 · conversation_uuid %s"
+        # conversation_uuid 는 CSV 값을 그대로 적는다. UUID 가 없을 때만 묶음 근거를 덧붙인다.
+        uuid_text = ("conversation_uuid %s" % session.conversation_uuid if session.has_uuid
+                     else "conversation_uuid %s (출처 기준으로 묶은 화면 전용 그룹)" % session.conversation_uuid)
+        self.chat_header.setText("%s · %s · 메시지 %d건 · %s"
                                  % (session.display_title(), session.service_display(),
-                                    len(session.messages), session.conversation_uuid))
+                                    len(session.messages), uuid_text))
         self.chat_header.setToolTip(span)
 
     def _on_message_selected(self, *_args):
