@@ -5,6 +5,9 @@
 pytsk3==20260715      # Disk Image(DD/RAW·E01) 파티션 · NTFS 접근. --image 사용 시 필요
 brotli==1.2.0         # Chrome Cache 대화 API 응답(br) 해제. 대화 메시지 복구에 필요
 cramjam==2.12.1       # LevelDB .ldb(SSTable) raw Snappy 해제. Local Storage .ldb 읽기에 필요
+dissect.fve==4.6      # BitLocker 볼륨 해제 (--image). 팀 기존 구현과 같은 버전 — 없으면 BitLocker 파티션만
+                      # IMAGE_BITLOCKER_LOCKED 로 남기고 나머지 파티션·입력은 그대로 동작한다.
+                      # pycryptodome 은 선택 가속 경로라 필수 의존성으로 두지 않는다 (팀 구현과 동일).
 
 # E01/EWF 입력 전용 — Python 3.12 에서만 설치된다 (cp313 wheel 없음, LGPLv3+).
 # Python 3.13 에서 E01 을 주면 E01_INPUT_REQUIRES_PYEWF 로 거부하고 DD/RAW 는 정상 동작한다.

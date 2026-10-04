@@ -21,6 +21,7 @@ from .image import ImageOpenError, ImageSource, open_image_source
 from .output.csv_writer import CSV_DEBUG_FILES, CSV_FINAL_FILES, write_result_csv
 from .output.debug import write_result_json
 from .parser import run
+from . import bitlocker, live
 from .source import DirectorySource, SourcePathError, normalize_source_path
 
 
@@ -56,6 +57,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     source.add_argument("--dir", metavar="FOLDER", help="folder to analyze (copied/mounted Chrome data). read-only")
     source.add_argument("--image", metavar="IMAGE",
                         help="DD/RAW or E01/EWF disk image (read-only). Needs pytsk3; E01 also needs pyewf")
+    source.add_argument("--live", action="store_true",
+                        help="collect Chrome artifacts from this Windows PC (read-only copy) and analyze them")
+    parser.add_argument("--live-work-dir", metavar="FOLDER",
+                        help="where --live keeps its working copy (default: a temporary folder removed afterwards)")
+    parser.add_argument("--key-material", metavar="KEY",
+                        help="BitLocker volume key for --image: recovery:<48 digits> | passphrase:<text> | "
+                             "bek:<path> | fvek:<hex>. Clear-key / suspended volumes open without a key. "
+                             f"Can also be given via the {bitlocker.KEY_ENV} environment variable "
+                             "(keeps the key out of the command line). The key is never logged or written to output.")
     parser.add_argument("--history", metavar="RELATIVE_PATH",
                         help="analyze only this History file (relative to --dir, e.g. Default/History). "
                              "omit to auto-discover Chrome profiles")
@@ -225,6 +235,8 @@ def _print_text(text: str, stream: Any = None) -> None:
 
 
 def _run_cli(args: argparse.Namespace) -> int:
+    if getattr(args, "live", False):
+        return _run_cli_live(args)
     if args.image is None:
         try:
             source = DirectorySource(args.dir)
@@ -232,13 +244,31 @@ def _run_cli(args: argparse.Namespace) -> int:
             raise CliUsageError(f"invalid --dir: {exc}") from None
         return _run_cli_on_source(args, source)
     try:
-        image_source = open_image_source(args.image)
+        image_source = open_image_source(args.image,
+                                         bitlocker.key_material_from_env(getattr(args, "key_material", None)))
     except ImageOpenError as exc:
         raise CliUsageError(f"invalid --image: {exc}") from None
     try:
         return _run_cli_on_source(args, image_source)
     finally:
         image_source.close()
+
+
+def _run_cli_live(args: argparse.Namespace) -> int:
+    """Live: 현재 PC 에서 Artifact 를 사본으로 가져온 뒤 폴더 입력과 같은 경로로 분석한다.
+
+    Live 전용 Reader·Rule 은 없다. 수집(live.py) 과 해석(기존 파이프라인) 을 나눈다.
+    """
+    try:
+        collection = live.collect_live_artifacts(getattr(args, "live_work_dir", None))
+    except live.LiveAcquisitionError as exc:
+        raise CliUsageError(f"--live: {exc}") from None
+    _print_text(os.linesep.join(["", "[LIVE ACQUISITION]"] + live.summarize(collection)))
+    try:
+        source = DirectorySource(str(collection.working_dir))
+        return _run_cli_on_source(args, source)
+    finally:
+        collection.cleanup()        # 직접 만든 임시 폴더만 정리한다
 
 
 def _csv_dir_from_args(args: argparse.Namespace, source: Source) -> Path | None:

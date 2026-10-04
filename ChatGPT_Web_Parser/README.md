@@ -15,7 +15,7 @@ WHS 대학 팀 프로젝트 *"LLM 대화 내용 추출 및 사용자 행위 분�
 |---|---|
 | Python | **3.12 / 3.13** (둘 다 전체 테스트 통과 확인) |
 | 필수 | 없음 — 표준 라이브러리만으로 폴더 입력 분석이 동작한다 |
-| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `libewf-python`(E01) |
+| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `dissect.fve==4.6`(BitLocker 볼륨) · `libewf-python`(E01) |
 
 ```
 pip install -r requirements.txt
@@ -54,6 +54,77 @@ python -B -m unittest discover -s tests
 - `--out` 은 **optional** 이다. 주지 않으면 JSON 을 만들지 않고 정상 종료한다. 주는 경우 입력 폴더 **밖**이어야 한다. 기존 파일을 덮어쓰려면 `--overwrite`.
 - 종료 코드: `0` 분석 완료(결과 0건 포함) / `2` 잘못된 인자·입력 / `1` 예상하지 못한 오류.
 - 폴더 입력은 `Users/<user>/AppData/Local/Google/Chrome/User Data/` 의 `Default`·`Profile <숫자>`(Chrome Stable)를 자동 탐색한다. 못 찾으면 `CHROME_PROFILE_NOT_FOUND` warning + exit 0.
+
+## 2-2. 입력 Mode 세 가지
+
+`--image` · `--dir` · `--live` 는 **상호배타**다 (하나만 준다). 어느 모드든 이후의 Chrome Profile 탐색 ·
+Artifact Reader · 판정 Rule · 대화 복구 · 최종 CSV 는 같은 코드를 쓴다.
+
+```
+# Image Mode : DD/RAW · E01 디스크 이미지 (읽기 전용)
+python -m chatgpt_parser.cli --image <IMAGE> --csv-dir out_csv
+
+# Folder Mode : 마운트·수집한 폴더
+python -m chatgpt_parser.cli --dir <ROOT> --csv-dir out_csv
+
+# Live Mode : 지금 이 Windows PC 에서 자동 수집
+python -m chatgpt_parser.cli --live --csv-dir out_csv
+```
+
+### Folder Mode
+
+History 파일 하나를 고르는 방식이 **아니다**. Chrome User Data 를 찾아 들어갈 수 있는 **Root 폴더**를 준다
+(예: 수집본의 최상위). Parser 가 그 아래에서
+`Users/<user>/AppData/Local/Google/Chrome/User Data/` 의 `Default` · `Profile <숫자>` 를 스스로 찾는다.
+사용자 이름·Profile 개수를 미리 알 필요가 없다. 특정 History 하나만 보려면 `--history` 로 지정한다.
+
+### Live Mode
+
+파일·폴더를 고르지 않는다. 실행 중인 Windows PC 에서 ChatGPT Web 분석에 필요한 Chrome Artifact 를 스스로 찾는다.
+
+```
+현재 Windows 사용자 폴더 탐색 → Chrome User Data 탐색 → Default / Profile N 탐색
+→ 필요한 Artifact 만 읽기 전용으로 Working Copy → 기존 Folder 분석 로직 재사용
+```
+
+- **원본 Artifact 를 수정·삭제·덮어쓰지 않는다** (읽기로만 연다).
+- Chrome 이 실행 중이면 일부 파일이 잠겨 수집에 실패할 수 있다. **파일 하나가 실패해도 분석을 멈추지 않고**
+  실패 건수를 warning 으로 알린다.
+- `--live-work-dir` 를 **생략하면** 임시 폴더에 Working Copy 를 만들고 분석이 끝나면 지운다.
+  **지정하면** 그 폴더에 Working Copy 를 남긴다 (수집 결과를 보관하거나 다시 분석할 때).
+
+## 2-3. BitLocker 볼륨 (Image Mode)
+
+이미지 안의 파티션이 BitLocker 로 암호화돼 있으면 선두의 `-FVE-FS-` 로 알아보고, `dissect.fve` 로 풀어서
+복호화 스트림을 기존 이미지 분석 경로에 그대로 연결한다. **원본 이미지는 읽기만 하고 복호화본을 따로 저장하지 않는다.**
+clear key · 일시 중단(suspended) 상태의 볼륨은 키 없이 열린다. 키가 없거나 맞지 않으면 그 파티션만
+`IMAGE_BITLOCKER_LOCKED` 로 남기고 다른 파티션을 계속 확인한다 (무차별 대입·우회는 하지 않는다).
+
+지원하는 키 형식:
+
+```
+recovery:<48자리 복구 키>
+passphrase:<암호>
+bek:<.BEK 파일 경로>
+fvek:<hex>
+```
+
+> **키 전달 주의.** `--key-material` 은 명령행 인자라 셸 기록이나 **상위 통합 실행기의 `run.log`
+> (실행 명령 문자열을 그대로 기록한다)** 에 남을 수 있다. 그래서 통합 실행처럼 로그가 남는 경로에서는
+> 환경변수 **`ERELM_KEY_MATERIAL`** 로 주는 것을 권장한다. **실제 복구 키를
+> `integration/parsers.json` 의 `args` 에 적지 말 것.**
+>
+> ```
+> # PowerShell (값은 예시 자리표시자다 — 실제 키를 문서·설정 파일에 남기지 않는다)
+> $env:ERELM_KEY_MATERIAL = "recovery:<48-digit-recovery-key>"
+> python -m chatgpt_parser.cli --image <IMAGE> --csv-dir out_csv
+> ```
+>
+> Parser 는 키 값을 stdout · stderr · warning · 예외 메시지 · `result.json` · CSV 어디에도 쓰지 않는다
+> (키 종류와 보호자 목록만 남긴다).
+
+검증 상태: BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출은 단위 테스트로 확인했다.
+**실제 암호화 이미지에 복구 키를 넣어 푸는 실증 검증은 테스트용 암호화 이미지가 있어야 하며 아직 수행하지 않았다.**
 
 ## 2-1. Python 통합 (팀 Controller 에서 호출)
 

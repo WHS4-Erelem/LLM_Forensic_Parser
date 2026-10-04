@@ -101,7 +101,7 @@ def _csv_rows(result: ParseResult, filename: str) -> list[dict[str, Any]]:
         # 프롬프트 첫 줄은 이미 복구된 메시지·초안에서만 찾는다 (Event 마다 다시 훑지 않도록 한 번만 만든다).
         prompt_texts = timeline_prompt_texts(result)
         return [_timeline_row(event, prompt_texts) for event in result.events
-                if csv_final_user_behavior(event.action) is not None]
+                if csv_final_user_behavior(event.action, event) is not None]
     if filename == "recovered_conversations.csv":
         return [_recovered_conversation_row(conversation, message)
                 for conversation in result.conversations for message in conversation.messages]

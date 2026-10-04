@@ -197,19 +197,20 @@ INPUT_TYPES = ("dir", "image")
 
 def analyze_chatgpt_web(
     input_path: str | os.PathLike[str], *, input_type: str = "dir", history_path: str | None = None,
-    os_user: str | None = None, browser_profile: str | None = None,
+    os_user: str | None = None, browser_profile: str | None = None, key_material: str | None = None,
 ) -> ParseResult:
     """
     입력 1개를 분석해 ParseResult 를 돌려준다. **파일을 쓰지 않는다** (출력은 write_final_outputs 가 한다).
       input_type="dir"    input_path = 분석용 폴더 (원본은 읽기만 한다)
       input_type="image"  input_path = DD/RAW 또는 E01 이미지 (pytsk3 / pyewf 필요)
     history_path 를 주면 자동 탐색 대신 그 History 1개만 읽는다 (Source 기준 상대 경로).
+    key_material 은 BitLocker 이미지용 키다 (recovery:/passphrase:/bek:/fvek:, 폴더 입력에는 쓰지 않는다).
     """
     if input_type not in INPUT_TYPES:
         raise ValueError(f"input_type must be one of {INPUT_TYPES}, got {input_type!r}")
     if input_type == "dir":
         return run(DirectorySource(input_path), history_path, os_user=os_user, browser_profile=browser_profile)
-    image_source = open_image_source(input_path)
+    image_source = open_image_source(input_path, key_material)
     try:
         return run(image_source, history_path, os_user=os_user, browser_profile=browser_profile)
     finally:

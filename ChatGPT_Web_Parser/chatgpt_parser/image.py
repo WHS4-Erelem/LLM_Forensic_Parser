@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from . import bitlocker
 from .source import Source, normalize_source_path
 
 
@@ -59,6 +60,9 @@ IMAGE_FILESYSTEM_OPEN_FAILED = "IMAGE_FILESYSTEM_OPEN_FAILED"
 IMAGE_PARTITION_NOT_NTFS = "IMAGE_PARTITION_NOT_NTFS"
 IMAGE_NTFS_CANDIDATES = "IMAGE_NTFS_CANDIDATES"
 IMAGE_PARTITION_SELECTED = "IMAGE_PARTITION_SELECTED"
+IMAGE_BITLOCKER_DETECTED = "IMAGE_BITLOCKER_DETECTED"
+IMAGE_BITLOCKER_UNLOCKED = "IMAGE_BITLOCKER_UNLOCKED"
+IMAGE_BITLOCKER_LOCKED = "IMAGE_BITLOCKER_LOCKED"
 _IMAGE_READ_CHUNK = 1024 * 1024
 
 
@@ -286,8 +290,12 @@ def open_ewf_image(image_path: str | os.PathLike[str]) -> tuple[Any, list[str]]:
     return _ewf_img_info_class()(handle, segments), [f"{IMAGE_EWF_SEGMENTS}:{len(segments)}"]
 
 
-def open_image_source(image_path: str | os.PathLike[str]) -> ImageSource:
-    """DD/RAW 또는 E01/EWF 이미지를 열어 분석할 NTFS 파티션의 ImageSource 를 반환한다. 호출자가 close() 해야 한다."""
+def open_image_source(image_path: str | os.PathLike[str], key_material: str | None = None) -> ImageSource:
+    """DD/RAW 또는 E01/EWF 이미지를 열어 분석할 NTFS 파티션의 ImageSource 를 반환한다. 호출자가 close() 해야 한다.
+
+    BitLocker 볼륨은 팀 공통 방식(chatgpt_parser/bitlocker.py)으로 풀어서 같은 경로로 분석한다.
+    키가 없거나 맞지 않으면 그 파티션만 잠김으로 기록하고 다른 파티션을 계속 본다 (우회하지 않는다).
+    """
     if pytsk3 is None:
         raise ImageOpenError("pytsk3 is not installed (approved package: pytsk3==20260715)")
     path = Path(image_path)
@@ -313,9 +321,22 @@ def open_image_source(image_path: str | os.PathLike[str]) -> ImageSource:
                                      block_size=None, byte_offset=0)]
     candidates: list[tuple[ImagePartition, TskFilesystem, bool]] = []
     fs_info = None
+    unlocked_images: list[Any] = []          # 복호화 볼륨은 ImageSource 가 닫힐 때까지 살아 있어야 한다
     for partition in partitions:
+        fs_image, fs_offset = image, partition.byte_offset
+        if bitlocker.is_bitlocker(image, partition.byte_offset):
+            warnings.append(f"{IMAGE_BITLOCKER_DETECTED}:{partition.label}")
+            size = (partition.sector_count or 0) * (partition.block_size or 0)
+            try:
+                fs_image, method = bitlocker.open_volume(image, partition.byte_offset, size, key_material)
+            except bitlocker.VolumeLockedError as exc:      # 키 없음·틀린 키·라이브러리 없음 — 값은 남기지 않는다
+                warnings.append(f"{IMAGE_BITLOCKER_LOCKED}:{partition.label}:{exc}")
+                continue
+            unlocked_images.append(fs_image)
+            fs_offset = 0                                   # 복호화 볼륨은 그 자체가 하나의 이미지다
+            warnings.append(f"{IMAGE_BITLOCKER_UNLOCKED}:{partition.label}:{method}")
         try:
-            fs_info = pytsk3.FS_Info(image, offset=partition.byte_offset)
+            fs_info = pytsk3.FS_Info(fs_image, offset=fs_offset)
         except OSError:
             warnings.append(f"{IMAGE_FILESYSTEM_OPEN_FAILED}:{partition.label}")
             continue
