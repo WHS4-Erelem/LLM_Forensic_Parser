@@ -78,9 +78,15 @@ def _one_line(v, limit=300):
 
 def _winpath(r):
     """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...' (공유본 표기).
-    ponytail: 드라이브 문자는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
-    p = ((r.get("evidence") or {}).get("location") or {}).get("path") or ""
-    return "C:" + p.replace("/", "\\") if p else ""
+    라이브 분석은 실제 드라이브 문자를 안다(location.drive). 드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
+    ponytail: 이미지·추출 폴더는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
+    loc = (r.get("evidence") or {}).get("location") or {}
+    p, drive = loc.get("path") or "", loc.get("drive")
+    if not p:
+        return ""
+    if drive == "":
+        return p
+    return (drive or "C:") + p.replace("/", "\\")
 
 
 def _behavior_details(r, titles):

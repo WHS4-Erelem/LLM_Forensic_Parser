@@ -56,7 +56,8 @@ def records_from_inventory(vfs, inventory, image_desc, rb):
                     root = m.get("path") or key
                     found.append((kind, root, t.get("created"), t.get("modified"),
                                   {"path": root, "mft_record": m.get("mft_record"),
-                                   "ntfs_standard_information": {"created": t.get("created"), "modified": t.get("modified")}}))
+                                   "ntfs_standard_information": {"created": t.get("created"), "modified": t.get("modified")},
+                                   **({"drive": m["drive"]} if m.get("drive") is not None else {})}))
         found.sort(key=lambda x: x[0])
     out = []
     for kind, root, created, modified, loc in found:

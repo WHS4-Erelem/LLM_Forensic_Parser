@@ -63,6 +63,9 @@ class VfsFile:
             loc["partition_offset_bytes"] = self.volume_offset
         if self.native_path:
             loc["native_path"] = self.native_path
+        drive = getattr(self._source, "drive", None)     # 라이브 분석만: 실제 드라이브 문자 ('' = 드라이브 문자가 없는 시스템)
+        if drive is not None:
+            loc["drive"] = drive
         if self.si_times:
             loc["ntfs_standard_information"] = self.si_times
         if self.fn_times:
@@ -330,8 +333,10 @@ class DirectoryVfs:
             self.host_provider, self.host_meta = doc.get("provider"), doc.get("entries") or {}
 
     def host_stat(self, path):
-        """'/Users/x/Downloads/f' → 호스트가 준 메타데이터 dict, 없으면 None."""
-        return self.host_meta.get(path.replace("\\", "/").lower())
+        """'/Users/x/Downloads/f' 또는 'C:/Users/x/Downloads/f'(역슬래시 표기 포함) → 호스트가 준 메타데이터 dict, 없으면 None.
+        추출 폴더는 볼륨 하나의 사본이라 드라이브 문자는 떼고 찾는다."""
+        key = path.replace("\\", "/")
+        return self.host_meta.get((key[2:] if key[1:2] == ":" else key).lower())
 
     @staticmethod
     def _long(path):
@@ -429,20 +434,23 @@ class LiveVfs(DirectoryVfs):
         if not os.path.isdir(self.root):
             raise FilesystemError("디렉터리가 아닙니다", path=self.root)
         self.host_provider, self.host_meta = "live filesystem (os.stat)", {}
+        self.drive = os.path.splitdrive(self.root)[0].upper()      # 'C:' / POSIX 는 ''
         for d in self.scan_roots():            # 패키지 폴더의 생성 시각 = 설치 근거 (package_install 이 dir 항목에서 찾는다)
             entry = self._entry(d)
             if entry:
                 self.host_meta[entry["path"].lower()] = entry
 
-    def _entry(self, full, head=False):
-        """실제 경로 하나 → _host_metadata.json 의 항목과 같은 모양의 dict. 없거나 권한이 없으면 None."""
+    def _entry(self, full, head=False, base=None, drive=None):
+        """실제 경로 하나 → _host_metadata.json 의 항목과 같은 모양의 dict. 없거나 권한이 없으면 None.
+        base/drive: 볼륨 루트가 아닌 다른 드라이브의 파일을 볼 때 (바로가기 대상이 D: 에 있는 경우)."""
         try:
             st = os.stat(full)
         except OSError:
             return None
         is_dir = os.path.isdir(full)
-        entry = {"path": "/" + os.path.relpath(full, self._long(self.root)).replace(os.sep, "/"), "size": st.st_size,
-                 "dir": is_dir, "mft_record": _stat_mft_record(st), "times": _stat_times(st)}
+        entry = {"path": "/" + os.path.relpath(full, base or self._long(self.root)).replace(os.sep, "/"), "size": st.st_size,
+                 "dir": is_dir, "mft_record": _stat_mft_record(st), "times": _stat_times(st),
+                 "drive": self.drive if drive is None else drive}
         if head and not is_dir and st.st_size:
             try:
                 with open(full, "rb") as fh:
@@ -453,8 +461,15 @@ class LiveVfs(DirectoryVfs):
 
     def host_stat(self, path):
         key = path.replace("\\", "/")
-        return self.host_meta.get(key.lower()) or self._entry(
-            os.path.join(self._long(self.root), key.lstrip("/").replace("/", os.sep)), head=True)
+        drive, key = (key[:2].upper(), key[2:]) if key[1:2] == ":" else (self.drive, key)
+        if drive == self.drive:
+            base = self._long(self.root)
+            hit = self.host_meta.get(key.lower())
+            if hit:
+                return hit
+        else:
+            base = self._long(drive + os.sep)                  # 바로가기 대상이 다른 드라이브에 있는 경우
+        return self._entry(os.path.join(base, key.lstrip("/").replace("/", os.sep)), head=True, base=base, drive=drive)
 
     def _file_meta(self, rel, st):
         return _stat_mft_record(st), _stat_times(st)
@@ -476,4 +491,21 @@ if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색
         os.makedirs(os.path.join(td, ".codex", "sessions"))
         open(os.path.join(td, ".codex", "sessions", "r.jsonl"), "w").close()
         assert [f.path for f in DirectoryVfs(td).iter_files()] == ["/.codex/sessions/r.jsonl"]   # 부분 추출 트리: 전체
+    with tempfile.TemporaryDirectory() as td:                                                    # 라이브: 실제 시각·드라이브
+        os.makedirs(os.path.join(td, "Users", "a", ".codex"))
+        os.makedirs(os.path.join(td, "Users", "a", "Downloads"))
+        open(os.path.join(td, "Users", "a", ".codex", "auth.json"), "w").close()
+        with open(os.path.join(td, "Users", "a", "Downloads", "x"), "wb") as fh:
+            fh.write(b"%PDF-1.7 ...")
+        live = LiveVfs(td)
+        (f,) = list(live.iter_files())
+        assert f.si_times["created"] and f.si_times["modified"] and f.location()["drive"] == live.drive
+        win = os.sep.join(["", "Users", "a", "Downloads", "x"])                                  # Windows 표기 (역슬래시)
+        for form in ("/Users/a/Downloads/x", live.drive + win):
+            hit = live.host_stat(form)
+            assert hit and hit["head_hex"] == b"%PDF-1.7".hex() and hit["times"]["created"], (form, hit)
+        assert live.host_stat("/Users/a/Downloads/none") is None
+        assert list(LiveVfs(os.path.join(td, "Users", "a", "Downloads")).iter_files()) == []       # 탐색 폴더가 없으면 아무것도 읽지 않는다
+        d = DirectoryVfs(td); d.host_meta = {"/users/a/downloads/x": {"size": 1}}
+        assert d.host_stat("C:" + win) == {"size": 1} and "drive" not in next(d.iter_files()).location()
     print("vfs self-check ok")
