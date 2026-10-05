@@ -339,22 +339,43 @@ class DirectoryVfs:
         그 설정과 무관하게 열린다 — 사건 폴더가 깊은 곳에 있어도 추출 파일을 놓치지 않게."""
         return "\\\\?\\" + path if os.name == "nt" and not path.startswith("\\\\") else path
 
+    def scan_roots(self):
+        """루트 아래에서 SCAN_ROOTS('Users/*/.codex' …)에 해당하는 폴더를 대소문자 무시로 찾는다 — 이미지 입력의
+        _expand_roots 와 같은 범위. 볼륨 루트(C:\\ 나 그 사본)를 받아도 디스크 전체를 훑지 않는다."""
+        found = []
+        for pattern in SCAN_ROOTS:
+            level = [self._long(self.root)]
+            for seg in pattern.lower().split("/"):
+                nxt = []
+                for d in level:
+                    try:
+                        names = os.listdir(d)
+                    except OSError:
+                        continue
+                    nxt += [p for p in (os.path.join(d, n) for n in names if fnmatch.fnmatch(n.lower(), seg))
+                            if os.path.isdir(p)]
+                level = nxt
+            found += level
+        return found
+
     def iter_files(self):
         walk_root = self._long(self.root)
-        for dirpath, _dirs, files in os.walk(walk_root):
-            for fn in files:
-                full = os.path.join(dirpath, fn)
-                try:
-                    st = os.stat(full)
-                except OSError:
-                    continue
-                tail = os.path.relpath(full, walk_root)
-                rel = "/" + tail.replace(os.sep, "/")
-                if rel == "/" + HOST_META_NAME:
-                    continue
-                m = self.host_meta.get(rel.lower()) or {}
-                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=os.path.join(self.root, tail),
-                              mft_record=m.get("mft_record"), si_times=m.get("times"))
+        # 탐색 루트가 하나도 없으면 볼륨 모양이 아닌 부분 추출 트리(.codex 폴더만 준 경우 등)이므로 전체를 본다
+        for top in self.scan_roots() or [walk_root]:
+            for dirpath, _dirs, files in os.walk(top):
+                for fn in files:
+                    full = os.path.join(dirpath, fn)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    tail = os.path.relpath(full, walk_root)
+                    rel = "/" + tail.replace(os.sep, "/")
+                    if rel == "/" + HOST_META_NAME:
+                        continue
+                    m = self.host_meta.get(rel.lower()) or {}
+                    yield VfsFile(path=rel, size=st.st_size, source=self, native_path=os.path.join(self.root, tail),
+                                  mft_record=m.get("mft_record"), si_times=m.get("times"))
 
     def _read_file(self, vfile):
         with open(self._long(vfile.native_path), "rb") as fh:
@@ -366,3 +387,18 @@ class DirectoryVfs:
                     "note": "호스트 DFIR 도구가 꺼낸 파일 트리 — MFT 근거는 호스트가 넘긴 %s" % HOST_META_NAME}
         return {"filesystem": "host-directory", "root": self.root,
                 "note": "디스크 이미지가 아닌 추출 파일 트리 — MFT 근거 없음"}
+
+
+if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색 범위 자체 검사
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for rel in ("USERS/a/.codex/auth.json", "Users/a/Videos/big.bin", "Windows/Prefetch/CODEX.EXE-1.pf", "ProgramData/other/x"):
+            os.makedirs(os.path.dirname(os.path.join(td, rel)), exist_ok=True)
+            open(os.path.join(td, rel), "w").close()
+        got = sorted(f.path.lower() for f in DirectoryVfs(td).iter_files())
+        assert got == ["/users/a/.codex/auth.json", "/windows/prefetch/codex.exe-1.pf"], got      # 볼륨 모양: 탐색 루트만, 대소문자 무시
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, ".codex", "sessions"))
+        open(os.path.join(td, ".codex", "sessions", "r.jsonl"), "w").close()
+        assert [f.path for f in DirectoryVfs(td).iter_files()] == ["/.codex/sessions/r.jsonl"]   # 부분 추출 트리: 전체
+    print("vfs self-check ok")
