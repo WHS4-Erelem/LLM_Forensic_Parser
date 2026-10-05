@@ -358,10 +358,16 @@ class DirectoryVfs:
             found += level
         return found
 
+    walk_all_without_roots = True      # 탐색 루트가 없으면 부분 추출 트리(.codex 폴더만 준 경우 등)로 보고 전체를 본다
+
+    def _file_meta(self, rel, st):
+        """파일 한 개의 (MFT 레코드 번호, $SI 시각). 추출 폴더에서는 호스트가 넘긴 값만 쓴다 — 복사본의 시각은 의미가 없다."""
+        m = self.host_meta.get(rel.lower()) or {}
+        return m.get("mft_record"), m.get("times")
+
     def iter_files(self):
         walk_root = self._long(self.root)
-        # 탐색 루트가 하나도 없으면 볼륨 모양이 아닌 부분 추출 트리(.codex 폴더만 준 경우 등)이므로 전체를 본다
-        for top in self.scan_roots() or [walk_root]:
+        for top in self.scan_roots() or ([walk_root] if self.walk_all_without_roots else []):
             for dirpath, _dirs, files in os.walk(top):
                 for fn in files:
                     full = os.path.join(dirpath, fn)
@@ -373,9 +379,9 @@ class DirectoryVfs:
                     rel = "/" + tail.replace(os.sep, "/")
                     if rel == "/" + HOST_META_NAME:
                         continue
-                    m = self.host_meta.get(rel.lower()) or {}
+                    mft_record, times = self._file_meta(rel, st)
                     yield VfsFile(path=rel, size=st.st_size, source=self, native_path=os.path.join(self.root, tail),
-                                  mft_record=m.get("mft_record"), si_times=m.get("times"))
+                                  mft_record=mft_record, si_times=times)
 
     def _read_file(self, vfile):
         with open(self._long(vfile.native_path), "rb") as fh:
@@ -387,6 +393,75 @@ class DirectoryVfs:
                     "note": "호스트 DFIR 도구가 꺼낸 파일 트리 — MFT 근거는 호스트가 넘긴 %s" % HOST_META_NAME}
         return {"filesystem": "host-directory", "root": self.root,
                 "note": "디스크 이미지가 아닌 추출 파일 트리 — MFT 근거 없음"}
+
+
+def _stat_times(st):
+    """os.stat 결과 → $SI 시각 표기. 실행 중인 시스템에서는 이 값이 원본 파일시스템의 시각 그 자체다.
+    MFT 변경 시각($SI changed)은 Windows 의 stat 으로 얻을 수 없어 None."""
+    def ts(ns):
+        return _iso(datetime.fromtimestamp(0, tz=timezone.utc) + timedelta(microseconds=ns // 1000)) if ns else None
+    birth = getattr(st, "st_birthtime_ns", None)           # Windows 는 3.12+, macOS 는 항상 제공
+    if os.name == "nt":
+        created, changed = birth or st.st_ctime_ns, None   # Windows 의 st_ctime 은 생성 시각
+    else:
+        created, changed = birth, st.st_ctime_ns           # POSIX 의 st_ctime 은 inode 변경 시각
+    return {"created": ts(created), "modified": ts(st.st_mtime_ns), "mft_modified": ts(changed), "accessed": ts(st.st_atime_ns)}
+
+
+def _stat_mft_record(st):
+    """NTFS 의 파일 ID(64비트) 하위 48비트 = MFT 레코드 번호. 다른 파일시스템이면 None."""
+    return (st.st_ino & 0xFFFFFFFFFFFF) or None if os.name == "nt" else None
+
+
+class LiveVfs(DirectoryVfs):
+    """실행 중인 시스템의 볼륨 루트(C:\\ 등)를 직접 읽는다 — 이미지를 뜨지 않고 그 PC 에서 바로 분석할 때(라이브 분석).
+
+    추출 폴더 입력과 다른 점
+      - 탐색 폴더(SCAN_ROOTS)만 본다. 하나도 없으면 아무것도 읽지 않는다 (디스크 전체를 훑지 않는다).
+      - 파일 시각은 os.stat 값 = 원본 파일시스템의 시각이라 MFT 근거 자리에 그대로 쓴다.
+      - 꺼내 두지 않은 항목(패키지 폴더, 바로가기 대상 파일)은 host_stat 이 실제 경로를 그때그때 조회한다.
+    모든 파일은 읽기 전용으로만 연다. 삭제된 파일과 $UsnJrnl 은 다루지 않는다."""
+
+    walk_all_without_roots = False
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        if not os.path.isdir(self.root):
+            raise FilesystemError("디렉터리가 아닙니다", path=self.root)
+        self.host_provider, self.host_meta = "live filesystem (os.stat)", {}
+        for d in self.scan_roots():            # 패키지 폴더의 생성 시각 = 설치 근거 (package_install 이 dir 항목에서 찾는다)
+            entry = self._entry(d)
+            if entry:
+                self.host_meta[entry["path"].lower()] = entry
+
+    def _entry(self, full, head=False):
+        """실제 경로 하나 → _host_metadata.json 의 항목과 같은 모양의 dict. 없거나 권한이 없으면 None."""
+        try:
+            st = os.stat(full)
+        except OSError:
+            return None
+        is_dir = os.path.isdir(full)
+        entry = {"path": "/" + os.path.relpath(full, self._long(self.root)).replace(os.sep, "/"), "size": st.st_size,
+                 "dir": is_dir, "mft_record": _stat_mft_record(st), "times": _stat_times(st)}
+        if head and not is_dir and st.st_size:
+            try:
+                with open(full, "rb") as fh:
+                    entry["head_hex"] = fh.read(8).hex()
+            except OSError:
+                pass
+        return entry
+
+    def host_stat(self, path):
+        key = path.replace("\\", "/")
+        return self.host_meta.get(key.lower()) or self._entry(
+            os.path.join(self._long(self.root), key.lstrip("/").replace("/", os.sep)), head=True)
+
+    def _file_meta(self, rel, st):
+        return _stat_mft_record(st), _stat_times(st)
+
+    def describe(self):
+        return {"filesystem": "live", "root": self.root,
+                "note": "실행 중인 시스템의 파일을 직접 읽음 — 시각·MFT 번호는 os.stat 값, 삭제 파일·$UsnJrnl 없음"}
 
 
 if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색 범위 자체 검사

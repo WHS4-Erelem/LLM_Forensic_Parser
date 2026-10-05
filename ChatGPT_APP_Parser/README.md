@@ -66,7 +66,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | 옵션 | 설명 |
 |---|---|
 | `--input, -i` | E01(분할 `.E01/.E02…` 포함) / RAW `.dd` `.raw`(분할 `.001` 포함) / 추출 디렉터리 |
-| `--input-type` | `auto`(기본) / `image` / `dir` |
+| `--input-type` | `auto`(기본, 경로를 보고 image/dir 판별) / `image` / `dir`(추출 폴더) / `live`(실행 중인 이 PC 를 직접 분석. 자동 선택되지 않으며 `--input` 을 생략하면 시스템 드라이브) |
 | `--out-dir, -o` | 결과 폴더 (기본 `cx_out`) |
 | `--format` | `csv`(기본, 팀 공통 CSV 2종) / `json`(cx_result.json 전체 레코드) / `both` |
 | `--kinds` | `rollout,rollout_loose,session_index,global_state,auth,sqlite,prefetch,recent_lnk,webcache` 중 선택 (기본 전체) |
@@ -107,6 +107,8 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
 타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.17 (2026-10-05, 라이브 분석 준비 2/5 — 라이브 모드): `--input-type live` 를 추가했다. 이미지를 뜨지 않고 실행 중인 PC 의 볼륨 루트(기본: 시스템 드라이브)를 직접 읽는다(`vfs.LiveVfs`). 탐색 폴더만 읽기 전용으로 열고, 파일 시각과 MFT 레코드 번호는 `os.stat` 값(= 원본 파일시스템의 값)을 MFT 근거 자리에 쓴다. 바로가기 대상 파일과 패키지 폴더는 0.3.11 의 호스트 메타데이터 통로(`host_stat`)로 실제 경로를 직접 조회한다. 삭제 파일과 `$UsnJrnl` 은 다루지 않는다(로그인은 의심, 계정 전환·앱 삭제는 나오지 않음). 표준 라이브러리만 쓴다. 이미지·폴더 입력의 출력은 동일.
+
 0.3.16 (2026-10-05, 라이브 분석 준비 1/5 — 폴더 입력의 탐색 범위 제한): 폴더 입력이 루트 아래 전체를 훑던 것을, 이미지 입력과 같은 탐색 폴더(`locate.SCAN_ROOTS`)만 보도록 바꿨다(`vfs.DirectoryVfs.scan_roots`, 대소문자 무시). 볼륨 루트(`C:\` 나 그 사본)를 줘도 디스크 전체를 돌지 않는다. 탐색 폴더가 하나도 없는 부분 추출 트리(`.codex` 폴더만 준 경우 등)는 이전처럼 전체를 본다. Autopsy 경유 출력은 동일. 자체 검사 `python -m cxparser.vfs`.
 
 0.3.15 (2026-10-04): 채팅 모드 첨부 업로드 행의 `Behavior_details` 가 파일명 대신 대화 제목으로 찍히던 문제 수정(`output.py` 의 내용 우선순위에서 파일명을 제목 앞으로). 첨부가 여러 개면 7열이 모두 같은 행이 되어 통합기가 한 행으로 합치던 것도 함께 해결된다. 대화 제목은 `Artifact_details` 에 그대로 남는다. 채팅 모드 첨부가 없는 이미지(삭제 제외)의 출력은 0.3.14 와 동일.

@@ -1,6 +1,7 @@
 """명령행 인터페이스.
 
   python -m cxparser --input <image.E01|image.dd|디렉터리> --out-dir <결과폴더>
+  python -m cxparser --input-type live --out-dir <결과폴더>        (실행 중인 이 PC 를 직접 분석)
 """
 
 import argparse
@@ -19,9 +20,12 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="cxparser",
         description="Codex Desktop 아티팩트 파서 (E01/RAW 디스크 이미지 -> JSON/CSV)")
-    p.add_argument("--input", "-i", required=True,
-                   help="E01(분할 포함)/RAW .dd/.raw 이미지 또는 추출 디렉터리")
-    p.add_argument("--input-type", choices=("auto", "image", "dir"), default="auto")
+    p.add_argument("--input", "-i",
+                   help="E01(분할 포함)/RAW .dd/.raw 이미지, 추출 디렉터리, 또는 (live) 볼륨 루트. "
+                        "live 에서 생략하면 시스템 드라이브")
+    p.add_argument("--input-type", choices=("auto", "image", "dir", "live"), default="auto",
+                   help="auto=경로를 보고 image/dir 판별 (기본) / image / dir=추출 폴더 / "
+                        "live=실행 중인 이 PC 를 직접 분석 (자동 선택되지 않음, 명시해야 함)")
     p.add_argument("--out-dir", "-o", default="cx_out", help="결과 출력 폴더")
     p.add_argument("--format", choices=("json", "csv", "both"), default="csv",
                    help="csv=팀 공통 timeline.csv + recovered_conversations.csv (기본) / "
@@ -49,7 +53,12 @@ OUTPUT_FILES = ("cx_result.json", "timeline.csv", "recovered_conversations.csv")
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.input:
+        if args.input_type != "live":
+            parser.error("--input 이 필요합니다 (live 일 때만 생략 가능)")
+        args.input = os.environ.get("SystemDrive", "C:") + os.sep
     kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip())
 
     existing = [f for f in OUTPUT_FILES if os.path.exists(os.path.join(args.out_dir, f))]
