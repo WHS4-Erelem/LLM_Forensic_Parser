@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import platform
 import struct
 from datetime import datetime, timedelta, timezone
 
@@ -473,6 +474,28 @@ class LiveVfs(DirectoryVfs):
 
     def _file_meta(self, rel, st):
         return _stat_mft_record(st), _stat_times(st)
+
+    def describe_input(self):
+        """증거 설명(image) — 이미지 파일이 아니라 '언제, 어느 PC 를, 어떤 권한으로 읽었는지' 를 남긴다."""
+        if os.name == "nt":
+            import ctypes
+            try:
+                elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except (AttributeError, OSError):
+                elevated = None
+        else:
+            elevated = os.geteuid() == 0
+        return {
+            "image_id": "live:%s:%s" % (platform.node(), self.root),
+            "image_type": "live",
+            "file_name": self.root,
+            "hostname": platform.node(),
+            "os": platform.platform(),
+            "collected_at_utc": _iso(datetime.now(timezone.utc).replace(microsecond=0)),
+            "elevated": elevated,
+            "note": ("실행 중인 시스템의 파일을 직접 읽음 — 디스크 이미지가 아니므로 같은 결과를 다시 만들 수 없고, "
+                     "읽는 동안 파일이 바뀔 수 있다. 원본은 읽기 전용으로만 열었다 (마지막 접근 시각은 운영체제 설정에 따라 갱신될 수 있음)"),
+        }
 
     def describe(self):
         return {"filesystem": "live", "root": self.root,

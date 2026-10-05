@@ -46,12 +46,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     # --- 1. 입력 열기 -------------------------------------------------
     if input_type == "live":
         vfs = LiveVfs(input_path)
-        image_desc = {
-            "image_id": "live:" + vfs.root,
-            "image_type": "live",
-            "file_name": vfs.root,
-            "note": "실행 중인 시스템의 파일을 직접 읽음 — 디스크 이미지 아님",
-        }
+        image_desc = vfs.describe_input()
         img = None
         fs_desc = vfs.describe()
     elif input_type == "dir" or (input_type == "auto" and os.path.isdir(input_path)):
@@ -186,7 +181,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.18",
+        "tool": {"name": "cxparser", "version": "0.3.19",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

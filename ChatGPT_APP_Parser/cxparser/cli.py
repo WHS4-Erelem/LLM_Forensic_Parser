@@ -90,6 +90,10 @@ def main(argv=None):
     if not args.quiet:
         s = result["summary"]
         print("입력      : %s" % result["input"]["image_id"])
+        if result["input"].get("image_type") == "live":
+            print("라이브    : %s, 수집 %s, 관리자 권한 %s"
+                  % (result["input"]["os"], result["input"]["collected_at_utc"],
+                     {True: "예", False: "아니오"}.get(result["input"]["elevated"], "확인 불가")))
         print("스캔 파일 : %d, Codex 경로 %d건, 파싱 대상 %d건"
               % (result["scan"]["files_scanned"],
                  result["scan"]["codex_paths_found"],
