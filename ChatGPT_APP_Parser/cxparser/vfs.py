@@ -327,6 +327,7 @@ class DirectoryVfs:
         if not os.path.isdir(self.root):
             raise FilesystemError("디렉터리가 아닙니다", path=self.root)
         self.host_provider, self.host_meta = None, {}
+        self.denied = []                       # 권한이 없어 열지 못한 탐색 폴더 (루트 기준 경로)
         meta_path = os.path.join(self.root, HOST_META_NAME)
         if os.path.isfile(meta_path):
             with open(meta_path, encoding="utf-8") as fh:
@@ -356,6 +357,9 @@ class DirectoryVfs:
                 for d in level:
                     try:
                         names = os.listdir(d)
+                    except PermissionError:                # 있지만 권한이 없어 못 여는 폴더 — 숨기지 않고 보고한다
+                        self._note_denied(d)
+                        continue
                     except OSError:
                         continue
                     nxt += [p for p in (os.path.join(d, n) for n in names if fnmatch.fnmatch(n.lower(), seg))
@@ -371,10 +375,26 @@ class DirectoryVfs:
         m = self.host_meta.get(rel.lower()) or {}
         return m.get("mft_record"), m.get("times")
 
+    def _note_denied(self, path):
+        """권한이 없어 열지 못한 폴더를 기록한다. Windows 의 옛 호환용 연결('Default User', 'All Users/Documents' 등
+        재분석 지점)은 관리자여도 열리지 않는 것이 정상이라 제외한다."""
+        try:
+            if getattr(os.lstat(path), "st_file_attributes", 0) & 0x400:       # FILE_ATTRIBUTE_REPARSE_POINT
+                return
+        except OSError:
+            pass
+        rel = "/" + os.path.relpath(path, self._long(self.root)).replace(os.sep, "/")
+        if rel not in self.denied:
+            self.denied.append(rel)
+
+    def _walk_error(self, exc):
+        if isinstance(exc, PermissionError) and exc.filename:
+            self._note_denied(exc.filename)
+
     def iter_files(self):
         walk_root = self._long(self.root)
         for top in self.scan_roots() or ([walk_root] if self.walk_all_without_roots else []):
-            for dirpath, _dirs, files in os.walk(top):
+            for dirpath, _dirs, files in os.walk(top, onerror=self._walk_error):
                 for fn in files:
                     full = os.path.join(dirpath, fn)
                     try:
@@ -419,6 +439,30 @@ def _stat_mft_record(st):
     return (st.st_ino & 0xFFFFFFFFFFFF) or None if os.name == "nt" else None
 
 
+def _registered_package_roots():
+    """현재 사용자에게 설치된 Codex 패키지의 폴더(PackageRootFolder). 관리자 권한이 필요 없다. Windows 가 아니면 빈 목록."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    out = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Software" + os.sep + os.sep.join(
+                ("Classes", "Local Settings", "Software", "Microsoft", "Windows", "CurrentVersion",
+                 "AppModel", "Repository", "Packages"))) as key:
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                name = winreg.EnumKey(key, i)
+                if name.lower().startswith("openai.codex_"):
+                    try:
+                        with winreg.OpenKey(key, name) as sub:
+                            out.append(winreg.QueryValueEx(sub, "PackageRootFolder")[0])
+                    except OSError:
+                        continue
+    except OSError:
+        pass
+    return out
+
+
 class LiveVfs(DirectoryVfs):
     """실행 중인 시스템의 볼륨 루트(C:\\ 등)를 직접 읽는다 — 이미지를 뜨지 않고 그 PC 에서 바로 분석할 때(라이브 분석).
 
@@ -435,8 +479,12 @@ class LiveVfs(DirectoryVfs):
         if not os.path.isdir(self.root):
             raise FilesystemError("디렉터리가 아닙니다", path=self.root)
         self.host_provider, self.host_meta = "live filesystem (os.stat)", {}
+        self.denied = []
         self.drive = os.path.splitdrive(self.root)[0].upper()      # 'C:' / POSIX 는 ''
-        for d in self.scan_roots():            # 패키지 폴더의 생성 시각 = 설치 근거 (package_install 이 dir 항목에서 찾는다)
+        # 패키지 폴더의 생성 시각 = 설치 근거 (package_install 이 dir 항목에서 찾는다).
+        # WindowsApps 는 관리자가 아니면 목록을 볼 수 없지만, 패키지 폴더 자체는 이름을 알면 열린다 → 레지스트리에서 이름을 얻는다.
+        for d in self.scan_roots() + [self._long(p) for p in _registered_package_roots()
+                                      if os.path.splitdrive(p)[0].upper() == self.drive]:
             entry = self._entry(d)
             if entry:
                 self.host_meta[entry["path"].lower()] = entry
@@ -531,4 +579,5 @@ if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색
         assert list(LiveVfs(os.path.join(td, "Users", "a", "Downloads")).iter_files()) == []       # 탐색 폴더가 없으면 아무것도 읽지 않는다
         d = DirectoryVfs(td); d.host_meta = {"/users/a/downloads/x": {"size": 1}}
         assert d.host_stat("C:" + win) == {"size": 1} and "drive" not in next(d.iter_files()).location()
+    assert _registered_package_roots() is not None                                               # 레지스트리가 없어도 예외 없이 목록
     print("vfs self-check ok")

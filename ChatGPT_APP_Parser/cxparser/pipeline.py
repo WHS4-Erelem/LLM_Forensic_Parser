@@ -100,6 +100,13 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         if kind in kinds:
             targets.append((kind, vfile, meta))
 
+    denied = getattr(vfs, "denied", None)
+    if denied:
+        denied = sorted(denied, key=lambda p: (p.count("/"), p))           # 얕은 경로(영향이 큰 것) 먼저
+        warnings.append("권한이 없어 읽지 못한 탐색 폴더 %d곳: %s%s — 관리자 권한으로 실행하면 포함된다 "
+                        "(Windows/Prefetch 가 빠지면 Prefetch 기반 실행 기록이 없다)"
+                        % (len(denied), ", ".join(denied[:6]), " 외 %d곳" % (len(denied) - 6) if len(denied) > 6 else ""))
+
     if not inventory:
         # 음성 대조(negative control) 이미지에서는 "없음" 이 정상 결과다 — 오류가 아니라 0건 + 경고로 끝낸다.
         # 진짜 입력 오류(이미지 안 열림, NTFS 없음)는 그 전 단계에서 CxError 로 이미 걸러진다.
@@ -140,6 +147,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                                  "mft_record": vfile.mft_record})
         except CxError as exc:
             errors.append({"path": vfile.path, **exc.to_dict()})
+        except OSError as exc:            # 라이브 분석: 실행 중인 앱이 잠근 파일, 권한 없는 파일 — 그 파일만 건너뛴다
+            errors.append({"path": vfile.path, "code": "READ_FAILED",
+                           "message": "%s: %s" % (type(exc).__name__, exc)})
         except Exception as exc:  # noqa: BLE001
             errors.append({"path": vfile.path, "code": "UNEXPECTED",
                            "message": "%s: %s" % (type(exc).__name__, exc)})
@@ -181,7 +191,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.19",
+        "tool": {"name": "cxparser", "version": "0.3.20",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
