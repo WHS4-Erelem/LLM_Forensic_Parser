@@ -33,6 +33,8 @@ def build_parser():
     p.add_argument("--kinds", default=",".join(pipeline.DEFAULT_KINDS),
                    help="파싱할 아티팩트 종류 (쉼표구분): "
                         + ",".join(pipeline.DEFAULT_KINDS))
+    p.add_argument("--max-file-mb", type=int, default=pipeline.DEFAULT_MAX_FILE_BYTES // (1024 * 1024),
+                   help="파싱 대상 파일 하나의 크기 상한(MB). 넘으면 그 파일만 FILE_TOO_LARGE 로 건너뛴다 (기본 %(default)s)")
     p.add_argument("--max-excerpt", type=int, default=500,
                    help="근거 발췌 최대 길이(문자)")
     p.add_argument("--no-usn", action="store_true",
@@ -69,7 +71,8 @@ def main(argv=None):
 
     try:
         result = pipeline.run(args.input, input_type=args.input_type, kinds=kinds,
-                              max_excerpt=args.max_excerpt, usn=not args.no_usn,
+                              max_excerpt=args.max_excerpt, max_file_bytes=args.max_file_mb * 1024 * 1024,
+                              usn=not args.no_usn,
                               usn_max_bytes=args.usn_max_bytes, key_material=args.key_material)
     except CxError as exc:
         payload = {"status": "failed", **exc.to_dict()}

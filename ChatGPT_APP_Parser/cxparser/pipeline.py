@@ -58,12 +58,17 @@ def _running_codex_pids():
     return pids
 
 
+# 파싱 대상 파일 하나의 크기 상한. 파일을 통째로 메모리에 읽으므로 상한은 두되, 오래 쓴 PC 의 대화 DB
+# (thread_history_1.sqlite 가 두 달 사용에 94MB)가 걸리지 않게 넉넉히 잡는다. CLI --max-file-mb 로 바꾼다.
+DEFAULT_MAX_FILE_BYTES = 1024 * 1024 * 1024
+
+
 class Result(dict):
     pass
 
 
 def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
-        max_file_bytes=64 * 1024 * 1024, usn=True, usn_max_bytes=None, key_material=None):
+        max_file_bytes=DEFAULT_MAX_FILE_BYTES, usn=True, usn_max_bytes=None, key_material=None):
     started = time.time()
     warnings = []
     errors = []
@@ -150,7 +155,8 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     for kind, vfile, _meta in sorted(targets, key=lambda t: t[1].path):
         if vfile.size > max_file_bytes:
             errors.append({"code": "FILE_TOO_LARGE", "path": vfile.path,
-                           "size": vfile.size, "limit": max_file_bytes})
+                           "size": vfile.size, "limit": max_file_bytes,
+                           "message": "파싱 대상 파일이 크기 상한을 넘어 건너뜀 — --max-file-mb 로 상한을 올릴 수 있다"})
             continue
         parser = PARSERS[kind]
         try:
@@ -226,7 +232,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.21",
+        "tool": {"name": "cxparser", "version": "0.3.22",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
