@@ -1,395 +1,262 @@
-# AIFP — Claude Desktop 포렌식 파서
+# Claude Desktop 아티팩트 파서
 
-디스크 이미지에서 Claude Desktop 사용 흔적을 읽어 **사용자 행위 타임라인**을 만든다.
-살아 있는 시스템을 분석하지 않고, 이미지를 마운트하지도 않는다.
+Windows 디스크 이미지(E01 / RAW)에서 Claude Desktop 의 사용자 행위와 대화를 복원한다.
+이미지를 마운트하지 않고 읽기 전용으로만 연다. BitLocker 로 암호화된 볼륨은 키를 받아
+풀어서 읽고, 이미지 없이 실행 중인 Windows PC 를 직접 분석(라이브)할 수도 있다.
 
-![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/target-Windows%20NTFS-0078D6?logo=windows&logoColor=white)
-![Image formats](https://img.shields.io/badge/image-dd%20%7C%20E01-555)
-![Dependencies](https://img.shields.io/badge/core-stdlib%20only-success)
+설치 형태 세 가지를 모두 찾는다.
 
-```bash
-python aifp_parse.py --image D:\case\disk.dd --out D:\case\result
+```
+%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\   (MSIX)
+%APPDATA%\Claude\                                                        (일반 설치)
+%LOCALAPPDATA%\Claude\ + %LOCALAPPDATA%\Claude-Data\                     (데이터 분리형)
 ```
 
----
-
-## 목차
-
-- [무엇을 하는 도구인가](#무엇을-하는-도구인가)
-- [설치](#설치)
-- [사용법](#사용법)
-- [어디에서 무엇을 읽나](#어디에서-무엇을-읽나)
-- [무엇이 나오나](#무엇이-나오나)
-- [판정 규칙](#판정-규칙)
-- [설계 노트](#설계-노트)
-- [프로젝트 구조](#프로젝트-구조)
-- [확장하기](#확장하기)
-- [파이썬에서 직접 쓰기](#파이썬에서-직접-쓰기)
-
----
-
-## 무엇을 하는 도구인가
-
-획득이 끝난 디스크 이미지를 입력으로 받아, 그 안에서 Claude Desktop의 흔적을 찾아
-"언제 무엇을 했는가"를 근거와 함께 복원한다.
-
-| | |
-| --- | --- |
-| **입력** | `.dd` (RAW 디스크 이미지) · `.E01` (EnCase Evidence File) |
-| **출력** | `timeline.csv` · `recovered_conversations.csv` 두 파일 |
-| **접근 방식** | 읽기 전용 · 마운트 없음 · 관리자 권한 불필요 · 분석 전후 해시 비교 |
-| **대상 탐지** | 사용자 계정마다, 설치 형태(스토어/일반)마다, NTFS 볼륨을 훑어 스스로 찾는다 |
-
-라이브 시스템을 분석하면 파일을 여는 순간 접근 시각이 갱신되고, 앱이 실행 중이면
-캐시 인덱스와 lockfile이 잠겨 읽히지 않는다. 그래서 입력은 이미지다.
-
----
+읽는 저장소는 IndexedDB(대화 본문), HTTP 캐시, Local/Session Storage, 설정 파일,
+Electron 앱 로그, 프리패치, `$UsnJrnl:$J` 다.
 
 ## 설치
 
-파이썬 3.11 이상이면 코어는 표준 라이브러리만으로 동작한다.
+Python 3.10 ~ 3.12 (`pytsk3` 와 `libewf-python` 의 Windows 휠이 이 범위에만 있다).
 
-```bash
-git clone <repo-url>
-cd aifp-parser
-python aifp_parse.py --version
+```
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
 ```
 
-아래 패키지는 선택이다. 없어도 파서는 돌아가며, 빠진 기능은 결과에 사유와 함께 기록된다.
-
-| 패키지 | 없을 때 | 설치 |
+| 패키지 | 역할 | 없으면 |
 | --- | --- | --- |
-| `zstandard` | 대화 본문(zstd) 해제 불가 | `pip install zstandard` |
-| `ccl_chromium_reader` | 캐시 인덱스·IndexedDB 구조 파싱 생략 | `pip install git+https://github.com/cclgroupltd/ccl_chromium_reader.git` |
-| `pyewf` | E01만 읽지 못함 | 환경별 libewf 바인딩 |
+| `pytsk3` | NTFS 볼륨 열거와 파일 읽기 | 실행되지 않는다 |
+| `libewf-python` | E01 열기, 분할 세그먼트 검증 | RAW 이미지만 분석할 수 있다 |
+| `ccl-chromium-reader` | IndexedDB 정식 파싱 | 멈추지 않지만 대화의 발화자와 전송 시각을 복원하지 못한다 |
+| `zstandard` | HTTP 캐시 응답 압축 해제 | 멈추지 않지만 캐시의 압축 구간 안을 보지 못한다 |
+| `dissect.fve` | BitLocker 볼륨 해제 (`pycryptodome` 이 함께 설치된다) | BitLocker 파티션만 `VOLUME_LOCKED` 로 멈춘다. 일반 이미지·라이브 입력은 그대로 동작한다 |
 
-> `ccl_chromium_reader`는 PyPI에 없다. 위 주소로 설치해야 한다.
+## 실행
 
----
-
-## 사용법
-
-```bash
-# 기본
-python aifp_parse.py --image D:\case\disk.dd --out result
-
-# E01
-python aifp_parse.py --image D:\case\disk.E01 --out result
-
-# 파일 삭제·이동·이름 변경과 휴지통 경로까지 추적
-python aifp_parse.py --image D:\case\disk.dd --out result --extended-fs
-
-# 볼륨을 직접 지정
-python aifp_parse.py --image D:\case\disk.dd --volume 2 --out result
+```
+python run_parser.py --input "D:\case\image.E01" --out-dir "D:\case\out" --format both --verbose
 ```
 
-입력은 `.dd` 와 `.E01` 두 가지뿐이다. 다른 확장자는 인자를 받는 자리에서 거절하므로
-분석이 시작되지도 않는다.
+분할 E01 은 첫 세그먼트(`.E01`)만 주면 나머지를 자동으로 잇는다. 분할 RAW 는 첫
+조각(`.001`)을 준다. 확장자가 아니라 파일 시그니처로 형식을 판별한다.
 
-| 옵션 | 설명 |
+콘솔 코드 페이지는 파서가 스스로 UTF-8 로 맞춘다. `chcp 65001` 은 필요 없다.
+
+| 옵션 | 역할 |
 | --- | --- |
-| `--image` | 증거 이미지 (`.dd` 또는 `.E01`) — 필수 |
-| `--out` | 결과 폴더 |
-| `--rules` | 판별 규칙 파일 (기본 `rules/claude_desktop.json`) |
-| `--volume N` | 분석할 파티션 번호. 미지정 시 대상 흔적이 있는 NTFS 볼륨을 자동 선택 |
-| `--extended-fs` | `$UsnJrnl:$J` 와 `$Recycle.Bin` 을 추가로 분석 |
-| `--resume` | 중단된 분석을 체크포인트부터 이어서 실행 |
-| `--keep-work` | 작업 사본 보존. 기본은 덮어쓰고 삭제 |
-| `--verbose` | 단계별 진행 출력 |
+| `--input`, `-i` | E01(분할 포함) / RAW `.dd` `.raw` 이미지, 추출 디렉터리, 또는 (라이브) 볼륨 루트 |
+| `--out-dir`, `-o` | 결과 폴더 (기본 `cl_out`) |
+| `--format` | `csv` CSV 2종 (기본) / `json` 전체 레코드와 근거 / `both` |
+| `--input-type` | `auto`(기본) / `image` / `dir` / `live` (라이브는 자동 선택되지 않는다) |
+| `--key-material` | BitLocker 키: `recovery:<48자리>` / `passphrase:<암호>` / `bek:<.BEK 경로>` / `fvek:<hex>`. 환경변수 `ERELM_KEY_MATERIAL` 로도 받는다 |
+| `--kinds` | 파싱할 아티팩트 종류 제한 (쉼표 구분, 기본은 전체) |
+| `--max-excerpt` | 근거 발췌 최대 길이 (기본 500자) |
+| `--no-usn` | `$UsnJrnl:$J` 분석 생략 |
+| `--usn-max-bytes` | `$J` 에서 읽을 최대 바이트 |
+| `--overwrite` | 기존 결과가 있어도 덮어쓴다 (기본은 거부) |
+| `--verbose`, `-v` | 단계별 진행 상황 출력 |
+| `--no-banner` / `--quiet` | 배너 / 요약 생략 |
 
-시각은 항상 KST로 적는다. 대화 본문은 마스킹하지 않는다.
+종료코드 `0` 정상 · `1` 파일 단위 오류 있음 · `2` 입력 실패.
 
-종료 코드 — `0` 정상 / `1` 오류 발생 / `2` 입력 문제로 중단 / `130` 사용자 중단
+기본이 덮어쓰기 거부인 것은 이전 실행 결과와 새 결과가 한 폴더에 섞이는 것을 막기
+위해서다. 같은 폴더에 다시 내려면 `--overwrite` 를 준다.
 
-분석한 이미지로 전체 검증을 돌릴 수도 있다. 결과 수치를 대조하는 것이 아니라
-무결성 검증 통과, 모든 이벤트에 근거, 시각에 출처, 작업 사본 삭제, 재현성, 재개처럼
-어떤 이미지에서도 참이어야 하는 성질을 확인한다.
+### BitLocker 이미지
 
-```bash
-python tests/verify_all.py D:\case\disk.dd
+```
+set ERELM_KEY_MATERIAL=recovery:123456-123456-123456-123456-123456-123456-123456-123456
+python run_parser.py --input "D:\case\image.E01" --out-dir "D:\case\out"
 ```
 
----
+파티션 선두의 `-FVE-FS-` 로 BitLocker 를 알아보고 `dissect.fve` 로 푼 뒤, 복호화된
+볼륨을 일반 NTFS 와 같은 경로로 읽는다 (MFT·삭제 엔트리·`$UsnJrnl` 포함). 키 형식과
+환경변수 이름은 팀의 다른 파서(Claude Web · ChatGPT)와 같다.
 
-## 어디에서 무엇을 읽나
-
-| 저장소 | 읽는 것 |
+| 볼륨 상태 | 결과 |
 | --- | --- |
-| HTTP 캐시 | 대화 본문이 실제로 남는 곳. 키는 `chat_conversations/<uuid>`, 본문은 zstd |
-| IndexedDB | 대화·첨부·입력 초안 흔적. UTF-8과 UTF-16LE를 동시에 훑는다 |
-| Local Storage | LevelDB 원시 스캔. 삭제 표시(tombstone)와 압축 전 `.log` 잔존분까지 |
-| Blob | IndexedDB blob 실물 — 계정 프로필 |
-| 설정 파일 | 계정·조직 UUID, 종료 직전 재작성 시각, 약 5분 간격 사용 기록 |
-| 앱 로그 | 로그인·로그아웃·계정 전환·종료·모델·계정/조직 UUID. 패키지 밖에 있어 앱을 지워도 남는다 |
-| 파일 메타 | lockfile·캐시 파일의 NTFS 4시각, 앱 삭제 여부 판정, Prefetch 실행 시각 |
-| 변경 저널 | 파일 생성·변경·삭제·이름 변경. 부모 참조로 경로를 되살려 제품까지 가른다 |
-| 휴지통 | 원래 경로와 삭제 시각 |
+| clear key (보호 일시 중단 등) · 복호화 완료 | 키 없이 열린다 |
+| 복구 키 · 암호 · BEK · FVEK 를 줌 | 그 키로 연다 |
+| 키가 없거나 틀림 | `VOLUME_LOCKED` (종료코드 2). 볼륨의 키 보호자 목록을 함께 출력한다 |
+| 평문 볼륨 + 잠긴 볼륨 | `VOLUME_LOCKED`. 복구 파티션 같은 평문 볼륨만 읽고 "아티팩트 없음" 으로 끝내지 않는다 |
 
-시각은 FILETIME·WebKit·Unix 초/밀리초를 자동 판별한다. 저장값은 항상 UTC이고 표시만 바꾼다.
+키는 명령행 기록에 남지 않게 환경변수로 주는 것을 권한다. 키 값은 콘솔·로그·결과
+파일 어디에도 쓰지 않고, 어떤 방법으로 풀었는지(`unlock_method`)만 `result.json`
+의 `filesystem.volumes` 에 남긴다. 무차별 대입이나 우회는 하지 않는다.
 
-앱 로그는 시간대 표시 없이 그 PC의 현지시각으로 적힌다. 파일 수정시각(UTC)과 마지막
-줄을 견줘 오프셋을 추정해 환산하며, 추정했다는 사실은 실행 기록에 남긴다.
+### 라이브 분석 (실행 중인 PC)
 
-이름에 claude 가 들어갔다고 전부 이 앱의 흔적은 아니다. 변경 저널 기록은 경로를 보고
-Claude Desktop · Claude Web · Claude Code(CLI) · 다른 앱으로 가른다. 다른 앱 것은 표에서
-빼고 몇 건을 뺐는지 기록에 남긴다.
+```
+python run_parser.py --input-type live --out-dir "D:\out"
+```
 
----
+이미지를 뜨지 않고 지금 이 PC 의 `C:\`(시스템 드라이브)에서 Claude Desktop 저장 경로를
+찾아 읽는다. 다른 드라이브나 마운트 폴더는 `--input D:\` 로 준다.
 
-## 무엇이 나오나
+- 이미지 분석과 **같은 탐색 경로**(설치 형태 세 가지 + 앱 로그 + 프리패치)만 본다.
+  디스크 전체를 훑지 않는다. 판정 규칙도 이미지와 같다.
+- 원본은 **읽기 전용**으로만 연다. 복사본이나 임시 파일을 원본 경로에 만들지 않고,
+  출력 폴더가 탐색 경로 안이면 실행을 거부한다.
+- 실행 중인 앱이 잡고 있는 파일(HTTP 캐시 등)도 다른 프로세스와 공유하는 읽기로 연다.
+  그래도 못 읽은 파일은 `filesystem.read_failures` 와 경고로 남긴다.
+- 관리자 권한이 아니면 `C:\Windows\Prefetch` 와 `C:\Program Files\WindowsApps` 를 볼 수
+  없다. 열지 못한 폴더는 `filesystem.denied` 에 남는다.
+- 파일 시각·MFT 번호는 `os.stat` 값이고, 그 출처를 근거의 `time_source` 에 적는다.
+  `Artifact_details` 에는 `수집=live` 가 붙는다.
 
-`--out` 폴더에 **두 파일만** 만든다. 둘 다 UTF-8 BOM이라 엑셀에서 바로 열린다.
+## 출력
 
-### timeline.csv
-
-흔적이 확인된 사용자 행위를 시간순으로. 미검출 행위는 싣지 않는다.
-
-| 열 | 내용 |
+| 파일 | 내용 |
 | --- | --- |
-| `service` | 분석 대상 서비스 (`claude-desktop`) |
-| `timestamp` | 행위를 대표하는 시각 (KST). 근거 있는 시각이 없으면 **비워 둔다** |
-| `user_action` | 사전에 정의된 행위명 |
-| `action_detail` | 증거 상태와 핵심 내용 |
-| `verdict` | `확정` — 독립 아티팩트 2계열 교차검증 또는 직접 증거<br>`의심` — 흔적은 있으나 확정 기준 미달 |
-| `account_uuid` | 확정할 수 있을 때만 |
-| `conversation_uuid` | 특정 대화와 연결될 때만 |
+| `timeline.csv` | 판정된 사용자 행위 (확정·의심만) |
+| `recovered_conversations.csv` | 복원한 대화를 메시지 단위로 |
+| `result.json` | 전체 레코드와 판정 근거 (`--format json` 또는 `both`) |
 
-### recovered_conversations.csv
+CSV 는 UTF-8 BOM 으로 저장해 엑셀에서 바로 열린다. 시각은 KST, 값이 없는 칸은 `-`.
 
-복원한 대화를 **메시지 단위**로.
+**timeline.csv** — `Model` · `Timestamp` · `User_behavior` · `Behavior_details ` ·
+`Verdict` · `Artifact_path` · `Artifact_details `
 
-| 열 | 내용 |
+`Verdict` 는 `확정`(아티팩트가 그 행위를 직접 증명) 과 `의심`(정황 증거) 두 가지다.
+근거를 찾지 못한 행위는 행을 만들지 않는다. `User_behavior` 는 고정된 행위 분류표의
+이름만 쓴다 (`parser/events.py` 참조).
+
+**recovered_conversations.csv** — `Model` · `timestamp` · `conversation_uuid` ·
+`conversation_title` · `message_uuid` · `parent_message_uuid` · `message order` ·
+`role` · `content` · `Artifact_path`
+
+`role` 은 본문이 어디에서 왔는지로 판정한 값이다.
+
+| 값 | 뜻 |
 | --- | --- |
-| `service` | `claude-desktop` |
-| `timestamp` | 메시지 생성 시각 (KST) |
-| `conversation_uuid` / `conversation_title` | 대화 식별자와 제목 |
-| `message_uuid` / `parent_message_uuid` | 메시지 식별자와 부모 — 수정·재시도 분기를 보존한다 |
-| `message_order` | 부모·자식 관계로 재구성한 순서. 대화마다 1부터 |
-| `role` | `user` / `assistant` / `system` / `unknown` (`human`은 `user`로 변환) |
-| `content` | 본문 전체. 마스킹하지 않고 한 셀에 넣는다 |
-| `recovery_status` | `완전 복구` — UUID·역할·내용이 모두 있고 잘림 없음<br>`부분 복구` — 일부가 없거나 잘림 |
+| `user` | 사용자가 입력창에 친 말, 파일을 올린 말 |
+| `assistant` | 모델 응답 |
+| `system` | 앱이 대화에 끼워 넣은 안내 (`<system-reminder>` 등) |
+| `tool` | 도구 실행 결과 |
+| `unknown` | 역할 표식 없이 저장소에 남아 있던 본문 |
 
----
+앱은 시스템 안내와 도구 결과도 발화자를 `user` 로 적어 저장한다. 그대로 실으면
+사용자가 한 말로 읽히므로 다시 판정한다.
 
-## 판정 규칙
+산출물에는 대화 본문이 마스킹 없이 들어간다. 사건 자료로 취급한다.
 
-로그인, 대화 생성·열람·삭제, 프롬프트 입력과 전송, 모델 응답, 파일 업로드,
-앱 실행과 정상 종료, 애플리케이션 삭제, 모델 변경, 임시 채팅, 캐시 삭제 등
-17가지를 직접 증거와 보조 증거로 나누어 판정한다.
+## 대화를 어떻게 복원하는가
 
-규칙은 코드가 아니라 `rules/claude_desktop.json`에 있다. 앱이 업데이트되어 경로나 키가
-바뀌면 이 파일만 고치면 된다. 어떤 규칙으로 판정했는지는 `--log` 로 남기는 실행 기록에 규칙 버전으로 적힌다.
+IndexedDB 값은 V8 구조화 복제로 저장된다. 정식으로 역직렬화하면 발화자·전송 시각·대화
+UUID·부모 메시지가 기록된 값 그대로 나온다. Claude Desktop 은 대화를 네 곳에 나누어 담는다.
 
-```json
-{
-  "id": "E02-02",
-  "name": "애플리케이션 삭제",
-  "category": "install",
-  "evidence_level": "direct",
-  "require": [{ "kind": "app_removed", "source": "fsmeta" }],
-  "per_record": true,
-  "time_from": "context",
-  "explain": "왜 이것이 그 행위의 근거인지 적는다 — 보고서에 그대로 인용된다"
-}
-```
+| 데이터베이스 / 스토어 | 형태 | 얻는 것 |
+| --- | --- | --- |
+| `claude-conversation-store` / `trees` (`product=chat`) | `tree.chat_messages[]` | 발화자, 본문, 순번, 부모 메시지 |
+| `claude-conversation-store` / `trees` (`product=cowork`) | `tree.events[].payload.message` | 역할, 본문, 세션 ID, 전송 시각 |
+| `keyval-store` / `keyval` (`react-query-cache`) | 대화 목록 | 제목, 생성 시각, 모델, 임시 채팅 여부, 요약 |
+| `claude-conversation-store` / `meta` | 열람 기록 | 마지막 열람 시각, 메시지 수 |
 
-대상 경로도 규칙 파일이 선언한다. 설치 형태가 여럿이면 후보를 나열하면 된다.
+같은 부모 메시지 아래에 형제가 둘 이상 있으면 그 자리에서 대화가 갈라진 것이다.
+사용자 메시지의 형제는 대화 수정, 모델 응답의 형제는 대화 재시도로 판정한다.
 
-```json
-"app_root": {
-  "relative": "AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude",
-  "alternatives": ["AppData/Roaming/Claude"],
-  "marker_files": ["config.json"],
-  "marker_dirs": ["IndexedDB"]
-}
-```
+본문이 남지 않은 대화는 목록의 `summary` 필드가 유일한 내용 단서이므로 함께 수집한다.
+이 요약은 앱이 생성한 문장이고 사용자가 입력한 말이 아니다. 그래서
+`recovered_conversations.csv` 에는 싣지 않고 `result.json` 의 관찰 기록으로만 남기며,
+근거 문구에 사용자 발화가 아님을 적는다.
 
----
+정식 파싱이 닿지 못한 곳(압축 전 `.log` 의 잔존분, 입력창 초안)만 원시 스캔으로 보완한다.
+정식 파싱이 이미 읽은 저장소에서 원시 스캔이 다시 집어 올린 본문은 같은 대화의 잘린
+조각이므로 `result.json` 에 근거로 남기고 CSV 에는 싣지 않는다 (`superseded_by`).
 
-## 설계 노트
+## 다른 이미지에서는 어떻게 되는가
 
-### 1. 이중 인코딩 검색은 선택이 아니다
+복원되는 대화의 양은 이미지가 무엇을 갖고 있느냐로 정해진다. 앱은 최근에 연 대화의
+트리만 보관하고 나머지는 버린다. 그래서 대화 목록에 수십 건이 있어도 본문을 복원할 수
+있는 대화는 몇 건뿐인 경우가 흔하다.
 
-`chat-draft` 같은 키는 IndexedDB 안에 UTF-16LE로만 존재하고 UTF-8로는 한 번도
-나타나지 않는 경우가 있다. UTF-8로만 찾으면 입력 초안이 통째로 안 보인다.
-그래서 모든 검색을 두 인코딩으로 동시에 한다.
-
-### 2. 파일 시각을 그대로 믿으면 안 된다
-
-Chromium은 종료할 때 밀린 쓰기를 한꺼번에 flush한다. 캐시 파일의 수정 시각이
-전부 "앱을 끈 시각"으로 수렴한다. 파서는 이 수렴을 감지해 신뢰도를 낮추고 경고를 붙인다.
-
-| 시각 출처 | 신뢰도 |
+| 이미지 상태 | 결과 |
 | --- | --- |
-| 앱 로그 · API 응답 · `$UsnJrnl` | 높음 |
-| 설정 파일 · 파일명에 박힌 시각 | 중간 |
-| `$MFT` 타임스탬프 | 낮음 |
+| 앱이 설치돼 있고 최근 대화가 있음 | 본문 + 대화 목록 + 요약 |
+| 대화는 많지만 오래됨 | 목록·요약은 나오고 본문은 최근 것만 |
+| 앱을 지운 이미지 | 대화 0건. 앱 로그·프리패치로 계정과 실행 흔적만 |
+| Windows 사용자가 여럿 | 사용자별로 따로 복원한다 |
 
-### 3. "흔적 없음"과 "못 읽음"은 다르다
+무엇을 얻었는지는 결과의 `indexeddb` 로 확인한다.
 
-| 결과 | 의미 |
+```
+python -c "import json,io;print(json.load(io.open(r'out\result.json',encoding='utf-8'))['indexeddb'])"
+```
+
+```
+available            ccl-chromium-reader 로 정식 파싱이 됐는지
+conversations        확인한 대화 수 (목록 기준)
+messages             본문을 복원한 메시지 수
+user_messages        그중 사용자가 입력한 것
+```
+
+`conversations` 는 큰데 `messages` 가 작다면 파서가 놓친 것이 아니라 그 이미지에 본문이
+남아 있지 않은 것이다. `available` 이 `false` 면 대화의 발화자와 전송 시각을 복원하지
+못한 상태이므로 보고서에 그 사실을 적는다.
+
+행위 탐지는 이미지에 근거가 있을 때만 행을 만든다. 근거가 없으면 추측해서 채우지 않는다.
+결과가 적게 나오는 것과 파서가 실패한 것은 다르며, 후자는 `result.json` 의 `errors` 와
+`warnings` 에 남는다.
+
+## 테스트
+
+```
+python -m unittest discover -s tests -v
+```
+
+| 파일 | 확인하는 것 |
 | --- | --- |
-| `not_detected` | 찾아봤는데 없었다 — 확인한 경로를 함께 기록 |
-| `not_applicable` | 기능 자체가 없다 (데스크톱 앱에는 시크릿 모드가 없다) |
-| `deleted_recovered` | 삭제 엔트리에서 본문까지 복원 |
-| `deleted_metadata_only` | 클러스터가 재할당되어 이름·시각만 남음 |
+| `tests/test_bitlocker.py` | 해제 방식별(복구 키·암호·BEK·clear key·복호화 완료) 열기, 키 없음·틀린 키·형식 오류의 잠김 처리, 키 값 비노출, 평문 이미지 결과 불변 |
+| `tests/test_live.py` | 라이브 결과가 이미지 입력과 같은 행위·시각·판정인지, 원본 불변, 탐색 범위, 증거 안 출력 거부, 실행 중인 앱이 잡은 파일 읽기, 독점 잠금 파일 보고 |
 
-### 4. 확신도는 독립 채널 수로 매긴다
+BitLocker 시험은 처음 실행할 때 `dissect.fve` 저장소의 BitLocker 테스트 볼륨(고정
+커밋, AGPL-3.0 데이터라 저장소에는 넣지 않음)을 `tests/_data/bde/` 로 내려받는다.
+그 볼륨은 데이터 영역이 비어 있어서, `tests/_data/claude_ntfs.img.gz`(합성 Claude
+아티팩트, `tests/make_ntfs_fixture.sh` 로 생성)를 그 볼륨의 키로 암호화해 채운 뒤
+분석한다 (`tests/bde_fixture.py`). 오프라인이면 해당 시험만 건너뛴다.
 
-```text
-직접 증거 60점 / 보조 증거 35점에서 출발
-  + 서로 다른 저장소에서 같은 행위가 확인될 때마다 +15
-  − 시각 신뢰도가 낮으면 −10
+## 알려진 한계
+
+| 항목 | 내용 |
+| --- | --- |
+| IndexedDB 정식 파싱 | `ccl-chromium-reader` 가 없거나 역직렬화가 실패하면 원시 스캔으로 대체하고 경고를 남긴다. 이때는 발화자와 전송 시각을 복원하지 못한다 |
+| 삭제된 저장소 파일 | 클러스터를 다른 데이터가 덮어쓴 경우 내용을 읽지 않고 그 사실만 기록한다 |
+| 대화 본문 보존 범위 | 앱이 최근 대화의 트리만 보관한다. 나머지 대화는 제목·생성 시각·요약만 복원되며 본문은 이미지에 없다 |
+| 전체 이미지 해시 | 대용량 이미지 식별을 위해 첫 세그먼트 선두 64MB 만 해시한다. 분석 전후 무결성 증명이 필요하면 `certutil -hashfile` 로 따로 뜬다 |
+| 분할 E01 | 마지막 세그먼트가 누락되면 열지 않고 중단한다. 잘린 이미지를 분석해 잘못된 해시를 내지 않기 위해서다 |
+| 다운로드 폴더 | 파일 다운로드는 Claude 경로 밖에서 일어나 현재 탐색 범위가 아니다 |
+| 다른 제품 | Claude Code(CLI), Claude Web, 이름만 겹치는 다른 앱의 경로는 제외하고 건수를 경고로 남긴다 |
+| NTFS 압축 | 압축 속성이 켜진 `$DATA` 는 해제하지 않는다 |
+| BitLocker | AES-XTS(Windows 10 이후 기본)는 빠른 복호화 경로를 쓰고, 그 외 방식은 `dissect.fve` 기본 경로라 느리다. 실제 BitLocker 시나리오 이미지(68.7GB, clear key)에서 Claude 아티팩트 152개 전부를 독립 구현(`dissect.fve` 기본 복호화 + `dissect.ntfs`)과 해시 대조해 일치를 확인했다 |
+| 초기화 크기(VDL) | 미리 할당된 파일(캐시 `data_N` 등)은 초기화 크기 뒤를 NTFS 규칙대로 0 으로 읽는다. 그 뒤에 디스크에 남은 옛 바이트(잔존 데이터)는 파일 내용으로 보지 않으며 현재 분석하지 않는다 |
+| 라이브 분석 재현성 | 실행 중인 시스템을 읽으므로 같은 결과를 다시 만들 수 없고, 읽는 동안 앱이 파일을 바꿀 수 있다. 증거 보존이 필요하면 이미지를 뜬다 |
+| 라이브 분석 범위 | 삭제 파일과 `$UsnJrnl:$J` 는 다루지 않는다 (볼륨을 원시로 열지 않는다). MFT 변경 시각은 얻을 수 없어 비워 둔다. 마지막 접근 시각은 운영체제 설정에 따라 갱신될 수 있다 |
+
+## 구조
+
+```
+run_parser.py          실행 진입점
+parser/
+  cli.py               인자 해석, 콘솔 UTF-8 설정, 덮어쓰기 보호
+  pipeline.py          증거 열기 → 경로 탐색 → 파싱 → 중복 정리 → 교차검증
+  image.py             E01(분할 검증 포함) · RAW 열기
+  vfs.py               NTFS 볼륨 열거와 파일 읽기 (삭제 엔트리 포함)
+  locate.py            설치 형태별 경로 식별
+  events.py            사용자 행위 분류표
+  model.py             레코드 구조 — 시각 · 사용자 행위 · 근거
+  timeline.py          시각순 정렬과 시각 미상 분리
+  output.py            result.json · CSV 2종
+  usn.py               $UsnJrnl:$J 해석
+  util.py              시각 변환 · 발췌 · 민감정보 마스킹
+  artifacts/
+    idbtree.py         IndexedDB 정식 파싱 — V8 역직렬화
+    idbstore.py        파싱 결과를 레코드로 — 발화자 판정, 분기 감지
+    idb.py             저장소 원시 스캔 — 입력 초안, 잔존분
+    v8text.py          V8 문자열 이중 인코딩 해독
+    misc.py            캐시 · 설정 파일 · 프리패치
+    applog.py          Electron 로그, 타임존 보정
 ```
 
-같은 저장소에서 근거가 여러 개 나오는 것은 교차 검증이 아니다. 채널 수는 늘지 않는다.
-독립 채널의 기준은 `Storage` 열거형(`cache` `indexeddb` `localstorage` `blob`
-`configfile` `applog` `filesystem` `registry`)이다.
-
-### 5. 앱을 지워도 파일시스템은 기억한다
-
-`--extended-fs` 를 켜면 `$UsnJrnl:$J` 에서 Claude 관련 파일의 생성·삭제·이름 변경을,
-`$Recycle.Bin` 의 `$I` 파일에서 삭제된 파일의 **원래 전체 경로와 삭제 시각**을 읽는다.
-같은 파일에 수십 건씩 쌓이는 기록은 파일 단위로 묶어 처음·마지막 시각과 횟수만 남긴다.
-
-### 6. 이미지가 온전하지 않을 수 있다
-
-파티션 표가 말하는 디스크 크기보다 파일이 작으면 잘린 이미지로 보고 누락량을 알린다.
-볼륨 하나가 BitLocker나 손상으로 열리지 않아도 나머지 볼륨은 계속 본다.
-불량 섹터는 0으로 채우고 진행하되, 그 사실을 `issues.csv`에 남긴다.
-
----
-
-## 프로젝트 구조
-
-```text
-aifp-parser/
-├── aifp_parse.py              CLI 진입점
-├── rules/
-│   └── claude_desktop.json    판별 규칙 — 코드가 아니라 여기를 고친다
-├── aifp/
-│   ├── pipeline.py            오케스트레이션 (증거 → 수집 → 판정 → 출력)
-│   ├── evidence/
-│   │   ├── container.py       RAW/dd · E01 → read(off, n)
-│   │   ├── vfs.py             NTFS를 마운트 없이 pathlib처럼 읽는 읽기 전용 VFS
-│   │   ├── _ntfs.py           $MFT 파서
-│   │   └── _vmdk.py           VMDK sparse 체인 리더
-│   ├── sources/               저장소별 리더 + 네임스페이스 레지스트리
-│   │   ├── cache_store.py     HTTP 캐시 (대화 본문)
-│   │   ├── leveldb_store.py   IndexedDB · Local Storage · blob
-│   │   ├── config_store.py    설정·상태 파일
-│   │   ├── fsmeta_store.py    앱 로그 · 파일 메타
-│   │   └── fsextra_store.py   $UsnJrnl:$J · $Recycle.Bin (--extended-fs)
-│   ├── actions.py             규칙 평가 + 교차 검증
-│   ├── schema.py              통합 이벤트 스키마 + 확신도
-│   ├── provenance.py          근거(ArtifactRef) + 수집 매니페스트
-│   ├── timeutil.py            시각 변환 + 출처/신뢰도 + flush 수렴 감지
-│   ├── masking.py             민감정보 가림
-│   ├── errors.py              예외 계층 + ErrorCollector
-│   ├── checkpoint.py          재개 — 중단 지점부터 이어서
-│   ├── report.py              집계 + 타임라인 구성
-│   ├── csvout.py              출력 — timeline.csv · recovered_conversations.csv
-│   └── banner.py              CLI 배너
-└── tests/
-    ├── verify_all.py          전체 검증 (분석할 이미지를 인자로 준다)
-    └── compare_runs.py        두 실행 결과 비교
-```
-
----
-
-## 확장하기
-
-다른 AI 서비스를 붙일 때 **코어는 건드리지 않는다.** 규칙 파일이 대상 경로와 쓸 리더를
-모두 선언하고, 리더만 새로 쓴다.
-
-```json
-{
-  "service_key": "chatgpt-desktop",
-  "target": {
-    "service": "ChatGPT",
-    "client": "desktop",
-    "app_root": {
-      "relative": "AppData/Local/Packages/OpenAI.../LocalCache/Roaming",
-      "marker_files": ["auth.json"],
-      "marker_dirs": ["sessions"]
-    },
-    "sources": ["jsonl", "sqlite", "config", "fsmeta"]
-  },
-  "rules": []
-}
-```
-
-리더는 `locate()`와 `read()` 둘만 구현하면 된다.
-
-```python
-from aifp.provenance import ArtifactRef, Storage
-from aifp.sources.base import Record, Source
-
-
-class SessionSource(Source):
-    name = "jsonl"
-    display = "세션 기록"
-
-    def locate(self) -> list:
-        d = self.root / "sessions"
-        return sorted(d.glob("*.jsonl")) if d.is_dir() else []
-
-    def read(self) -> list[Record]:
-        out = []
-        for f in self.locate():
-            data = self.safe_bytes(f)          # 실패해도 예외를 던지지 않는다
-            if data is None:
-                continue
-            out.append(Record(
-                source=self.name, kind="conversation", key=f.stem,
-                value={"uuid": f.stem},
-                ref=ArtifactRef(path=str(f), storage=Storage.FILESYSTEM.value),
-            ))
-        return out
-```
-
-등록은 한 줄이다. 리더는 `<service_key>.<name>`으로 등록되므로 서비스마다
-`cache`·`config` 같은 같은 이름을 써도 충돌하지 않는다.
-
-```python
-# aifp/sources/__init__.py 의 _bootstrap()
-register("chatgpt-desktop", SessionSource)
-```
-
-```bash
-python aifp_parse.py --image D:\case\disk.dd --rules rules/chatgpt_desktop.json --out result
-```
-
-그대로 재사용되는 계층 — `evidence/` · `errors` · `timeutil` · `provenance` ·
-`masking` · `schema` · `actions` · `report` · `checkpoint` (전부 서비스 무관)
-
----
-
-## 파이썬에서 직접 쓰기
-
-CLI를 거치지 않고 파이프라인을 직접 부를 수 있다.
-
-```python
-from pathlib import Path
-from aifp.pipeline import Pipeline
-
-from aifp.csvout import (rows_from_reporter, write_conversations,
-                          write_timeline)
-
-reporter = Pipeline(
-    Path(r"D:\case\disk.dd"),
-    Path("rules/claude_desktop.json"),
-    out_dir=Path("result"),
-    tz="KST",
-    unmask=True,
-    extended_fs=True,          # $UsnJrnl:$J · $Recycle.Bin 까지
-).run()
-
-timeline, conversations = rows_from_reporter(reporter)
-write_timeline(timeline, Path("result/timeline.csv"))
-write_conversations(conversations, Path("result/recovered_conversations.csv"))
-print(len(timeline), len(conversations))
-```
-
-자세한 실행 절차와 확인 항목은 [TESTING.md](TESTING.md)에 있다.
+다른 LLM 서비스를 붙일 때는 `locate.py` 에 경로를, `artifacts/` 에 저장소 리더를 더한다.
+파이프라인과 출력은 건드리지 않는다.

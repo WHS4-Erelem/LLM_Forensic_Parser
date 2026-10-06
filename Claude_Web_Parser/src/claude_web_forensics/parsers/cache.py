@@ -1,324 +1,217 @@
-"""Chrome Cache parser (spec section 10.3).
-
-Order of work: index entry metadata, select Claude-related keys, hydrate bodies
-only when needed, decode, extract semantics. Only decoded Claude download-file
-bodies are kept (in the temporary workspace) so on-disk files can be matched to
-them byte for byte; nothing is exported.
-Bodies are never all loaded into memory (fix for chrome_artifact_diff_v2.py:960-1099).
-"""
+"""Chrome Cache parser."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import collections
+import datetime as dt
+import re
 from pathlib import Path
 from typing import Any, Callable
 
-from ..decode.content import DECODE_LIMITED, sniff_and_decompress
-from ..decode.content import decode_text_strict, try_parse_json
+from ..decode.content import DECODE_LIMITED, decode_text_strict, sniff_and_decompress
+from ..decode.content import image_format, try_parse_json
 from ..model.entities import FAMILY_CACHE, EvidenceRecord, make_evidence_id
 from ..model.entities import ST_FAILED, ST_NOT_FOUND, ST_PARSED, ST_PARTIAL, ParseStatus
-from ..util.common import from_iso8601
+from ..util.common import UTC, ensure_aware
 from . import ccl_adapter as ccl
-from .common import (
-    conversation_from_url,
-    is_claude_url,
-    organization_from_url,
-    truncate,
-)
+from .common import conversation_from_url, is_claude_url, organization_from_url, truncate
+from .filesystem import remote_path
 
-# Claude API surfaces worth indexing first (spec section 10.3).
 KEY_CONVERSATION = "conversation_api"
 KEY_CONVERSATION_LIST = "conversation_list"
 KEY_LATEST_SNAPSHOT = "latest_or_snapshot"
+KEY_SHARE = "share_api"
+KEY_FILE_ASSET = "file_asset"
 KEY_DOWNLOAD_FILE = "download_file"
 KEY_ORGANIZATION = "organization_api"
 KEY_ACCOUNT = "account_api"
 KEY_OTHER_CLAUDE = "other_claude"
 
-# Only these are hydrated; static assets are indexed but their bodies are not read.
 HYDRATE_KINDS = {
-    KEY_CONVERSATION,
-    KEY_CONVERSATION_LIST,
-    KEY_LATEST_SNAPSHOT,
-    KEY_DOWNLOAD_FILE,
-    KEY_ORGANIZATION,
-    KEY_ACCOUNT,
+    KEY_CONVERSATION, KEY_CONVERSATION_LIST, KEY_LATEST_SNAPSHOT, KEY_SHARE,
+    KEY_DOWNLOAD_FILE, KEY_ORGANIZATION, KEY_ACCOUNT,
 }
 
-_STATIC_MARKERS = (
-    "/_next/", "/static/", ".js", ".css", ".woff", ".woff2", ".ttf",
-    ".ico", ".map", "/sdk/", "assets.claude", "a-cdn",
-)
-
+_CONVERSATION_PATH = re.compile(r"/chat_conversations/[0-9a-f-]{36}(?:/([a-z_]+))?(?:[/?#]|$)")
+_FILE_ASSET_PATH = re.compile(r"/api/[0-9a-f-]{36}/files/([0-9a-f-]{36})/([a-z_]+)")
+_SHARE_SUBRESOURCES = {"share_access", "shares", "access_requests", "share"}
 
 def classify_key(key: str) -> str:
-    """Bucket a cache key so hydration can stay selective."""
     k = key.lower()
     if "/wiggle/download-file" in k or "download-file?" in k:
         return KEY_DOWNLOAD_FILE
-    if "/chat_conversations/" in k and "composer_notices" not in k:
-        if k.rstrip("/").endswith("/latest") or "/snapshot" in k:
+    match = _CONVERSATION_PATH.search(k)
+    if match:
+        sub = match.group(1) or ""
+        if not sub:
+            return KEY_CONVERSATION
+        if sub == "latest" or sub.startswith("snapshot"):
             return KEY_LATEST_SNAPSHOT
-        return KEY_CONVERSATION
+        if sub in _SHARE_SUBRESOURCES:
+            return KEY_SHARE
+        return KEY_ORGANIZATION
     if "chat_conversations_v2" in k or "chat_conversations?" in k:
         return KEY_CONVERSATION_LIST
+    if _FILE_ASSET_PATH.search(k):
+        return KEY_FILE_ASSET
     if "/api/account" in k or "/api/bootstrap" in k or "current_account" in k:
         return KEY_ACCOUNT
     if "/api/organizations/" in k:
         return KEY_ORGANIZATION
-    if any(marker in k for marker in _STATIC_MARKERS):
-        return KEY_OTHER_CLAUDE
     return KEY_OTHER_CLAUDE
 
+def _as_time(value: Any) -> dt.datetime | None:
+    return ensure_aware(value, UTC) if isinstance(value, dt.datetime) else None
 
-@dataclass
-class CacheIndexEntry:
-    key: str
-    kind: str
-    variant: int
-    metadata: Any
-    meta_location: str
-    body_location: str
-    content_type: str = ""
-    content_encoding: str = ""
-    organization_uuid: str | None = None
-    conversation_uuid: str | None = None
-    attributes: dict[str, Any] = field(default_factory=dict)
-
+def _shape(value: Any) -> str:
+    if isinstance(value, dict):
+        keys = sorted(value)
+        return "{" + ",".join(keys[:12]) + (",…" if len(keys) > 12 else "") + "}"
+    if isinstance(value, list):
+        return f"list[{len(value)}]"
+    return type(value).__name__
 
 def parse_cache(
-    cache_dir: Path,
-    source_path: str,
-    volume_id: str,
-    raw_writer: Callable[[bytes, str], str] | None = None,
+    cache_dir: Path, source_path: str, volume_id: str, raw_writer: Callable[[bytes, str], str] | None = None,
 ) -> tuple[list[EvidenceRecord], ParseStatus]:
-    """Parse the Chromium cache. `raw_writer(data, suffix) -> path` keeps download bodies."""
     records: list[EvidenceRecord] = []
-    errors: list[str] = []
-
     if not cache_dir.exists():
         return records, ParseStatus(
-            artifact="Cache",
-            family=FAMILY_CACHE,
-            status=ST_NOT_FOUND,
-            source_path=source_path,
-            message="Cache_Data directory not staged",
-            impact="cached conversation/API bodies unavailable",
+            artifact="Cache", family=FAMILY_CACHE, status=ST_NOT_FOUND,
+            source_path=source_path, message="Cache_Data directory not staged",
         )
-
     try:
         cache = ccl.open_cache(cache_dir)
     except Exception as exc:
         return records, ParseStatus(
-            artifact="Cache",
-            family=FAMILY_CACHE,
-            status=ST_FAILED,
-            source_path=source_path,
-            error_code=type(exc).__name__,
+            artifact="Cache", family=FAMILY_CACHE, status=ST_FAILED, source_path=source_path,
             message=str(exc),
-            impact="cached conversation/API bodies unavailable",
         )
 
-    total_keys = 0
-    claude_keys = 0
-    hydrated = 0
+    errors: list[str] = []
+    total_keys = hydrated = 0
 
+    stats: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    shapes: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     try:
-        # ---- 1) metadata-first indexing --------------------------------
-        index: list[CacheIndexEntry] = []
         for key in ccl.cache_keys(cache):
             total_keys += 1
             if not is_claude_url(key):
                 continue
-            claude_keys += 1
             kind = classify_key(key)
             metas = ccl.cache_metadata(cache, key)
             meta_locs, body_locs = ccl.cache_locations(cache, key)
-            count = max(len(metas), len(meta_locs), len(body_locs), 1)
-            for i in range(count):
-                meta = metas[i] if i < len(metas) else None
-                index.append(
-                    CacheIndexEntry(
-                        key=key,
-                        kind=kind,
-                        variant=i,
-                        metadata=meta,
-                        meta_location=ccl.location_str(
-                            meta_locs[i] if i < len(meta_locs) else None
-                        ),
-                        body_location=ccl.location_str(
-                            body_locs[i] if i < len(body_locs) else None
-                        ),
-                        content_type=ccl.header_value(meta, "content-type") or "",
-                        content_encoding=ccl.header_value(meta, "content-encoding") or "",
-                        organization_uuid=organization_from_url(key),
-                        conversation_uuid=conversation_from_url(key),
-                    )
-                )
-
-        # ---- 2) selective hydration -----------------------------------
-        bodies_by_key: dict[str, list[bytes]] = {}
-        for entry in index:
-            locator = f"key={entry.key};variant={entry.variant}"
-            attributes: dict[str, Any] = {
-                "subtype": "cache_entry",
-                "cache_key": entry.key,
-                "key_kind": entry.kind,
-                "variant_index": entry.variant,
-                "content_type": entry.content_type,
-                "content_encoding": entry.content_encoding,
-                "metadata_location": entry.meta_location,
-                "body_location": entry.body_location,
-                "volume_id": volume_id,
-                "body_hydrated": False,
-            }
-
-            request_time = ccl.get_attr_any_meta(entry.metadata, "request_time")
-            response_time = ccl.get_attr_any_meta(entry.metadata, "response_time")
-            attributes["request_time"] = str(request_time) if request_time else ""
-            attributes["response_time"] = str(response_time) if response_time else ""
-
-            summary = f"Cache entry ({entry.kind}): {truncate(entry.key, 140)}"
-            timestamp = None
-            message_payload: Any = None
-
-            if entry.kind in HYDRATE_KINDS:
-                if entry.key not in bodies_by_key:
-                    bodies_by_key[entry.key] = ccl.cache_bodies(cache, entry.key)
-                bodies = bodies_by_key[entry.key]
-                body = bodies[entry.variant] if entry.variant < len(bodies) else None
-
+            bodies = ccl.cache_bodies(cache, key) if kind in HYDRATE_KINDS else []
+            for variant in range(max(len(metas), len(meta_locs), len(body_locs), 1)):
+                meta = metas[variant] if variant < len(metas) else None
+                meta_loc = ccl.location_str(meta_locs[variant] if variant < len(meta_locs) else None)
+                body_loc = ccl.location_str(body_locs[variant] if variant < len(body_locs) else None)
+                attributes: dict[str, Any] = {
+                    "subtype": "cache_entry", "cache_key": key, "key_kind": kind, "variant_index": variant,
+                    "content_type": ccl.header_value(meta, "content-type") or "",
+                    "content_encoding": ccl.header_value(meta, "content-encoding") or "",
+                    "metadata_location": meta_loc, "body_location": body_loc,
+                    "request_at": _as_time(ccl.get_attr_any_meta(meta, "request_time")),
+                    "response_at": _as_time(ccl.get_attr_any_meta(meta, "response_time")),
+                    "body_hydrated": False, "volume_id": volume_id,
+                }
+                asset = _FILE_ASSET_PATH.search(key.lower())
+                if asset:
+                    attributes["file_uuid"], attributes["file_variant"] = asset.groups()
+                if kind == KEY_DOWNLOAD_FILE:
+                    attributes["output_path"] = remote_path(key.split(" ")[-1])
+                stats[kind]["entries"] += 1
+                body = bodies[variant] if variant < len(bodies) else None
                 if body is not None:
                     hydrated += 1
-                    attributes.update({"body_hydrated": True, "raw_size": len(body)})
+                    parsed = _decode_body(body, kind, attributes, raw_writer)
+                    stats[kind][f"decode:{attributes.get('decode_status')}"] += 1
+                    stats[kind][f"json:{attributes.get('json_parse_status')}"] += 1
+                    if parsed is not None:
+                        attributes["_json"] = parsed
+                        shapes[kind][_shape(parsed)] += 1
+                        _enrich_from_json(kind, attributes, parsed)
+                locator = f"key={key};variant={variant}"
+                records.append(
+                    EvidenceRecord(
+                        evidence_id=make_evidence_id(
+                            FAMILY_CACHE, source_path, locator,
+                            {"key": key, "variant": variant, "meta_location": meta_loc,
+                             "body_location": body_loc},
+                        ),
+                        artifact="Cache", artifact_family=FAMILY_CACHE, source_path=source_path,
 
-                    result = sniff_and_decompress(body, entry.content_encoding or None)
-                    attributes["decode_status"] = result.status
-                    attributes["decoders"] = list(result.applied_decoders)
-                    if result.error:
-                        attributes["decode_error"] = result.error
-
-                    if result.ok:
-                        decoded = result.data
-                        attributes["decoded_size"] = len(decoded)
-                        # A Claude download body is kept only so an on-disk
-                        # file can be matched to it byte for byte.
-                        if raw_writer is not None and entry.kind == KEY_DOWNLOAD_FILE:
-                            attributes["decoded_body_path"] = raw_writer(decoded, "body.bin")
-
-                        text, encoding = decode_text_strict(decoded, entry.content_type)
-                        attributes["text_encoding"] = encoding
-                        if text is not None:
-                            parsed = try_parse_json(text)
-                            if parsed is not None:
-                                attributes["json_parse_status"] = "PARSED"
-                                message_payload = parsed
-                                _enrich_from_json(entry, attributes, parsed)
-                            else:
-                                attributes["json_parse_status"] = "NOT_JSON"
-                                attributes["text_preview"] = text[:4096]
-                        else:
-                            attributes["json_parse_status"] = "BINARY"
-                    elif result.status == DECODE_LIMITED:
-                        attributes["json_parse_status"] = "DECODE_LIMITED"
-                    else:
-                        attributes["json_parse_status"] = "DECODE_FAILED"
-
-                    created = attributes.get("conversation_created_at")
-                    timestamp = from_iso8601(created) if created else None
-
-            payload = {
-                "key": entry.key,
-                "variant": entry.variant,
-                "meta_location": entry.meta_location,
-                "body_location": entry.body_location,
-            }
-            records.append(
-                EvidenceRecord(
-                    evidence_id=make_evidence_id(FAMILY_CACHE, source_path, locator, payload),
-                    artifact="Cache",
-                    artifact_family=FAMILY_CACHE,
-                    source_path=source_path,
-                    # The exact cache file holding this entry (data_N or f_xxxxxx).
-                    artifact_path=_entry_file_path(
-                        source_path, entry.body_location, entry.meta_location
-                    ),
-                    volume_id=volume_id,
-                    record_locator=locator,
-                    timestamp=timestamp,
-                    account_uuid=attributes.get("account_uuid"),
-                    organization_uuid=entry.organization_uuid,
-                    conversation_uuid=entry.conversation_uuid
-                    or attributes.get("conversation_uuid"),
-                    summary=summary,
-                    attributes=attributes,
+                        artifact_path=_entry_file_path(source_path, body_loc, meta_loc), volume_id=volume_id,
+                        record_locator=locator, account_uuid=attributes.get("account_uuid"),
+                        organization_uuid=organization_from_url(key),
+                        conversation_uuid=conversation_from_url(key),
+                        summary=f"Cache entry ({kind}): {truncate(key, 140)}", attributes=attributes,
+                    )
                 )
-            )
-            if message_payload is not None:
-                records[-1].attributes["_json"] = message_payload
     except Exception as exc:
         errors.append(f"cache iteration: {type(exc).__name__}: {exc}")
     finally:
         ccl.close_cache(cache)
 
+    details = []
+    for kind in sorted(stats):
+        if kind == KEY_OTHER_CLAUDE:
+            continue
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(stats[kind].items()))
+        shape = "; ".join(f"{s}×{n}" for s, n in shapes[kind].most_common(4))
+        details.append(f"cache {kind}: {counts}" + (f"; top-level {shape}" if shape else ""))
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
-        artifact="Cache",
-        family=FAMILY_CACHE,
-        status=status,
-        source_path=source_path,
-        record_count=len(records),
-        error_count=len(errors),
-        message="; ".join(errors[:5])
-        or f"keys={total_keys} claude={claude_keys} hydrated={hydrated}",
+        artifact="Cache", family=FAMILY_CACHE, status=status, source_path=source_path,
+        record_count=len(records), message="; ".join(errors[:5])
+        or f"keys={total_keys} claude={len(records)} hydrated={hydrated}", details=details,
     )
 
+def _decode_body(
+    body: bytes, kind: str, attributes: dict[str, Any], raw_writer
+) -> Any | None:
+    attributes.update({"body_hydrated": True, "raw_size": len(body)})
+    result = sniff_and_decompress(body, attributes["content_encoding"] or None)
+    attributes["decode_status"] = result.status
+    if result.error:
+        attributes["decode_error"] = result.error
+    if not result.ok:
+        attributes["json_parse_status"] = (
+            "DECODE_LIMITED" if result.status == DECODE_LIMITED else "DECODE_FAILED"
+        )
+        return None
+    decoded = result.data
+    attributes["decoded_size"] = len(decoded)
+    if kind == KEY_DOWNLOAD_FILE:
+        attributes["body_format"] = image_format(decoded)
+        if raw_writer is not None:
+            attributes["decoded_body_path"] = raw_writer(decoded, "body.bin")
+    text, _encoding = decode_text_strict(decoded, attributes["content_type"])
+    if text is None:
+        attributes["json_parse_status"] = "BINARY"
+        return None
+    parsed = try_parse_json(text)
+    attributes["json_parse_status"] = "PARSED" if parsed is not None else "NOT_JSON"
+    return parsed
 
 def _entry_file_path(source_path: str, *locations: str) -> str:
-    """Cache_Data/<file> from a CCL location string ("data_3@1234", "f_00001a@0").
-
-    The body location is preferred (the file that holds the response); the
-    metadata location is the fallback. Empty when neither names a file.
-    """
     for location in locations:
         name = (location or "").rsplit("@", 1)[0].strip()
         name = name.replace("\\", "/").rsplit("/", 1)[-1]
-        if name and name not in ("None",):
+        if name and name != "None":
             return f"{source_path.rstrip('/')}/{name}"
     return ""
 
-
-def _enrich_from_json(entry: CacheIndexEntry, attributes: dict[str, Any], parsed: Any) -> None:
-    """Pull identifiers out of a decoded Claude API body."""
-    if isinstance(parsed, dict):
-        uuid = parsed.get("uuid")
-        if isinstance(uuid, str) and entry.kind == KEY_CONVERSATION:
-            attributes["conversation_uuid"] = uuid.lower()
-        if isinstance(parsed.get("name"), str):
-            attributes["conversation_title"] = parsed["name"]
-        if isinstance(parsed.get("created_at"), str):
-            attributes["conversation_created_at"] = parsed["created_at"]
-        if isinstance(parsed.get("updated_at"), str):
-            attributes["conversation_updated_at"] = parsed["updated_at"]
-        if isinstance(parsed.get("model"), str):
-            attributes["conversation_model"] = parsed["model"]
-        if parsed.get("is_temporary") is not None:
-            attributes["is_temporary"] = parsed.get("is_temporary")
-        if parsed.get("current_leaf_message_uuid"):
-            attributes["current_leaf_message_uuid"] = parsed["current_leaf_message_uuid"]
-
-        # Share-link snapshot object (E07-02 direct evidence).
-        snapshot = parsed.get("snapshot")
-        if isinstance(snapshot, dict):
-            attributes["snapshot_uuid"] = snapshot.get("uuid")
-            attributes["snapshot_name"] = snapshot.get("snapshot_name") or snapshot.get("name")
-            attributes["snapshot_created_at"] = snapshot.get("created_at")
-            attributes["snapshot_conversation_uuid"] = snapshot.get("conversation_uuid")
-            creator = snapshot.get("created_by") or snapshot.get("creator")
-            if isinstance(creator, dict):
-                attributes["snapshot_creator_uuid"] = creator.get("uuid")
-                attributes["snapshot_creator_name"] = creator.get("full_name") or creator.get(
-                    "display_name"
-                )
-        account = parsed.get("account")
-        if isinstance(account, dict) and isinstance(account.get("uuid"), str):
-            attributes["account_uuid"] = account["uuid"].lower()
+def _enrich_from_json(kind: str, attributes: dict[str, Any], parsed: Any) -> None:
+    if not isinstance(parsed, dict):
+        return
+    snapshot = parsed.get("snapshot")
+    if kind == KEY_LATEST_SNAPSHOT and isinstance(snapshot, dict) and snapshot.get("uuid"):
+        attributes["snapshot_uuid"] = str(snapshot["uuid"]).lower()
+        attributes["snapshot_created_at"] = snapshot.get("created_at")
+        attributes["snapshot_visibility"] = snapshot.get("visibility")
+    if kind == KEY_SHARE and isinstance(parsed.get("people"), list):
+        attributes["share_people_count"] = len(parsed["people"])
+        attributes["share_visibility"] = parsed.get("visibility")
+    account = parsed.get("account")
+    if isinstance(account, dict) and isinstance(account.get("uuid"), str):
+        attributes["account_uuid"] = account["uuid"].lower()

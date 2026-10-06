@@ -1,50 +1,49 @@
-"""Command-line entry point.
-
-    python -m claude_web_forensics analyze --image /evidence/case.E01 --output /results/case01
-    python -m claude_web_forensics analyze --image /evidence/disk.dd  --output /results/case01 --extended-fs
-
-Outputs (the only files written to --output):
-    timeline.csv                 확정/의심 user actions with artifact paths
-    recovered_conversations.csv  recovered Claude conversation messages
-
-Exit codes:
-    0  analysis completed (individual artifact failures are logged, not fatal)
-    1  the image itself could not be opened, or a result CSV failed verification
-    2  invalid arguments / refused output location
-"""
+"""Command-line entry point."""
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
+import os
 import platform
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from . import __version__
 from .pipeline import AnalysisOptions, run_analysis
-from .image.adapters import ImageOpenError
+from .image.adapters import ImageOpenError, is_device_path
 from .image.volumes import KeyMaterial
 
 EXIT_OK = 0
 EXIT_FATAL = 1
 EXIT_USAGE = 2
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="claude-web-forensics",
-        description=(
+        prog="claude-web-forensics", description=(
             "Single-snapshot forensic parser for Claude Web traces in Google Chrome "
-            "on Windows. Input is an E01-family or raw/dd disk image. Writes exactly "
+            "on Windows. Input is an E01-family or raw/dd disk image, a live NTFS volume "
+            "(\\\\.\\C:, administrator) or a copied volume tree (--dir). Writes exactly "
             "two files to --output: timeline.csv and recovered_conversations.csv "
             "(UTF-8 with BOM). Progress is logged to the console only."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    analyze = sub.add_parser("analyze", help="analyse a disk image")
-    analyze.add_argument("--image", required=True, type=Path, help="E01 or raw/dd image path")
+    analyze = sub.add_parser("analyze", help="analyse a disk image, live volume or folder")
+    source = analyze.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path, help="E01 or raw/dd image path, or a live volume such as \\\\.\\C:")
+    source.add_argument(
+        "--dir", type=Path, help="copied volume tree: a folder that contains Users\\<user>\\... (no $MFT / $UsnJrnl)",
+    )
+    analyze.add_argument(
+        "--elevate", action="store_true",
+        help="if --image is a live volume and this process is not elevated, re-run itself through UAC and wait",
+    )
+    analyze.add_argument("--log-file", type=Path, default=None, help=argparse.SUPPRESS)
     analyze.add_argument(
         "--output", required=True, type=Path,
         help="output directory for timeline.csv and recovered_conversations.csv",
@@ -52,49 +51,37 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--partition-offset", type=int, default=None, help="byte offset of the target partition"
     )
-    analyze.add_argument(
-        "--partition-index", type=int, default=None, help="index of the target partition"
-    )
+    analyze.add_argument("--partition-index", type=int, default=None, help="index of the target partition")
     analyze.add_argument("--windows-user", default="", help="limit analysis to one Windows user")
     analyze.add_argument("--chrome-profile", default="", help="limit analysis to one Chrome profile")
     analyze.add_argument(
-        "--key-material",
-        default="",
-        help=(
+        "--key-material", default="", help=(
             "BitLocker key material: 'recovery:<48-digit>', 'bek:<path>' or 'fvek:<hex>'. "
             "Never logged or written to the CSVs."
         ),
     )
     analyze.add_argument(
-        "--extended-fs",
-        action="store_true",
-        help="additionally analyse $UsnJrnl:$J and $Recycle.Bin",
+        "--extended-fs", action="store_true", help="additionally analyse $UsnJrnl:$J and $Recycle.Bin",
     )
     analyze.add_argument(
         "--keep-staging", action="store_true",
         help="keep the temporary working directory instead of deleting it",
     )
     analyze.add_argument(
-        "--overwrite",
-        action="store_true",
-        help=(
+        "--overwrite", action="store_true", help=(
             "replace timeline.csv / recovered_conversations.csv from a previous run; "
             "other files in the folder are never touched"
         ),
     )
     analyze.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="console log level (no log file is written)",
     )
 
     sub.add_parser("version", help="print version and dependency provenance")
     return parser
 
-
 def parse_key_material(spec: str) -> KeyMaterial:
-    """Parse --key-material. The value itself is never logged."""
     material = KeyMaterial()
     if not spec:
         return material
@@ -113,35 +100,56 @@ def parse_key_material(spec: str) -> KeyMaterial:
     elif kind == "passphrase":
         material.passphrase = value
     else:
-        raise SystemExit(
-            "--key-material must start with recovery:, bek:, fvek: or passphrase:"
-        )
+        raise SystemExit("--key-material must start with recovery:, bek:, fvek: or passphrase:")
     return material
 
-
-def setup_logging(level: str) -> logging.Logger:
-    """Console logging only; nothing is written to the output folder."""
+def setup_logging(level: str, log_file: Path | None = None) -> logging.Logger:
     logger = logging.getLogger("claude_web_forensics")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     logger.propagate = False
 
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(getattr(logging, level))
-    console.setFormatter(logging.Formatter("%(levelname)-8s %(message)s"))
-    logger.addHandler(console)
+    handlers = [logging.StreamHandler(sys.stderr)]
+    if log_file:  # only used by --elevate: the elevated child has its own console, so it mirrors the log to a file
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    for handler in handlers:
+        handler.setLevel(getattr(logging, level))
+        handler.setFormatter(logging.Formatter("%(levelname)-8s %(message)s"))
+        logger.addHandler(handler)
     return logger
 
-
-def _validate_output(image: Path, output: Path) -> None:
-    """Output must never live inside the evidence image's own path."""
-    image = image.resolve()
+def _validate_output(evidence_root: Path, output: Path) -> None:
+    """--dir only: results written inside the analysed tree would be read back as evidence on the next run.
+    An image file needs no such rule (only the two CSVs are ever written, never over an existing file)."""
+    root = evidence_root.resolve()
     output = output.resolve()
-    if output == image.parent or image.parent in output.parents or output in image.parents:
-        raise SystemExit(
-            f"refusing to write output inside the evidence directory: {output}"
-        )
+    if output == root or root in output.parents or output in root.parents:
+        raise SystemExit(f"refusing to write output inside the evidence directory: {output}")
 
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def _elevate(argv: list[str]) -> int:
+    """Re-run this CLI through UAC (PowerShell Start-Process -Verb RunAs), wait, replay its log, return its exit code."""
+    log_file = Path(tempfile.gettempdir()) / f"cwf_elevated_{int(time.time())}.log"
+    src = Path(__file__).resolve().parents[1]
+    args = ["-c", f"import sys; sys.path.insert(0, {str(src)!r}); "
+            "from claude_web_forensics.cli import main; sys.exit(main(sys.argv[1:]))",
+            *argv, "--log-file", str(log_file)]
+    # Start-Process joins -ArgumentList with spaces verbatim, so each argument is Windows-quoted first
+    quoted = ",".join("'" + subprocess.list2cmdline([a]).replace("'", "''") + "'" for a in args)
+    cmd = (f"$p = Start-Process -FilePath '{sys.executable}' -WorkingDirectory '{os.getcwd()}' "
+           f"-ArgumentList @({quoted}) -Verb RunAs -Wait -PassThru; exit $p.ExitCode")
+    code = subprocess.run(["powershell", "-NoProfile", "-Command", cmd]).returncode
+    try:
+        sys.stderr.write(log_file.read_text(encoding="utf-8"))
+        log_file.unlink()
+    except OSError:
+        sys.stderr.write(f"elevated run finished with exit code {code} (no log returned; UAC declined?)\n")
+    return code
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -156,19 +164,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ccl_chromium_reader {provenance['version']} @ {provenance['commit']}")
         return EXIT_OK
 
-    image = Path(args.image)
+    image = Path(args.dir or args.image)
     output = Path(args.output)
-    if not image.exists():
-        print(f"image not found: {image}", file=sys.stderr)
+    device = is_device_path(image)
+    if device and not _is_admin():
+        if args.elevate:
+            return _elevate(sys.argv[1:] if argv is None else list(argv))
+        print(f"{image} is a live volume: run from an administrator terminal or add --elevate", file=sys.stderr)
+        return EXIT_USAGE
+    if args.dir and not image.is_dir() or not device and not image.exists():
+        print(f"{'folder' if args.dir else 'image'} not found: {image}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        _validate_output(image, output)
+        if args.dir:
+            _validate_output(image, output)
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
 
-    # Existing result CSVs are replaced only with --overwrite; any other file
-    # in the folder is left untouched.
     from .output.csv_export import OutputDirectoryError, prepare_output_dir
 
     try:
@@ -177,11 +190,11 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
 
-    logger = setup_logging(args.log_level)
+    logger = setup_logging(args.log_level, args.log_file)
+    if args.dir and (args.partition_index is not None or args.partition_offset is not None or args.key_material):
+        logger.warning("--dir input: --partition-* and --key-material are ignored")
     if others:
-        logger.info(
-            "output folder also contains %s (left untouched)", ", ".join(others[:10])
-        )
+        logger.info("output folder also contains %s (left untouched)", ", ".join(others[:10]))
 
     try:
         key_material = parse_key_material(args.key_material)
@@ -190,14 +203,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     options = AnalysisOptions(
-        image_path=image,
-        output_dir=output,
-        partition_offset=args.partition_offset,
-        partition_index=args.partition_index,
-        windows_user=args.windows_user,
-        chrome_profile=args.chrome_profile,
-        key_material=key_material,
-        extended_fs=args.extended_fs,
+        image_path=image, output_dir=output, partition_offset=args.partition_offset,
+        partition_index=args.partition_index, windows_user=args.windows_user,
+        chrome_profile=args.chrome_profile, key_material=key_material, extended_fs=args.extended_fs,
         keep_staging=args.keep_staging,
     )
 
@@ -207,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImageOpenError as exc:
         logger.error("fatal: %s", exc)
         return EXIT_FATAL
-    except Exception as exc:  # pragma: no cover - last-resort guard
+    except Exception as exc:
         logger.exception("fatal: unexpected error: %s", exc)
         return EXIT_FATAL
 
@@ -220,7 +228,6 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("result CSV verification failed")
         return EXIT_FATAL
     return EXIT_OK
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

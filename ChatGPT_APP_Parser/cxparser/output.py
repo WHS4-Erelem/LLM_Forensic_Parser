@@ -30,9 +30,11 @@ CSV_VERDICTS = ("확정", "의심")
 _ROLE = {"user": "user", "assistant": "assistant",
          "userMessage": "user", "agentMessage": "assistant"}
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
+        "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache", "package_dir": "PackageDir",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
-# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
-_CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")
+# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위).
+# file_name 이 title 보다 앞: 채팅 모드 첨부 업로드 레코드는 대화 제목도 갖고 있어, 제목이 앞서면 파일명이 가려지고 첨부 여러 개가 같은 행이 된다
+_CORE_KEYS = ("text", "prompt_text", "file_name", "title", "model_slug", "key", "log_body")
 
 
 def write_json(path, payload):
@@ -76,9 +78,15 @@ def _one_line(v, limit=300):
 
 def _winpath(r):
     """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...' (공유본 표기).
-    ponytail: 드라이브 문자는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
-    p = ((r.get("evidence") or {}).get("location") or {}).get("path") or ""
-    return "C:" + p.replace("/", "\\") if p else ""
+    라이브 분석은 실제 드라이브 문자를 안다(location.drive). 드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
+    ponytail: 이미지·추출 폴더는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
+    loc = (r.get("evidence") or {}).get("location") or {}
+    p, drive = loc.get("path") or "", loc.get("drive")
+    if not p:
+        return ""
+    if drive == "":
+        return p
+    return (drive or "C:") + p.replace("/", "\\")
 
 
 def _behavior_details(r, titles):
@@ -92,7 +100,98 @@ def _behavior_details(r, titles):
     return "%s_%s" % (r["user_action"].get("action"), _one_line(core))
 
 
-def _artifact_details(r, titles):
+_PH_GLOBAL_KEYS = ("prompt-history.global", "prompt-history.chatgpt-global")
+
+
+def _is_live(r):
+    return ((r.get("evidence") or {}).get("location") or {}).get("allocated") is not False
+
+
+def _fold_prompt_history(rows):
+    """global-state 의 프롬프트 이력은 같은 프롬프트가 (1) 현존 파일과 삭제된 이전 버전(원자적 재작성 잔여) 양쪽,
+    (2) 대화별 목록과 global/chatgpt-global 목록 양쪽에 중복으로 실린다. 타임라인에는 프롬프트당 대화별 1행만 두고
+    나머지는 그 행의 Artifact_details 에 근거로 접는다. 삭제본에만 있거나 global 에만 있는 프롬프트는 그대로 남긴다.
+    반환: (행 목록, {record_id: 병합 메모})."""
+    groups, others = {}, []
+    for r in rows:
+        det = r.get("details") or {}
+        if det.get("artifact") == "codex_global_state" and str(det.get("key", "")).startswith("prompt-history") and det.get("prompt_text"):
+            groups.setdefault(" ".join(det["prompt_text"].split()), []).append(r)
+        else:
+            others.append(r)
+    out, notes = list(others), {}
+    # 시각이 있는 같은 프롬프트(rollout·SQLite·채팅창 캐시)가 있으면 global-state 행은 전부 그 행의 근거로 접는다
+    timed = {}
+    for r in others:
+        det = r.get("details") or {}
+        if (r.get("event") or {}).get("event_id") == "E04-01" and (r.get("timestamp") or {}).get("utc") and det.get("text"):
+            timed.setdefault(" ".join(str(det["text"]).split()), r)
+    for text in list(groups):
+        rep = timed.get(text)
+        if rep is not None:
+            rs = groups.pop(text)
+            notes.setdefault(rep["record_id"], []).append("global-state prompt-history 에도 기록 (%d건%s)" % (
+                len(rs), ", 삭제된 이전 버전 포함" if any(not _is_live(r) for r in rs) else ""))
+    for rs in groups.values():
+        is_global = lambda r: r["details"]["key"] in _PH_GLOBAL_KEYS
+        reps = {}                                                  # 대화(key)마다 대표 1행, 현존 파일 우선
+        for r in sorted(rs, key=lambda r: (is_global(r), not _is_live(r), r["record_id"])):
+            k = "_global" if is_global(r) else r["details"]["key"]
+            if not reps or (k != "_global" and k not in reps):
+                reps[k] = r
+        first = next(iter(reps.values()))
+        for r in rs:
+            if any(r is x for x in reps.values()):
+                continue
+            target = reps.get(r["details"]["key"]) or first           # 같은 대화의 삭제본은 그 대화 행에, global 항목은 첫 행에
+            mft = ((r.get("evidence") or {}).get("location") or {}).get("mft_record")
+            note = ("삭제된 이전 버전(MFT %s)에도 동일" % mft) if not _is_live(r) else "%s 목록에도 기록" % r["details"]["key"].split(".")[-1]
+            if is_global(r) and not _is_live(r):
+                note = "삭제된 이전 버전(MFT %s)의 %s 목록에도 동일" % (mft, r["details"]["key"].split(".")[-1])
+            notes.setdefault(target["record_id"], [])
+            if note not in notes[target["record_id"]]:
+                notes[target["record_id"]].append(note)
+        out.extend(reps.values())
+    return out, {k: "; ".join(v) for k, v in notes.items()}
+
+
+_RUN_FOLD_SEC = 120   # ponytail: 표본에서 Prefetch 시각이 첫 로그보다 10~70초 앞섬 (첫 실행은 초기화가 길다). 표본 늘면 조정
+
+
+def _fold_app_runs(rows, notes):
+    """E08-01 실행: 같은 실행이 앱 로그(프로세스 시작)와 Prefetch 양쪽에 남는다. 60초 안에 겹치면 로그 행 하나만 두고
+    Prefetch 시각을 그 행의 근거로 접는다. 짝이 없는 Prefetch 실행(로그가 순환·삭제된 경우)은 그대로 남긴다."""
+    runs = [r for r in rows if r["event"]["event_id"] == "E08-01" and (r.get("timestamp") or {}).get("utc")]
+    logs = [r for r in runs if (r.get("details") or {}).get("artifact") == "codex_sqlite"]
+    # 앱 프로세스 구간: 구간 안에서 뜬 Prefetch 실행은 앱이 띄운 보조 프로세스(codex.exe app-server 등)라 사용자 실행이 아니다
+    spans = [(_secs(lg["details"]["session_first_utc"]) - _RUN_FOLD_SEC, _secs(lg["details"]["session_last_utc"]))
+             for lg in logs if lg["details"].get("session_first_utc") and lg["details"].get("session_last_utc")]
+    drop = set()
+    for pf in (r for r in runs if (r.get("details") or {}).get("artifact") == "prefetch"):
+        t = _secs(pf["timestamp"]["utc"])
+        near = [lg for lg in logs if abs(_secs(lg["timestamp"]["utc"]) - t) <= _RUN_FOLD_SEC]
+        if near:
+            lg = min(near, key=lambda x: abs(_secs(x["timestamp"]["utc"]) - t))
+            drop.add(pf["record_id"])
+            notes.setdefault(lg["record_id"], [])
+            notes[lg["record_id"]].append("Prefetch 실행 기록 %s 와 일치" % to_kst(pf["timestamp"]["utc"])[:19])
+        elif any(a <= t <= b for a, b in spans):
+            drop.add(pf["record_id"])                      # 실행 중 구간 안의 보조 프로세스 기동 — JSON 에는 남고 타임라인에서만 뺀다
+    # 남은 Prefetch 실행이 60초 안에 여러 개(여러 .pf = 같은 실행이 띄운 프로세스들)면 가장 이른 것 하나만
+    rest = sorted((r for r in runs if (r.get("details") or {}).get("artifact") == "prefetch" and r["record_id"] not in drop),
+                  key=lambda r: _secs(r["timestamp"]["utc"]))
+    head = None
+    for pf in rest:
+        t = _secs(pf["timestamp"]["utc"])
+        if head is not None and t - _secs(head["timestamp"]["utc"]) <= _RUN_FOLD_SEC:
+            drop.add(pf["record_id"])
+            notes.setdefault(head["record_id"], []).append("같은 실행의 다른 프로세스 Prefetch %s" % to_kst(pf["timestamp"]["utc"])[11:19])
+        else:
+            head = pf
+    return [r for r in rows if r["record_id"] not in drop]
+
+
+def _artifact_details(r, titles, fold_note=None):
     det, ev = r.get("details") or {}, r.get("evidence") or {}
     loc = ev.get("location") or {}
     tag = _TAG.get(det.get("artifact"), det.get("artifact") or "Artifact")
@@ -105,6 +204,7 @@ def _artifact_details(r, titles):
           ("MFT", loc.get("mft_record")),
           ("volume", "ntfs@%s" % loc["partition_offset_bytes"] if loc.get("partition_offset_bytes") is not None else None),
           ("삭제 엔트리", "True" if loc.get("allocated") is False else None),
+          ("중복 병합", fold_note),
           ("규칙", r["event"]["event_id"]),
           ("패키지", PACKAGE_NAME)]
     return "[%s] " % tag + ", ".join("%s=%s" % (k, _one_line(v, 120)) for k, v in kv if v not in (None, ""))
@@ -124,6 +224,10 @@ def write_timeline_csv(path, records):
     titles = _titles(records)
     rows = [r for r in records if r["event"]["event_id"] != "NA-00"
             and VERDICT.get(r["user_action"].get("confidence")) in CSV_VERDICTS]
+    rows, fold_notes = _fold_prompt_history(rows)
+    raw_notes = {k: v.split("; ") for k, v in fold_notes.items()}
+    rows = _fold_app_runs(rows, raw_notes)
+    fold_notes = {k: "; ".join(v) for k, v in raw_notes.items()}
     rows.sort(key=lambda r: (r["timestamp"].get("utc") is None,
                              r["timestamp"].get("utc") or "", r["record_id"]))
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
@@ -134,7 +238,7 @@ def write_timeline_csv(path, records):
                events.name(r["event"]["event_id"]),          # 팀 카탈로그 행위명
                _behavior_details(r, titles),
                VERDICT[r["user_action"].get("confidence")],
-               _winpath(r), _artifact_details(r, titles)])
+               _winpath(r), _artifact_details(r, titles, fold_notes.get(r["record_id"]))])
     return path
 
 
@@ -169,3 +273,20 @@ def write_conversations_csv(path, records):
                role, det["text"], _winpath(r)])
             prev_uuid = uuid
     return path
+
+
+if __name__ == "__main__":  # python -m cxparser.output — 프롬프트 이력 중복 병합 자체 검사
+    def _rec(rid, key, text, live=True, mft=1):
+        return {"record_id": rid, "details": {"artifact": "codex_global_state", "key": key, "prompt_text": text},
+                "evidence": {"location": {"allocated": live, "mft_record": mft}}}
+    rows, notes = _fold_prompt_history([
+        _rec("r1", "prompt-history.T1", "hello"), _rec("r2", "prompt-history.T1", "hello", live=False, mft=9),
+        _rec("r3", "prompt-history.global", "hello"), _rec("r4", "prompt-history.global", "hello", live=False, mft=9),
+        _rec("r5", "prompt-history.global", "only-global"), _rec("r6", "prompt-history.global", "only-global", live=False, mft=9),
+        _rec("r7", "prompt-history.T2", "only-deleted", live=False, mft=9),
+        {"record_id": "r8", "details": {"artifact": "rollout"}, "evidence": {}}])
+    ids = sorted(r["record_id"] for r in rows)
+    assert ids == ["r1", "r5", "r7", "r8"], ids                       # 대화행 1 + global 만 1 + 삭제본만 1 + 무관 1
+    assert notes["r1"] == "삭제된 이전 버전(MFT 9)에도 동일; global 목록에도 기록; 삭제된 이전 버전(MFT 9)의 global 목록에도 동일", notes["r1"]
+    assert notes["r5"] == "삭제된 이전 버전(MFT 9)의 global 목록에도 동일" and "r7" not in notes, notes.get("r5")
+    print("output self-check ok")

@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """Gemini Web forensic-image/artifact parser; Python 3.10+.
 
-Primary CLI: py -3.12 "C:\\Users\\me\\Desktop\\gemini_parser\\gemini_parser.py" "C:\\Users\\me\\Desktop\\gemini_parser\\victim.E01"
-Primary API: results = GeminiImageParser(image_path).parse()
-GeminiParser(image_path).parse() also dispatches to the image reader.
-Debug: py -3.12 "C:\\Users\\me\\Desktop\\gemini_parser\\gemini_parser.py" --profile "C:\\Users\\me\\Desktop\\gemini_parser\\ChromeProfile"
 Image mode requires pytsk3; EWF additionally requires pyewf (libewf-python).
+BitLocker partitions additionally require dissect.fve and dissect.ntfs. Only an
+image-internal Clear Key is supported; external credentials are not accepted.
+Decrypted reads are partition-relative and read-only;
+no full decrypted image is created. States are in JSON partition_status detail.
 Profile mode still uses only the standard library. Dependency installation is
 external to this script; there is no automatic install, mount, or image write.
 
 Only list[dict] is the primary result. Status/inventory records use the same
-schema as findings and have detail.record_type to distinguish them. Binary
-scans are raw, bounded-context searches, NOT native Session/Cache/LevelDB
-decoders. The analyst CSV summarizes repeated raw hits per artifact file into
-two analyst-facing CSVs.  The CSV headers and row semantics follow the team's
+schema as findings and have detail.record_type to distinguish them. Binary artifacts keep the conservative raw-scan fallback, but when ccl_chromium_reader
+is available the parser first performs native Chromium Cache / IndexedDB / Local Storage /
+Sessions decoding from the private staged profile.  Decoded Gemini HTTP bodies are decompressed
+and passed into the existing f.req / wrb.fr / hNvQHb / StreamGenerate decoders before the raw
+scanner runs. The analyst
+CSV summarizes forensic findings into two analyst-facing CSVs.  The CSV headers and row semantics follow the team's
 reference outputs (Son Seonim sample): timeline.csv uses the seven English field
 names Model/Timestamp/User_behavior/Behavior_details /Verdict/Artifact_path/Artifact_details ,
 and recovered_conversations.csv uses the ten-field conversation schema. Final CSV semantics
 are intentionally strict for team integration: timeline.csv contains user-action events/candidates,
-while recovered_conversations.csv contains only message content that is actually recovered with
-conversation/message semantics. Detection/coverage rules are declared for every agreed Gemini Web
+while recovered_conversations.csv contains only structurally recovered persistent message content.
+Gemini History titles are retained as conversation metadata and may be used only to correlate a
+structured cid-less request payload to a unique conversation; titles are never promoted to message bodies. Detection/coverage
+rules are declared for every agreed Gemini Web
 project action; actions without sufficient local evidence remain NOT_OBSERVED/INCONCLUSIVE rather than
 being fabricated. Raw Session/Cache/LevelDB hits, coverage, offsets and parser-status records remain in
 gemini_results.json (and optional coverage.csv with --debug-output). Unrelated
-Chrome downloads/Recycle Bin rows remain in JSON. No raw string hit is promoted to a recovered chat or a confirmed prompt. Explicitly label-associated bounded raw text may appear only as an uncertain draft/send candidate when the surrounding evidence satisfies the dedicated rule.
+Chrome downloads/Recycle Bin rows remain in JSON. No unstructured raw string hit or History title is promoted to a recovered chat or a confirmed
+prompt; recovered conversation rows require structured message semantics or a narrowly correlated
+structured Gemini request payload. History/Sessions metadata and body recovery are reported separately.
 
 Evidence files are opened only for reading. SQLite opens private temporary
 copies, including WAL/rollback journals, never the evidence database itself.
@@ -35,26 +41,16 @@ SQLite WAL rationale: https://www.sqlite.org/wal.html
 EWF adapter: https://github.com/libyal/libewf/wiki/Python-development
 """
 
-# 코드 실행 방법
-# ------------------------------------
-# 파일들이 있는 폴더에 위치할 때
-# py -3.12 ".\gemini_parser.py" ".\Scenario_Image.E01" --output ".\gemini_result_E01" --csv
-# --csv 사용 시 timeline.csv + recovered_conversations.csv 생성
-#
-# 분할 E01(E01, E02, E03 ...)은 모두 같은 폴더에 두고 첫 번째 E01만 입력
-#
-# ------------------------------------
-# 절대경로 사용 예시
-# py -3.12 "C:\경로\gemini_parser.py" "C:\경로\Scenario_Image.E01" --output "C:\경로\gemini_result_E01" --csv
-# ------------------------------------
-
 from __future__ import annotations
 
 import argparse
 import bisect
 import configparser
 import csv
+import gzip
+import io
 import hashlib
+import html
 import importlib
 import json
 import os
@@ -65,11 +61,13 @@ import stat
 import struct
 import sys
 import tempfile
+import time
+import zlib
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath, PurePosixPath
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit
 
 
 FIELDS = ("service", "environment", "timestamp", "action_candidate", "artifact",
@@ -84,49 +82,52 @@ TIMELINE_FIELDS = ("Model", "Timestamp", "User_behavior", "Behavior_details ", "
 CONVERSATION_FIELDS = ("Model", "timestamp", "conversation_uuid", "conversation_title",
                        "message_uuid", "parent_message_uuid", "message order", "role",
                        "content", "Artifact_path")
-PARSER_VERSION = "1.1.2-all-actions-verified"
+PARSER_VERSION = "1.4.8.6-bitlocker-clear-key"
 OUTPUT_CONTRACT_VERSION = "2026-09-team-v1"
 COVERAGE_FIELDS = ("Model", "Scope", "Item", "Status", "Reason", "Artifact_path", "Artifact_details")
 TEAM_VERDICTS = {"확정", "의심"}
+TEAM_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST$")
 # Final timeline behaviors.  Raw strings/settings/cookies are evidence, not user behaviors.
 # 팀 합의 Gemini Web 행위 + 상세 실험의 첨부/생성 이미지 삭제 행위 + 분석 편의 보조 행위
 PROJECT_ACTIONS = (
     "로그인", "로그아웃", "계정 전환", "새로운 대화 생성", "기존 대화 삭제",
     "대화 수정", "대화 재시도", "사용자 프롬프트 입력/전송", "사용자 프롬프트 삭제",
-    "이미지 업로드", "이미지/문서 업로드 삭제", "문서 업로드", "문서 다운로드",
+    "이미지 업로드", "이미지 업로드 삭제", "문서 업로드", "문서 업로드 삭제", "문서 다운로드",
     "이미지 생성 요청", "생성 이미지 다운로드", "생성 이미지 다운로드 삭제",
     "대화 데이터 Export", "공유 링크 생성",
     "모델 변경", "계정 이름 변경", "임시 채팅 사용", "브라우저 시크릿 모드",
     "방문기록 삭제", "캐시 삭제",
 )
+# Timeline User_behavior values are restricted to the team's integration/user_behaviors.txt names.
+# Service-specific/raw helper labels stay in JSON/Behavior_details and never leak into timeline.csv.
 TEAM_BEHAVIORS = set(PROJECT_ACTIONS) | {
-    "서비스 접속", "대화 접근", "이미지 다운로드", "파일 다운로드",
+    "서비스 접속", "파일 다운로드",
 }
 # Artifact families inspected for each action. Used only for optional coverage/debug output.
 ACTION_COVERAGE_ARTIFACTS = {
     "서비스 접속": {"Chrome History"},
-    "대화 접근": {"Chrome History", "Chrome Sessions"},
     "로그인": {"Chrome History", "Chrome Cookies", "Chrome Preferences"},
     "로그아웃": {"Chrome History", "Chrome Local Storage", "Chrome Session Storage"},
     "계정 전환": {"Chrome History", "Chrome Preferences", "Chrome Local Storage"},
-    "새로운 대화 생성": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome IndexedDB"},
-    "기존 대화 삭제": {"Chrome Cache", "Chrome Local Storage", "Chrome IndexedDB"},
-    "대화 수정": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage"},
-    "대화 재시도": {"Chrome Cache", "Chrome Sessions"},
-    "사용자 프롬프트 입력/전송": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome Session Storage"},
-    "사용자 프롬프트 삭제": {"Chrome History", "Chrome Cookies", "Chrome Local Storage"},
-    "이미지 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage"},
-    "문서 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage"},
-    "이미지/문서 업로드 삭제": {"Chrome Cache", "Chrome Local Storage"},
+    "새로운 대화 생성": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome IndexedDB", "Chrome Service Worker"},
+    "기존 대화 삭제": {"Chrome Cache", "Chrome Local Storage", "Chrome IndexedDB", "Chrome Service Worker"},
+    "대화 수정": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome Service Worker"},
+    "대화 재시도": {"Chrome Cache", "Chrome Sessions", "Chrome Service Worker"},
+    "사용자 프롬프트 입력/전송": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome Session Storage", "Chrome Service Worker"},
+    "사용자 프롬프트 삭제": {"Chrome History", "Chrome Cookies", "Chrome Local Storage", "Chrome Service Worker"},
+    "이미지 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage", "Chrome Service Worker"},
+    "문서 업로드": {"Chrome Cache", "Chrome History", "Chrome Local Storage", "Chrome Service Worker"},
+    "이미지 업로드 삭제": {"Chrome Cache", "Chrome Local Storage", "Chrome Service Worker"},
+    "문서 업로드 삭제": {"Chrome Cache", "Chrome Local Storage", "Chrome Service Worker"},
     "문서 다운로드": {"Chrome History", "Zone.Identifier"},
-    "이미지 생성 요청": {"Chrome Cache", "Chrome Session Storage", "Chrome Sessions"},
+    "이미지 생성 요청": {"Chrome Cache", "Chrome Session Storage", "Chrome Sessions", "Chrome Service Worker"},
     "생성 이미지 다운로드": {"Chrome History", "Zone.Identifier"},
     "생성 이미지 다운로드 삭제": {"Windows Recycle Bin", "Chrome History"},
-    "대화 데이터 Export": {"Chrome History", "Chrome Session Storage", "Chrome Cache"},
-    "공유 링크 생성": {"Chrome History", "Chrome Cache"},
-    "모델 변경": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage"},
+    "대화 데이터 Export": {"Chrome History", "Chrome Session Storage", "Chrome Cache", "Chrome Service Worker"},
+    "공유 링크 생성": {"Chrome History", "Chrome Cache", "Chrome Service Worker"},
+    "모델 변경": {"Chrome Cache", "Chrome Sessions", "Chrome Local Storage", "Chrome Service Worker"},
     "계정 이름 변경": {"Chrome History", "Chrome Preferences"},
-    "임시 채팅 사용": {"Chrome Sessions", "Chrome Cache", "Chrome History"},
+    "임시 채팅 사용": {"Chrome Sessions", "Chrome Cache", "Chrome History", "Chrome Service Worker"},
     "브라우저 시크릿 모드": {"Chrome Sessions", "Chrome History", "Chrome Preferences"},
     "방문기록 삭제": {"Chrome History", "Forensic Image"},
     "캐시 삭제": {"Chrome Cache", "Chrome Preferences", "Forensic Image"},
@@ -139,13 +140,17 @@ CHROME_EPOCH = datetime(1601, 1, 1, tzinfo=UTC)
 UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 CHUNK = 1024 * 1024
 CONTEXT_BYTES = 2048
-OVERLAP = 16384
+OVERLAP = 262144
+MAX_PROTOCOL_TEXT = 8 * 1024 * 1024
+AGGRESSIVE_PROMPT_CONTEXT = 64 * 1024
+AGGRESSIVE_PROMPT_MAX_PER_FILE = 256
 URL_RE = re.compile(r"https?://[^\s\x00-\x20<>\"'`\\]+", re.I)
 DOMAIN_RE = re.compile(r"(?<![a-z0-9_.-])gemini\.google\.com(?![a-z0-9_.-])", re.I)
 APP_RE = re.compile(r"/app/([A-Za-z0-9_-]{1,256})(?=[/?#\s\x00\"'<>]|$)")
 PREF_RE = re.compile(r"gemini|google|account|cache|clear_data|content_settings|site_engagement", re.I)
 SECRET_RE = re.compile(r"password|secret|token|credential|encrypted|cookie_value", re.I)
-IMAGE_SUFFIXES = {".dd", ".img", ".raw", ".e01"}
+IMAGE_SUFFIXES = {".dd", ".img", ".raw", ".e01", ".001"}
+SPLIT_RAW_RE = re.compile(r"^(?P<stem>.+)\.(?P<num>\d{3})$")
 
 # Conservative semantic signatures. They are evaluated only on Gemini-scoped bounded
 # context, explicit History URLs, or structured preference fields. A keyword match is
@@ -162,6 +167,22 @@ EXPLICIT_SEMANTIC_RULES = (
     ("image_generation", re.compile(r"(?i)(?:image[_ -]?generation|generate[_ -]?image|generated[_ -]?image|imagegen(?:eration)?|imagen[_ -]?(?:request|result))")),
     ("temporary_chat", re.compile(r"(?i)(?:is[_ -]?temporary\s*[:=]\s*true|temporary[_ -]?chat|temp[_ -]?chat|ephemeral[_ -]?chat)")),
 )
+
+# Findings produced from raw/static/browser-state heuristics remain useful analyst clues, but
+# they are not final user-behavior events.  Keep them in gemini_results.json / coverage and
+# require event-specific or protocol-structured evidence before Timeline promotion.
+SUPPORTING_ONLY_ACTIONS = {
+    "prompt_send_candidate",
+    "conversation_delete_candidate", "conversation_edit_candidate",
+    "conversation_retry_candidate", "temporary_chat_candidate",
+    "attachment_remove_candidate", "image_generation_candidate",
+    "image_upload_candidate", "document_upload_candidate",
+    "model_change_candidate", "document_download_candidate",
+    "generated_image_download_candidate", "share_link_candidate",
+    "prompt_delete_candidate", "data_export_candidate",
+    "account_name_change_candidate", "incognito_mode_candidate",
+    "history_clear_candidate", "cache_clear_candidate",
+}
 # Browser-level privacy/cleanup actions are intentionally NOT derived from generic raw keywords.
 # A Session/Tabs file can contain multiple tabs (e.g. Gemini + chrome://settings/clearBrowserData)
 # in one bounded byte window, which proves neither that history/cache deletion executed nor that
@@ -211,6 +232,27 @@ def normalize_timestamp(raw, kind="chrome"):
     return result
 
 
+def normalize_team_kst_timestamp(value):
+    """Convert an already validated team-format KST timestamp into the internal timestamp dict.
+
+    Gemini READ_CHAT can expose per-turn Unix timestamps even when the surrounding Cache/Session
+    record has no trustworthy browser-record time.  Only the exact team KST format is accepted;
+    ambiguous values remain unavailable rather than being guessed.
+    """
+    text = str(value or "").strip()
+    if not TEAM_TIMESTAMP_RE.fullmatch(text):
+        return normalize_timestamp(None)
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S.%f KST").replace(tzinfo=KST)
+    except (TypeError, ValueError):
+        return normalize_timestamp(None)
+    return {
+        "raw": text,
+        "utc": parsed.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "kst": parsed.isoformat(),
+    }
+
+
 def chrome_integer(raw):
     return int(raw) if normalize_timestamp(raw).get("utc") else None
 
@@ -236,6 +278,268 @@ def conversation_id(url):
     return unquote(match.group(1)) if match else None
 
 
+# Optional native Chromium decoding.  The dependency is deliberately lazy so the parser keeps
+# its v1.2 raw-scan behavior when the integration environment has not installed CCL yet.
+# The pinned version/commit matches the Claude Web parser reviewed for this project.
+CCL_EXPECTED_VERSION = "0.3.18"
+CCL_EXPECTED_COMMIT = "ef840de30221c4d65bc96d2f4d9057e9ef2f526d"
+_CCL_MODULES = None
+_CCL_IMPORT_ATTEMPTED = False
+_CCL_IMPORT_ERROR = None
+DEEP_MAX_DECODED_BYTES = 256 * 1024 * 1024
+DEEP_MAX_DECODE_RATIO = 400
+
+
+def _load_ccl_modules():
+    """Load the Chromium container readers lazily; return a module dict or None."""
+    global _CCL_MODULES, _CCL_IMPORT_ATTEMPTED, _CCL_IMPORT_ERROR
+    if _CCL_IMPORT_ATTEMPTED:
+        return _CCL_MODULES
+    _CCL_IMPORT_ATTEMPTED = True
+    try:
+        package = importlib.import_module("ccl_chromium_reader")
+        _CCL_MODULES = {
+            "package": package,
+            "cache": importlib.import_module("ccl_chromium_reader.ccl_chromium_cache"),
+            "indexeddb": importlib.import_module("ccl_chromium_reader.ccl_chromium_indexeddb"),
+            "local_storage": importlib.import_module("ccl_chromium_reader.ccl_chromium_localstorage"),
+            "session_storage": importlib.import_module("ccl_chromium_reader.ccl_chromium_sessionstorage"),
+            "leveldb": importlib.import_module("ccl_chromium_reader.storage_formats.ccl_leveldb"),
+            "snss": importlib.import_module("ccl_chromium_reader.ccl_chromium_snss2"),
+        }
+        _CCL_IMPORT_ERROR = None
+    except Exception as exc:
+        _CCL_MODULES = None
+        _CCL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    return _CCL_MODULES
+
+
+def _ccl_get_attr(obj, *names, default=None):
+    if obj is None:
+        return default
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj.get(name)
+        if hasattr(obj, name):
+            try:
+                return getattr(obj, name)
+            except Exception:
+                continue
+    return default
+
+
+def _ccl_safe_str(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _ccl_location_str(location):
+    if location is None:
+        return ""
+    source = _ccl_get_attr(location, "source_file", "file_name", default="")
+    offset = _ccl_get_attr(location, "offset", default=None)
+    if source or offset is not None:
+        return f"{_ccl_safe_str(source)}@{offset}"
+    return _ccl_safe_str(location)
+
+
+def _ccl_location_path(location, root):
+    """Resolve a CCL source-file locator to the staged file when it is safely inside root."""
+    source = _ccl_safe_str(_ccl_get_attr(location, "source_file", "file_name", default="")).strip()
+    root = Path(root)
+    if not source:
+        return root
+    candidate = Path(source)
+    if not candidate.is_absolute():
+        candidate = root / candidate.name
+    try:
+        resolved = candidate.resolve()
+        root_resolved = root.resolve()
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return resolved
+    except OSError:
+        pass
+    return root
+
+
+def _ccl_header_pairs(meta):
+    attrs = _ccl_get_attr(meta, "http_header_attributes", default=[]) or []
+    output = []
+    for item in attrs:
+        try:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                name, value = item[0], item[1]
+            elif isinstance(item, dict):
+                name, value = item.get("name") or item.get("key"), item.get("value")
+            else:
+                name = _ccl_get_attr(item, "name", "key", default=None)
+                value = _ccl_get_attr(item, "value", default=None)
+            if name is not None and value is not None:
+                output.append((_ccl_safe_str(name).strip().lower(), _ccl_safe_str(value).strip()))
+        except Exception:
+            continue
+    return output
+
+
+def _ccl_header_value(meta, name):
+    target = str(name).casefold()
+    values = [value for key, value in _ccl_header_pairs(meta) if key == target]
+    return ", ".join(values) if values else None
+
+
+def _deep_decode_http_body(data, content_encoding=None):
+    """Decode HTTP Content-Encoding with hard size/ratio guards; never guess plaintext."""
+    if not isinstance(data, (bytes, bytearray)):
+        return None, [], "body is not bytes"
+    raw = bytes(data)
+    encodings = [x.strip().lower() for x in str(content_encoding or "").split(",") if x.strip()]
+    if not encodings:
+        if raw.startswith(b"\x1f\x8b"):
+            encodings = ["gzip"]
+        elif raw.startswith(b"\x28\xb5\x2f\xfd"):
+            encodings = ["zstd"]
+    decoded = raw
+    applied = []
+    try:
+        for enc in reversed(encodings):
+            if enc in ("", "identity"):
+                continue
+            if enc in ("gzip", "x-gzip"):
+                decoded = gzip.decompress(decoded)
+            elif enc in ("deflate", "x-deflate"):
+                try:
+                    decoded = zlib.decompress(decoded)
+                except zlib.error:
+                    decoded = zlib.decompress(decoded, -zlib.MAX_WBITS)
+            elif enc == "br":
+                try:
+                    brotli = importlib.import_module("brotli")
+                except Exception as exc:
+                    return None, applied, f"brotli unavailable: {exc}"
+                decoded = brotli.decompress(decoded)
+            elif enc in ("zstd", "zstandard"):
+                try:
+                    zstandard = importlib.import_module("zstandard")
+                except Exception as exc:
+                    return None, applied, f"zstd unavailable: {exc}"
+                dctx = zstandard.ZstdDecompressor()
+                try:
+                    decoded = dctx.decompress(decoded)
+                except Exception:
+                    with dctx.stream_reader(io.BytesIO(decoded)) as reader:
+                        decoded = reader.read(DEEP_MAX_DECODED_BYTES + 1)
+            else:
+                return None, applied, f"unsupported content-encoding: {enc}"
+            applied.append(enc)
+            if len(decoded) > DEEP_MAX_DECODED_BYTES:
+                return None, applied, f"decoded body exceeds {DEEP_MAX_DECODED_BYTES} bytes"
+            if len(raw) and len(decoded) // max(1, len(raw)) > DEEP_MAX_DECODE_RATIO:
+                return None, applied, "decoded/raw size ratio exceeds guard"
+    except Exception as exc:
+        return None, applied, f"{type(exc).__name__}: {exc}"
+    return decoded, applied, None
+
+
+def _deep_decode_text(data, content_type=None):
+    """Decode only plausible text; binary bodies are not forced through latin-1."""
+    if not isinstance(data, (bytes, bytearray)):
+        return None, "not-bytes"
+    blob = bytes(data)
+    if not blob:
+        return "", "empty"
+    content_type = str(content_type or "")
+    charset = None
+    match = re.search(r"charset\s*=\s*[\"']?([^;\"']+)", content_type, re.I)
+    if match:
+        charset = match.group(1).strip()
+    candidates = [charset] if charset else []
+    candidates += ["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be"]
+    for encoding in dict.fromkeys(x for x in candidates if x):
+        try:
+            text = blob.decode(encoding)
+        except Exception:
+            continue
+        printable = sum(ch.isprintable() or ch in "\r\n\t" for ch in text)
+        if not text or printable / max(1, len(text)) >= 0.85:
+            return text, encoding
+    return None, "binary/unreadable"
+
+
+def _cache_key_gemini_url(key):
+    """Return the actual Gemini URL embedded in a Chromium cache key, never a linked URL in a body."""
+    text = _ccl_safe_str(key)
+    for match in re.finditer(r"https?://[^\s\x00<>\"']+", text, re.I):
+        candidate = match.group(0).rstrip(")],;}")
+        if is_gemini_url(candidate):
+            return candidate
+    return None
+
+
+def _gemini_cache_endpoint_kind(url):
+    """Classify a Gemini-owned cache key without claiming that it contains a conversation body."""
+    try:
+        parsed = urlsplit(str(url or ""))
+    except Exception:
+        return "unknown"
+    path = (parsed.path or "").casefold()
+    query = (parsed.query or "").casefold()
+    if "batchexecute" in path or "batchexecute" in query:
+        return "batchexecute"
+    if "streamgenerate" in path or "streamgenerate" in query:
+        return "streamgenerate"
+    if "/_/bardchatui/" in path or "bardchatui" in path:
+        return "bardchatui"
+    if re.match(r"^/app/[^/]+", parsed.path or "", re.I):
+        return "conversation_page"
+    if path in ("", "/"):
+        return "gemini_root"
+    if any(token in path for token in ("/static/", "/images/", "/favicon", "/robots.txt")):
+        return "static_asset"
+    return "other_gemini"
+
+
+def _ccl_cache_stream_state(cache, raw_key):
+    """Best-effort forensic description of a cache entry's four blockfile streams.
+
+    CCL exposes the response body through stream 1.  When that stream is absent we keep
+    the fact explicit rather than silently treating it as an empty decoded body.  This
+    helper intentionally does not read extra streams as message evidence.
+    """
+    out = {"entry_available": False, "stream_sizes": [], "stream_initialized": []}
+    try:
+        entry = cache[raw_key]
+    except Exception as exc:
+        out["entry_error"] = error_text(exc)
+        return out
+    out["entry_available"] = True
+    sizes = _ccl_get_attr(entry, "data_sizes", default=()) or ()
+    addrs = _ccl_get_attr(entry, "data_addrs", default=()) or ()
+    try:
+        out["stream_sizes"] = [int(x) for x in list(sizes)[:4]]
+    except Exception:
+        out["stream_sizes"] = [_ccl_safe_str(x) for x in list(sizes)[:4]]
+    initialized = []
+    for addr in list(addrs)[:4]:
+        try:
+            initialized.append(bool(_ccl_get_attr(addr, "is_initialized", default=False)))
+        except Exception:
+            initialized.append(False)
+    out["stream_initialized"] = initialized
+    state = _ccl_get_attr(entry, "state", default=None)
+    if state is not None:
+        out["entry_state"] = _ccl_safe_str(state)
+    created = _ccl_get_attr(entry, "creation_time", default=None)
+    if created is not None:
+        out["creation_time"] = _ccl_safe_str(created)
+    return out
+
+
 def history_relevance(url):
     """Classify URLs relevant to the Gemini action rules without retaining unrelated Google browsing."""
     if is_gemini_url(url):
@@ -255,8 +559,18 @@ def history_relevance(url):
     if host == "myaccount.google.com" and ("/profile/name" in path or "/personal-info" in path):
         return "google_account_name"
     if host == "accounts.google.com":
+        # Google sign-in URLs are shared by many services (Drive, Claude, LM Studio, etc.).
+        # Attribute the flow to Gemini only when the URL itself carries an explicit Gemini
+        # destination/origin.  Generic /signin/, authuser=, or ServiceLogin markers alone
+        # are insufficient and previously caused cross-service false positives.
         values = " ".join(str(v) for v in query.values()).lower()
-        if "gemini.google.com" in values or "authuser" in query or "/signin/" in path or path.endswith("/servicelogin"):
+        explicit_gemini_target = (
+            "gemini.google.com" in values
+            or "bard.google.com" in values
+            or "gemini.google.com" in lowered
+            or "bard.google.com" in lowered
+        )
+        if explicit_gemini_target:
             return "google_account_url_with_gemini_reference"
     if host == "support.google.com" and "gemini" in lowered:
         return "google_gemini_support"
@@ -294,13 +608,15 @@ class GeminiParser:
         "cookies": "Chrome Cookies", "preferences": "Chrome Preferences",
         "secure_preferences": "Chrome Secure Preferences", "cache": "Chrome Cache",
         "local_storage": "Chrome Local Storage", "session_storage": "Chrome Session Storage",
-        "indexeddb": "Chrome IndexedDB", "recycle_bin": "Windows Recycle Bin",
+        "indexeddb": "Chrome IndexedDB", "service_worker": "Chrome Service Worker",
+        "conversation_scope": "Gemini Conversation Recovery Scope", "recycle_bin": "Windows Recycle Bin",
     }
 
     def __init__(self, profile_path, user_root=None, *, evidence_root=None,
                  correlation_seconds=300, max_binary_bytes=0, max_matches_per_file=200,
                  max_files=0, max_json_bytes=64 * 1024 * 1024, verbose=False,
-                 image_mode=None, temp_root=None, keep_temp=False, max_extracted_bytes=0):
+                 image_mode=None, temp_root=None, keep_temp=False, max_extracted_bytes=0,
+                 deep_recovery=True):
         self.profile_path = Path(profile_path).expanduser().absolute()
         self.user_root = Path(user_root).expanduser().absolute() if user_root else None
         self.evidence_root = Path(evidence_root).expanduser().absolute() if evidence_root else None
@@ -327,12 +643,17 @@ class GeminiParser:
         self.temp_root = temp_root
         self.keep_temp = keep_temp
         self.max_extracted_bytes = max_extracted_bytes
+        self.deep_recovery = bool(deep_recovery)
+        # True only for a Chrome profile staged from a read-only forensic image.
+        # Used to avoid reporting live-copy race limitations for static image evidence.
+        self._staged_from_forensic_image = False
         self._image_parser = None
 
     def _artifact_options(self):
         return {"correlation_seconds": self.correlation_seconds, "max_binary_bytes": self.max_binary_bytes,
                 "max_matches_per_file": self.max_matches_per_file, "max_files": self.max_files,
-                "max_json_bytes": self.max_json_bytes, "verbose": self.verbose}
+                "max_json_bytes": self.max_json_bytes, "verbose": self.verbose,
+                "deep_recovery": self.deep_recovery}
 
     def _say(self, text):
         if self.verbose:
@@ -366,11 +687,11 @@ class GeminiParser:
             "preferences": p / "Preferences", "secure_preferences": p / "Secure Preferences",
             "cache": p / "Cache" / "Cache_Data", "local_storage": p / "Local Storage" / "leveldb",
             "session_storage": p / "Session Storage", "indexeddb": p / "IndexedDB",
-            "sessions": p / "Sessions",
+            "service_worker": p / "Service Worker", "sessions": p / "Sessions",
         }
         self.artifacts, self.artifact_status, self._discovery_errors = {}, {}, {}
         self._expected = expected
-        directory_keys = {"cache", "local_storage", "session_storage", "indexeddb", "sessions"}
+        directory_keys = {"cache", "local_storage", "session_storage", "indexeddb", "service_worker", "sessions"}
         for key, path in expected.items():
             try:
                 info = path.stat()
@@ -435,11 +756,12 @@ class GeminiParser:
             self._say(f"[{'+' if state == 'success' else '-'}] {self.ARTIFACTS[key]}: {state}")
         self._say("[Parsing]")
         routines = [
-            ("history", self._parse_history), ("sessions", self._parse_binary_artifact),
+            ("history", self._parse_history), ("sessions", self._parse_browser_artifact),
             ("cookies", self._parse_cookies), ("preferences", self._parse_preferences),
-            ("secure_preferences", self._parse_preferences), ("cache", self._parse_binary_artifact),
-            ("local_storage", self._parse_binary_artifact),
-            ("session_storage", self._parse_binary_artifact), ("indexeddb", self._parse_binary_artifact),
+            ("secure_preferences", self._parse_preferences), ("cache", self._parse_browser_artifact),
+            ("local_storage", self._parse_browser_artifact),
+            ("session_storage", self._parse_browser_artifact), ("indexeddb", self._parse_browser_artifact),
+            ("service_worker", self._parse_browser_artifact),
             ("recycle_bin", self._parse_recycle_bin),
         ]
         for key, routine in routines:
@@ -466,15 +788,18 @@ class GeminiParser:
                 findings = 0
             self.artifact_status[key] = state
             limitations = []
-            if key in {"sessions", "cache", "local_storage", "session_storage", "indexeddb"}:
-                limitations = ["Raw byte/string scan only; no native record, compression, or deleted/live-state decoding.",
-                               "No raw match does not establish absence of service use."]
+            if key in {"sessions", "cache", "local_storage", "session_storage", "indexeddb", "service_worker"}:
+                limitations = ["Raw byte/string scan remains a fallback. Native Chromium decoding is attempted separately with ccl_chromium_reader when available.",
+                               "No recoverable local record does not establish absence of service use."]
             self._emit(key, "Artifact analysis status", path=self._expected[key],
                        detail={"record_type": "analysis_status", "finding_count": findings,
                                "limitations": limitations}, status=state, level="unconfirmed",
                        error=self._discovery_errors.get(key))
             self._say(f"[{'+' if findings else '-'}] {self.ARTIFACTS[key]}: {findings} findings ({state})")
+        # Semantic/correlation derivation must finish before recovery summaries are frozen.
+        # This prevents JSON summary counts from describing an earlier view than the final CSV.
         self._derive_semantic_actions()
+        self._emit_conversation_scope_summaries()
         return self.results
 
     def get_results(self) -> list[dict]:
@@ -521,11 +846,20 @@ class GeminiParser:
             else:
                 raise OSError("database or journal changed during all three copy attempts; acquire a stable snapshot")
             if "-wal" in before or "-journal" in before or attempt:
+                staged_image = bool(getattr(self, "_staged_from_forensic_image", False))
+                note_status = "success" if staged_image and attempt == 0 else "partial"
+                limitation = (
+                    "Database and available sidecars were staged from the same read-only forensic image "
+                    "before isolated SQLite access; no live-source copy race applies."
+                    if staged_image else
+                    "Stable size/mtime checks do not guarantee an atomic live snapshot."
+                )
                 self._emit(key, "Database and available journals copied for isolated SQLite reading",
-                           path=path, level="unconfirmed", status="partial",
+                           path=path, level="unconfirmed", status=note_status,
                            detail={"record_type": "acquisition_note", "copied_sidecars": [s for s in before if s],
                                    "copy_attempts": attempt + 1,
-                                   "limitation": "Stable size/mtime checks do not guarantee an atomic live snapshot."})
+                                   "source_snapshot": "forensic_image_stage" if staged_image else "profile_copy",
+                                   "limitation": limitation})
             connection = sqlite3.connect(str(destination / path.name), timeout=2)
             try:
                 connection.row_factory = sqlite3.Row
@@ -700,9 +1034,11 @@ class GeminiParser:
                 self._download_record(path, download, chain, columns, chain_status)
             except Exception as exc:
                 self._issue("history", path, error_text(exc), locator={"table": "downloads", "id": download["id"]})
+        # Only explicit URL/Zone linkage counts as Gemini-associated.  Pure temporal
+        # proximity remains a supporting clue in JSON and is not counted as service attribution.
         associated_count = sum(
             1 for r in self._downloads
-            if (r.get("detail") or {}).get("gemini_attribution") in {"url_associated_candidate", "temporal_candidate"}
+            if (r.get("detail") or {}).get("gemini_attribution") == "url_associated_candidate"
         )
         self._emit("history", "Chrome download records examined and preserved", path=path, level="unconfirmed",
                    detail={"record_type": "inventory", "downloads_examined": examined,
@@ -745,10 +1081,12 @@ class GeminiParser:
                        "nearby_gemini_visits": nearby, "nearby_visit_count": nearby_count,
                        "correlation_window_seconds": self.correlation_seconds,
                        "gemini_attribution": attribution,
-                       "service_attribution": "candidate" if attribution != "unlinked_chrome_download" else "unconfirmed",
+                       "service_attribution": "candidate" if attribution == "url_associated_candidate" else "unconfirmed",
                        "limitation": (
+                           "Temporal proximity to a Gemini visit is only a supporting clue and is not sufficient for Gemini service attribution."
+                           if attribution == "temporal_candidate" else
                            "Association does not prove Gemini generated the file. A missing file does not prove deletion."
-                           if attribution != "unlinked_chrome_download" else
+                           if attribution == "url_associated_candidate" else
                            "Chrome download record is preserved, but no Gemini-specific linkage was established from the examined local artifacts."
                        ),
                        **resolution})
@@ -784,9 +1122,15 @@ class GeminiParser:
         if direct:
             level = "direct"
             action = "file_download"
-        elif attribution in {"url_associated_candidate", "temporal_candidate"}:
+        elif attribution == "url_associated_candidate":
+            # Explicit Gemini URL/Zone linkage exists, but the local file proof is incomplete.
             level = "support"
             action = "file_download"
+        elif attribution == "temporal_candidate":
+            # Time proximity alone must never become a Gemini user-action Timeline event.
+            # Preserve the Chrome record in JSON as a supporting candidate only.
+            level = "support"
+            action = "file_download_candidate"
         else:
             level = "unconfirmed"
             action = "file_download_candidate"
@@ -1146,6 +1490,980 @@ class GeminiParser:
         return found
 
     @staticmethod
+    def _is_google_search_context(text):
+        """Return True for Google Search result/query contexts.
+
+        Gemini links frequently appear inside ordinary Google Search result HTML. Those pages
+        must never be treated as Gemini chat evidence merely because gemini.google.com and a
+        query string coexist in the same cache entry.
+        """
+        if not isinstance(text, str) or not text:
+            return False
+        low = text.casefold()
+        markers = (
+            "www.google.com/search", "google.com/search?", "google.com/search&",
+            "data-async-context=\"query:", "data-async-context='query:",
+            "id=\"rso\"", "id='rso'", "<div id=\"search\"", "<div id='search'",
+            "google search", "search?q=", "&q=", "?q=",
+        )
+        if any(marker in low for marker in markers):
+            return True
+        if re.search(r"(?i)data-async-context\s*=\s*[\"']query%?[:=]", text):
+            return True
+        return False
+
+    @staticmethod
+    def _is_cross_service_prompt_context(text):
+        """Detect a bounded context that belongs to another service rather than Gemini chat."""
+        if not isinstance(text, str) or not text:
+            return False
+        low = text.casefold()
+        return any(host in low for host in (
+            "drive.google.com", "drive.usercontent.google.com", "docs.google.com",
+            "mail.google.com", "gmail.com", "calendar.google.com", "photos.google.com",
+            "youtube.com", "youtu.be", "myaccount.google.com",
+            "chatgpt.com", "openai.com", "claude.ai", "lmstudio.ai",
+        ))
+
+    @classmethod
+    def _decode_aggressive_prompt_text(cls, value, field=""):
+        """Decode one fallback prompt candidate without turning transport text into chat."""
+        if not isinstance(value, str):
+            return None
+        text = value.strip().strip("\x00")
+        if not text:
+            return None
+
+        try:
+            if "\\" in text:
+                decoded = json.loads('"' + text.replace('"', '\\"') + '"')
+                if isinstance(decoded, str):
+                    text = decoded
+        except (json.JSONDecodeError, TypeError, ValueError):
+            text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+            text = text.replace('\\"', '"').replace("\\/", "/")
+
+        for _ in range(2):
+            previous = text
+            text = html.unescape(text)
+            if re.search(r"%[0-9A-Fa-f]{2}", text):
+                try:
+                    text = unquote_plus(text)
+                except Exception:
+                    pass
+            if text == previous:
+                break
+
+        text = text.strip().strip("\"'")
+        label = str(field or "").casefold()
+        if re.match(r"(?i)^query\s*[:=]", text):
+            if label != "query":
+                return None
+            text = re.sub(r"(?i)^query\s*[:=]\s*", "", text, count=1)
+        normalized = cls._normalize_message_content(text)
+        if not normalized:
+            return None
+        low = normalized.casefold()
+        if any(token in low for token in (
+            "data-async-context", "id=\"rso\"", "id='rso'", "google search",
+            "<html", "<div", "<script", "<style", "stylesheet", "javascript:",
+        )):
+            return None
+        return normalized
+
+    @classmethod
+    def _extract_aggressive_prompt_candidates_from_text(cls, text, absolute_base=0,
+                                                        encoding="utf-8", origin_scoped=False):
+        """Recover high-confidence user prompt candidates from raw Gemini-scoped text.
+
+        This fallback is used when native RPC decoding did not recover the message. It requires
+        a Gemini-specific anchor close to the labelled text and rejects Google Search HTML/query
+        contexts as well as unrelated service contexts. Generic sentences are never emitted.
+        """
+        if not isinstance(text, str) or not text:
+            return []
+
+
+
+        variants = [(text, False)]
+        unescaped = html.unescape(text.replace('\\"', '"').replace("\\/", "/"))
+        if unescaped != text:
+            variants.append((unescaped, True))
+        if re.search(r"%[0-9A-Fa-f]{2}", text):
+            try:
+                decoded = unquote_plus(text)
+            except Exception:
+                decoded = text
+            if decoded != text and decoded != unescaped:
+                variants.append((decoded, True))
+
+        # Disjoint escape/plain branches avoid backtracking over alternate parses
+        # of backslashes. Plain text excludes both quotes, so greediness cannot
+        # consume an unescaped closing quote; retain the existing 8192-atom bound.
+        quoted = re.compile(
+            r'''(?is)["']?(?P<label>prompt_text|prompt|user_input|input|query|message_text|message|content|text)["']?\s*[:=]\s*(?P<quote>["'])(?P<value>(?:\\.|[^\\"']){2,8192})(?P=quote)'''
+        )
+        form = re.compile(
+            r'''(?is)(?:^|[?&;\s])(?P<label>prompt_text|prompt|user_input|input|query)\s*=\s*(?P<value>[^&\r\n]{2,8192})'''
+        )
+        colon = re.compile(
+            r'''(?is)(?:^|[,{;\s])(?P<label>prompt_text|prompt|user_input|input|query)\s*:\s*(?P<value>[^\r\n,}\]]{2,4096})'''
+        )
+
+        output, seen = [], set()
+        for variant, approximate in variants:
+            # Exact ranges are meaningful only within this particular variant.
+            google_search_cache, cid_cache, strong_rpc_cache = {}, {}, {}
+            cross_service_cache, role_cache = {}, {}
+            for rx in (quoted, form, colon):
+                for match in rx.finditer(variant):
+                    label = str(match.group("label") or "").casefold()
+                    start = match.start()
+                    c0 = max(0, start - AGGRESSIVE_PROMPT_CONTEXT)
+                    c1 = min(len(variant), match.end() + AGGRESSIVE_PROMPT_CONTEXT)
+                    context_key = (c0, c1)
+                    context = variant[c0:c1]
+
+                    if context_key not in google_search_cache:
+                        google_search_cache[context_key] = cls._is_google_search_context(context)
+                    if google_search_cache[context_key]:
+                        continue
+
+                    if context_key not in cid_cache:
+                        cid_cache[context_key] = cls._explicit_conversation_id_from_text(context)
+                    cid = cid_cache[context_key]
+                    if context_key not in strong_rpc_cache:
+                        strong_rpc_cache[context_key] = bool(re.search(
+                            r"(?i)(?:\bhnvQHb\b|StreamGenerate|BardChatUi|gemini\.google\.com/_/|"
+                            r"origin\s*=\s*(?:https?%3A%2F%2F|https?://)?gemini\.google\.com|"
+                            r"source-path\s*[:=]\s*[\"']?/app)", context
+                        ))
+                    strong_rpc = strong_rpc_cache[context_key]
+                    gemini_anchor = bool(cid or origin_scoped or strong_rpc)
+                    if not gemini_anchor:
+                        continue
+                    if context_key not in cross_service_cache:
+                        cross_service_cache[context_key] = cls._is_cross_service_prompt_context(context)
+                    if cross_service_cache[context_key] and not (cid or strong_rpc):
+                        continue
+
+                    role = "user" if label in {"prompt_text", "prompt", "user_input", "input", "query"} else ""
+                    if not role:
+                        if context_key not in role_cache:
+                            user_side = bool(re.search(
+                                r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:user|human)["']|["']author["']\s*[:=]\s*["']user["']|user[_ -]?message|user[_ -]?input)''',
+                                context,
+                            ))
+                            assistant_side = bool(re.search(
+                                r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:assistant|model)["']|["']author["']\s*[:=]\s*["'](?:assistant|model)["'])''',
+                                context,
+                            ))
+                            role_cache[context_key] = (user_side, assistant_side)
+                        else:
+                            user_side, assistant_side = role_cache[context_key]
+                        if not user_side or assistant_side:
+                            continue
+                        role = "user"
+
+                    prompt = cls._decode_aggressive_prompt_text(match.group("value"), label)
+                    if not prompt:
+                        continue
+                    if prompt.casefold().startswith(("http://", "https://")):
+                        continue
+                    identity = (cid or "", prompt.casefold())
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+
+                    if approximate:
+                        offset = absolute_base
+                    else:
+                        try:
+                            if encoding == "utf-16le":
+                                offset = absolute_base + match.start() * 2
+                            else:
+                                offset = absolute_base + len(variant[:match.start()].encode("utf-8", errors="ignore"))
+                        except Exception:
+                            offset = absolute_base
+                    output.append({
+                        "conversation_id": cid or "",
+                        "message_id": "",
+                        "parent_message_id": "",
+                        "message_order": None,
+                        "role": role,
+                        "message_content": prompt,
+                        "response_id": None,
+                        "choice_id": None,
+                        "recovery_basis": "aggressive_raw_prompt",
+                        "protocol": "raw-labelled-fallback",
+                        "protocol_offset": offset,
+                        "protocol_encoding": encoding,
+                        "offset_is_approximate": bool(approximate),
+                        "prompt_field": label,
+                    })
+                    if len(output) >= AGGRESSIVE_PROMPT_MAX_PER_FILE:
+                        return output
+        return output
+
+    @classmethod
+    def _normalize_message_content(cls, value):
+        """Normalize recovered chat text while preserving useful line structure.
+
+        This is stricter than ordinary string extraction: identifiers, URLs, protocol labels,
+        HTML fragments and high-entropy tokens are rejected so they cannot become chat rows.
+        """
+        if not isinstance(value, str):
+            return None
+        value = value.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+        value = re.sub(r"[ \t]+", " ", value)
+        value = re.sub(r"\n{4,}", "\n\n\n", value).strip()
+        if len(value) < 2 or len(value) > 262144:
+            return None
+        lowered = value.casefold()
+        # A JSON-encoded container can contain the actual prompt plus IDs and metadata.
+        # Decode it structurally elsewhere; never emit the whole serialized container as content.
+        if value[:1] in "[{":
+            try:
+                decoded_container = json.loads(value)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                decoded_container = None
+            if isinstance(decoded_container, (list, dict)):
+                return None
+        if re.fullmatch(r"https?://\S+", value, re.I):
+            return None
+        if lowered in {
+            "message", "message_text", "text", "content", "prompt", "query", "response",
+            "answer", "input", "output", "generic", "null", "true", "false", "undefined",
+            "application/json", "application/x-www-form-urlencoded", "text/plain",
+        }:
+            return None
+        if re.fullmatch(r"[A-Za-z0-9_./:@+%?&=\-]{8,}", value) and not re.search(r"\s", value):
+            return None
+        if value.startswith("<") and value.endswith(">") and re.search(r"</?[A-Za-z][^>]*>", value):
+            return None
+        # Reject common protocol/UI-only fragments.
+        if any(token in lowered for token in (
+            "dynamicframe", "rotatecookiespage", "__features__", "rpctoken=",
+            "source-path=", "rpcids=", "blink serialized form state version",
+        )) and len(value.split()) < 18:
+            return None
+        letters = sum(ch.isalpha() for ch in value)
+        hangul = len(re.findall(r"[가-힣]", value))
+        if letters + hangul < 2:
+            return None
+        printable = sum(ch.isprintable() or ch in "\n\t" for ch in value)
+        if printable / max(1, len(value)) < 0.92:
+            return None
+        return value
+
+    @staticmethod
+    def _protocol_id(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if value.startswith("c_") and 4 <= len(value) <= 260:
+            return value[2:]
+        if re.fullmatch(r"(?:r|rc)_[A-Za-z0-9_-]{1,253}", value):
+            return value
+        if re.fullmatch(r"[A-Za-z0-9_-]{8,256}", value):
+            # Pure decimal values are usually counters/timestamps rather than IDs.
+            if value.isdigit():
+                return None
+            return value
+        return None
+
+    @staticmethod
+    def _conversation_protocol_id(value):
+        """Accept only Gemini conversation-id shapes observed in chat URLs/protocol payloads.
+
+        Model hashes, request UUIDs, RPC ids and other opaque tokens can also be 8-32
+        characters long, so the generic _protocol_id() is deliberately not sufficient here.
+        Current Gemini Web conversation ids observed in /app/<id> and c_<id> forms are
+        16 hexadecimal characters; preserve the original hex case but strip the c_ wrapper.
+        """
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if value.startswith("c_"):
+            value = value[2:]
+        return value if re.fullmatch(r"[0-9a-fA-F]{16}", value) else None
+
+    @classmethod
+    def _walk_json_strings(cls, value, max_nodes=20000):
+        """Yield strings from a decoded JSON-like tree with a hard traversal bound."""
+        stack = [value]
+        seen_nodes = 0
+        while stack and seen_nodes < max_nodes:
+            current = stack.pop()
+            seen_nodes += 1
+            if isinstance(current, str):
+                yield current
+            elif isinstance(current, dict):
+                stack.extend(reversed(list(current.values())))
+            elif isinstance(current, (list, tuple)):
+                stack.extend(reversed(current))
+
+    @classmethod
+    def _natural_strings(cls, value, limit=32):
+        found = []
+        seen = set()
+        for raw in cls._walk_json_strings(value):
+            text = cls._normalize_message_content(raw)
+            if not text:
+                continue
+            ident = text.casefold()
+            if ident in seen:
+                continue
+            seen.add(ident)
+            found.append(text)
+            if len(found) >= limit:
+                break
+        return found
+
+    @classmethod
+    def _stream_payload_messages(cls, payload, absolute_offset=0, protocol="gemini_stream_payload"):
+        """Decode Gemini StreamGenerate/chat-response arrays conservatively.
+
+        A valid chat response must expose a 16-hex conversation id at index 1, a response id,
+        and a choice list at index 4.  Those anchors are substantially stronger than merely
+        finding a wrb.fr envelope, which is shared by many unrelated Google RPCs.
+        """
+        out = []
+        seen = set()
+        visited = 0
+        stack = [payload]
+        while stack and visited < 5000:
+            node = stack.pop()
+            visited += 1
+            if isinstance(node, dict):
+                stack.extend(reversed(list(node.values())))
+                continue
+            if not isinstance(node, list):
+                continue
+            stack.extend(reversed(node))
+            if len(node) < 5 or not isinstance(node[1], list) or len(node[1]) < 2:
+                continue
+            cid = cls._conversation_protocol_id(node[1][0])
+            response_id = cls._protocol_id(node[1][1])
+            choices = node[4]
+            if not cid or not response_id or not isinstance(choices, list):
+                continue
+
+            query_text = None
+            if isinstance(node[2], list) and node[2]:
+                candidates = cls._natural_strings(node[2], limit=8)
+                if candidates:
+                    query_text = max(candidates, key=len)
+            if query_text:
+                item = {
+                    "conversation_id": cid,
+                    "message_id": "",
+                    "parent_message_id": "",
+                    "message_order": None,
+                    "role": "user",
+                    "message_content": query_text,
+                    "response_id": response_id,
+                    "choice_id": None,
+                    "recovery_basis": "structured_stream_query",
+                    "protocol": protocol,
+                    "protocol_offset": absolute_offset,
+                }
+                key = (cid, response_id, "user", query_text)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(item)
+
+            assistant_count = 0
+            for choice in choices[:16]:
+                if not isinstance(choice, list) or len(choice) < 2:
+                    continue
+                choice_id = cls._protocol_id(choice[0]) if choice else None
+                texts = cls._natural_strings(choice[1], limit=16)
+                if not texts:
+                    continue
+                # Stream chunks normally carry an accumulated candidate.  Keep the longest
+                # natural-language value in this choice; cross-chunk consolidation happens later.
+                content = max(texts, key=len)
+                if query_text and content.strip() == query_text.strip():
+                    continue
+                assistant_count += 1
+                item = {
+                    "conversation_id": cid,
+                    "message_id": response_id or choice_id or "",
+                    "parent_message_id": "",
+                    "message_order": None,
+                    "role": "assistant",
+                    "message_content": content,
+                    "response_id": response_id,
+                    "choice_id": choice_id,
+                    "recovery_basis": "structured_stream_choice",
+                    "protocol": protocol,
+                    "protocol_offset": absolute_offset,
+                }
+                key = (cid, response_id, choice_id, "assistant", content)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(item)
+                # Alternative drafts are choices, not separate conversation turns.
+                break
+            # Do not stop after the first response-shaped node. A single Google frame can
+            # contain multiple wrb.fr/chat payloads, and all must remain recoverable.
+        return out
+
+    @classmethod
+    def _decode_nested_json_strings(cls, value, depth=0, max_depth=4):
+        """Yield JSON values nested inside JSON-encoded strings at any container depth.
+
+        Batchexecute payloads commonly wrap an RPC request/response several list levels deep
+        before the useful value appears as a JSON string.  Traverse ordinary containers without
+        increasing the decode depth; only decoding a string consumes one depth level.
+        """
+        yield value
+        queue = [(value, depth)]
+        visited = 0
+        while queue and visited < 20000:
+            current, current_depth = queue.pop()
+            visited += 1
+            if isinstance(current, dict):
+                queue.extend((child, current_depth) for child in current.values())
+                continue
+            if isinstance(current, (list, tuple)):
+                queue.extend((child, current_depth) for child in current)
+                continue
+            if not isinstance(current, str) or current_depth >= max_depth:
+                continue
+            stripped = current.strip()
+            if not (2 <= len(stripped) <= MAX_PROTOCOL_TEXT and stripped[:1] in "[{"):
+                continue
+            try:
+                decoded = json.loads(stripped)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            yield decoded
+            queue.append((decoded, current_depth + 1))
+
+    @staticmethod
+    def _explicit_conversation_id_from_text(text):
+        """Return a conversation id only when the text carries an explicit chat anchor.
+
+        A bare 16-hex token is *not* enough: current Gemini request payloads also contain
+        16-hex model hashes, which must never become conversation_uuid values.  Accept only
+        /app/<id> paths or c_<16hex> protocol ids here.  Response payloads use their own
+        positional conversation-id decoder.
+        """
+        if not isinstance(text, str):
+            return None
+        match = re.search(r"(?:https?://gemini\.google\.com)?/app/([A-Za-z0-9_-]{8,256})", text, re.I)
+        if match:
+            return match.group(1)
+        match = re.search(r"\bc_([0-9a-fA-F]{16})\b", text)
+        if match:
+            return match.group(1)
+        return None
+
+    @classmethod
+    def _stream_request_prompts(cls, value, limit=8):
+        """Read only the StreamGenerate request slot, never arbitrary nested settings."""
+        if limit < 1 or not isinstance(value, list):
+            return []
+        # StreamGenerate f.req envelope: [null, JSON-encoded inner request].
+        if len(value) == 2 and value[0] is None and isinstance(value[1], str):
+            try:
+                value = json.loads(value[1])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return []
+        # Inner request: [[prompt, ...], null/[language], [continuation ids...], ...].
+        if not (isinstance(value, list) and len(value) >= 3
+                and isinstance(value[0], list) and value[0]
+                and isinstance(value[0][0], str)
+                and isinstance(value[2], list) and len(value[2]) >= 3
+                and all(isinstance(item, str) for item in value[2][:3])):
+            return []
+        language = value[1]
+        if language is not None and not (
+            isinstance(language, list) and len(language) == 1
+            and isinstance(language[0], str)
+            and re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z]{2,4})?", language[0])
+        ):
+            return []
+        prompt = cls._normalize_message_content(value[0][0])
+        return [prompt] if prompt else []
+
+    @classmethod
+    def _iter_wrb_entries(cls, value):
+        """Yield supported batchexecute response envelopes in source order."""
+        if isinstance(value, list):
+            if len(value) >= 3 and value[0] == "wrb.fr" and isinstance(value[2], str):
+                yield value
+                return
+            # Some captured/decoded Google frames expose [rpcid, null, inner_json, ...]
+            # without the outer wrb.fr tag.  Only normalize the known READ_CHAT rpc id.
+            if len(value) >= 3 and value[0] == "hNvQHb" and value[1] is None and isinstance(value[2], str):
+                yield ["wrb.fr", "hNvQHb", value[2]]
+                return
+            for child in value:
+                yield from cls._iter_wrb_entries(child)
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from cls._iter_wrb_entries(child)
+
+    @staticmethod
+    def _history_timestamp_value(value):
+        """Convert a Gemini READ_CHAT [epoch_seconds, nanoseconds] value to strict KST."""
+        if isinstance(value, (list, tuple)) and value:
+            seconds = value[0]
+            nanos = value[1] if len(value) > 1 else 0
+        else:
+            seconds, nanos = value, 0
+        try:
+            seconds = float(seconds)
+            nanos = int(nanos or 0)
+        except (TypeError, ValueError, OverflowError):
+            return ""
+        # Contemporary READ_CHAT records use Unix seconds.  Keep a conservative range so
+        # unrelated counters/file-times cannot silently become message timestamps.
+        if not (946684800 <= seconds <= 4102444800):  # 2000-01-01 .. 2100-01-01 UTC
+            return ""
+        try:
+            whole = int(seconds)
+            micros = int(round((seconds - whole) * 1_000_000)) + max(0, min(nanos, 999_999_999)) // 1000
+            if micros >= 1_000_000:
+                whole += micros // 1_000_000
+                micros %= 1_000_000
+            parsed = datetime.fromtimestamp(whole, tz=timezone.utc).replace(microsecond=micros).astimezone(KST)
+        except (OSError, OverflowError, ValueError):
+            return ""
+        return parsed.strftime("%Y-%m-%d %H:%M:%S") + f".{parsed.microsecond:06d} KST"
+
+    @classmethod
+    def _history_attachment_metadata(cls, node):
+        """Recover conservative attachment metadata from a READ_CHAT prompt attachment field.
+
+        Only the dedicated attachment subtree is inspected.  Natural-language strings elsewhere
+        in the turn are deliberately ignored so filenames cannot be invented from prompt text or
+        assistant content.  The output is internal JSON evidence; it is never appended to message
+        content.
+        """
+        if node in (None, "", [], {}):
+            return []
+        found = {}
+        stack = [node]
+        visited = 0
+        mime_re = re.compile(r"^[a-z0-9.+-]+/[a-z0-9.+-]+$", re.I)
+        while stack and visited < 2000:
+            current = stack.pop()
+            visited += 1
+            if isinstance(current, dict):
+                stack.extend(reversed(list(current.values())))
+                continue
+            if isinstance(current, (list, tuple)):
+                stack.extend(reversed(list(current)))
+                continue
+            if not isinstance(current, str):
+                continue
+            text = current.strip().replace("\x00", "")
+            if not text or len(text) > 1024:
+                continue
+            match = UPLOAD_FILE_RE.search(text)
+            if match:
+                filename = match.group(1).strip()
+                key = filename.casefold()
+                item = found.setdefault(key, {"filename": filename})
+                item["media_kind"] = "image" if IMAGE_FILE_RE.search(filename) else "document"
+            elif mime_re.fullmatch(text):
+                # MIME strings are retained only as a page-level hint.  Do not attach them to a
+                # filename unless the private RPC structure gives an explicit relationship.
+                found.setdefault("__mime__:" + text.casefold(), {"mime_type": text})
+        filenames = [value for key, value in found.items() if not key.startswith("__mime__:")]
+        mime_hints = [value["mime_type"] for key, value in found.items()
+                      if key.startswith("__mime__:") and value.get("mime_type")]
+        if len(filenames) == 1 and len(mime_hints) == 1:
+            filenames[0]["mime_type"] = mime_hints[0]
+        return filenames[:32]
+
+    @classmethod
+    def _history_rpc_messages(cls, payload, absolute_offset=0, protocol="wrb.fr/hNvQHb"):
+        """Decode hNvQHb READ_CHAT pages into user/assistant message records.
+
+        The decoder requires the positional anchors observed in Gemini's READ_CHAT turn
+        records.  It also follows the candidate id referenced by later turns so a regenerated
+        response branch that was actually continued is preferred over abandoned alternatives.
+        Thinking/tool metadata outside the selected candidate-text field is not promoted.
+        """
+        output = []
+        seen = set()
+
+        # READ_CHAT body is normally [turns, cursor/...], but nested JSON-string wrappers can
+        # expose that body at different depths. Search bounded containers for a turn list.
+        candidates = []
+        stack = [payload]
+        visited = 0
+        while stack and visited < 4000:
+            node = stack.pop()
+            visited += 1
+            if isinstance(node, dict):
+                stack.extend(reversed(list(node.values())))
+                continue
+            if not isinstance(node, list):
+                continue
+            if node and isinstance(node[0], list):
+                possible_turns = node[0]
+                if possible_turns and all(isinstance(turn, list) for turn in possible_turns[:3]):
+                    candidates.append(possible_turns)
+            stack.extend(reversed([child for child in node if isinstance(child, (list, dict))]))
+
+        for turns in candidates[:8]:
+            # hNvQHb pages are newest-first.  A regenerated response can leave several
+            # candidates; a candidate id referenced by a turn's parent/choice metadata is
+            # evidence that branch was actually continued.
+            continued_choice_ids = set()
+            for turn in turns[:2000]:
+                if isinstance(turn, list) and len(turn) > 1 and isinstance(turn[1], list) and len(turn[1]) > 2:
+                    choice = cls._protocol_id(turn[1][2])
+                    if choice:
+                        continued_choice_ids.add(choice)
+
+            total_turns = min(len(turns), 2000)
+            for turn_index, turn in enumerate(turns[:2000]):
+                if not isinstance(turn, list) or len(turn) < 4:
+                    continue
+                meta = turn[0] if isinstance(turn[0], list) else None
+                extended = turn[1] if len(turn) > 1 and isinstance(turn[1], list) else None
+                if not meta or len(meta) < 2:
+                    continue
+                cid = cls._conversation_protocol_id(meta[0])
+                response_id = cls._protocol_id(meta[1])
+                if not cid or not response_id:
+                    continue
+
+                parent_response_id = None
+                referenced_choice_id = None
+                if extended:
+                    ext_cid = cls._conversation_protocol_id(extended[0]) if len(extended) > 0 else None
+                    if ext_cid and ext_cid != cid:
+                        continue
+                    # The second value is the parent response id for follow-up turns; it is
+                    # not required to equal the current response id.
+                    parent_response_id = cls._protocol_id(extended[1]) if len(extended) > 1 else None
+                    referenced_choice_id = cls._protocol_id(extended[2]) if len(extended) > 2 else None
+
+                timestamp = cls._history_timestamp_value(turn[4] if len(turn) > 4 else None)
+                # Restore chronological protocol order even when timestamps are unavailable.
+                chronological_index = total_turns - 1 - turn_index
+
+                prompt_section = turn[2] if len(turn) > 2 else None
+                try:
+                    raw_prompt = prompt_section[0][0]
+                except (TypeError, IndexError):
+                    raw_prompt = None
+                try:
+                    attachment_section = prompt_section[0][4]
+                except (TypeError, IndexError):
+                    attachment_section = None
+                attachments = cls._history_attachment_metadata(attachment_section)
+                prompt = cls._normalize_message_content(raw_prompt)
+                if prompt:
+                    item = {
+                        "conversation_id": cid,
+                        "message_id": "",
+                        "parent_message_id": parent_response_id or "",
+                        "message_order": None,
+                        "role": "user",
+                        "message_content": prompt,
+                        "message_timestamp": timestamp,
+                        "response_id": response_id,
+                        "choice_id": referenced_choice_id,
+                        "recovery_basis": "history_rpc_user_prompt",
+                        "protocol": protocol,
+                        "protocol_offset": absolute_offset,
+                        "protocol_sequence": chronological_index * 2,
+                        "attachments": attachments,
+                    }
+                    key = (cid, response_id, "user", prompt)
+                    if key not in seen:
+                        seen.add(key)
+                        output.append(item)
+
+                # Current READ_CHAT response section is a candidate list at turn[3][0].
+                # Preserve every response candidate here.  The final conversation builder resolves
+                # the active branch globally using choice ids referenced by later turns, which also
+                # works when pagination placed the parent pointer in a different cache response.
+                response_section = turn[3] if len(turn) > 3 else None
+                try:
+                    response_candidates = response_section[0]
+                except (TypeError, IndexError):
+                    response_candidates = None
+                if isinstance(response_candidates, list):
+                    for candidate_rank, candidate in enumerate(response_candidates[:16]):
+                        if not isinstance(candidate, list) or len(candidate) < 2:
+                            continue
+                        selected_choice_id = cls._protocol_id(candidate[0])
+                        if not selected_choice_id:
+                            continue
+                        text_container = candidate[1]
+                        if isinstance(text_container, list) and text_container and isinstance(text_container[0], str):
+                            answer = cls._normalize_message_content(text_container[0])
+                        elif isinstance(text_container, str):
+                            answer = cls._normalize_message_content(text_container)
+                        else:
+                            answer = None
+                        if not answer or (prompt and answer.strip() == prompt.strip()):
+                            continue
+                        item = {
+                            "conversation_id": cid,
+                            "message_id": response_id,
+                            "parent_message_id": "",
+                            "message_order": None,
+                            "role": "assistant",
+                            "message_content": answer,
+                            "message_timestamp": timestamp,
+                            "response_id": response_id,
+                            "choice_id": selected_choice_id,
+                            "candidate_rank": candidate_rank,
+                            "recovery_basis": "history_rpc_assistant_candidate",
+                            "protocol": protocol,
+                            "protocol_offset": absolute_offset,
+                            "protocol_sequence": chronological_index * 2 + 1,
+                        }
+                        key = (cid, response_id, selected_choice_id, "assistant", answer)
+                        if key not in seen:
+                            seen.add(key)
+                            output.append(item)
+                if len(output) >= 4000:
+                    return output
+        return output
+
+    @classmethod
+    def _wrb_messages_from_text(cls, text, absolute_base=0):
+        """Recover Gemini chat responses from Google wrb.fr transport frames.
+
+        Google uses wrb.fr for many products/RPCs.  We therefore decode the envelope first and
+        only promote payloads that satisfy the stricter Gemini chat-response structure checked by
+        _stream_payload_messages().  Source order is preserved across multiple entries/chunks.
+        """
+        if not isinstance(text, str) or ('wrb.fr' not in text and 'hNvQHb' not in text):
+            return []
+        output = []
+        seen = set()
+        cursor = 0
+        for line in text.splitlines():
+            line_offset = text.find(line, cursor)
+            if line_offset < 0:
+                line_offset = cursor
+            cursor = line_offset + len(line) + 1
+            if ('wrb.fr' not in line and 'hNvQHb' not in line) or len(line) > MAX_PROTOCOL_TEXT:
+                continue
+            candidate = line.strip()
+            start = candidate.find('[')
+            if start > 0:
+                candidate = candidate[start:]
+            try:
+                # Cache/session bytes can append unrelated binary/text after a valid JSON frame
+                # on the same physical line.  Decode the first complete JSON value rather than
+                # requiring the remainder of the line to be empty.  Structural RPC validation
+                # below still decides whether the value is a Gemini message frame.
+                outer, _ = json.JSONDecoder().raw_decode(candidate)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
+            entry_index = 0
+            for entry in cls._iter_wrb_entries(outer):
+                entry_index += 1
+                rpc_id = entry[1] if len(entry) > 1 else None
+                inner_text = entry[2]
+                if not isinstance(inner_text, str) or not inner_text.strip():
+                    continue
+                try:
+                    decoded_root = json.loads(inner_text)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                protocol = "wrb.fr/StreamGenerate" if rpc_id in (None, "") else f"wrb.fr/{rpc_id}"
+                for decoded in cls._decode_nested_json_strings(decoded_root):
+                    if rpc_id == "hNvQHb":
+                        decoded_messages = cls._history_rpc_messages(
+                            decoded, absolute_base + line_offset, protocol=protocol
+                        )
+                    else:
+                        decoded_messages = cls._stream_payload_messages(
+                            decoded, absolute_base + line_offset, protocol=protocol
+                        )
+                    for msg in decoded_messages:
+                        msg = dict(msg)
+                        # READ_CHAT carries its own per-turn sequence; stream frames use entry order.
+                        if msg.get("protocol_sequence") is None:
+                            msg["protocol_sequence"] = entry_index
+                        key = (
+                            msg.get("conversation_id"), msg.get("response_id"), msg.get("choice_id"),
+                            msg.get("role"), msg.get("message_content"), msg.get("protocol_offset")
+                        )
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        output.append(msg)
+                        if len(output) >= 4096:
+                            return output
+        return output
+
+    @classmethod
+    def _f_req_messages_from_text(cls, text, absolute_base=0):
+        """Recover submitted user text from Gemini f.req payloads.
+
+        Only the known StreamGenerate request envelope and positional prompt slot qualify.
+        Unknown layouts remain unrecovered rather than promoting settings/UI strings.
+        """
+        if not isinstance(text, str) or "f.req" not in text:
+            return []
+        low = text.casefold()
+        if not any(marker in low for marker in (
+            "gemini.google.com", "bardchatui", "streamgenerate", "source-path=/app",
+            "source-path=%2fapp",
+        )):
+            # batchexecute/f.req is a shared Google transport (Drive and many other products
+            # use it too).  Without a Gemini/Bard/chat-specific anchor, promoting request text
+            # would create cross-service prompt/timeline false positives.
+            return []
+        output = []
+        seen = set()
+        for match in re.finditer(r"f\.req\s*=\s*([^&\r\n\x00]{2,})", text, re.I):
+            raw = match.group(1).strip().strip("\"'")
+            if len(raw) > MAX_PROTOCOL_TEXT * 2:
+                continue
+            try:
+                decoded_text = unquote_plus(raw)
+            except Exception:
+                decoded_text = raw
+            decoded_text = decoded_text.strip()
+            try:
+                payload = json.loads(decoded_text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
+            decoded_values = list(cls._decode_nested_json_strings(payload))
+            serialized_payloads = [decoded_text]
+            for decoded in decoded_values:
+                try:
+                    serialized_payloads.append(json.dumps(decoded, ensure_ascii=False, separators=(",", ":")))
+                except (TypeError, ValueError):
+                    pass
+
+            # Never infer a conversation id from an unanchored 16-hex token: model hashes use
+            # the same shape.  Only explicit /app/<id> or c_<id> anchors qualify here.
+            cid = None
+            context_start = max(0, match.start() - 4096)
+            context_end = min(len(text), match.end() + 4096)
+            cid = cls._explicit_conversation_id_from_text(text[context_start:context_end])
+            if not cid:
+                for serialized in serialized_payloads:
+                    cid = cls._explicit_conversation_id_from_text(serialized)
+                    if cid:
+                        break
+
+            structured_prompts = cls._stream_request_prompts(payload)
+            basis = "gemini_f_req_structured"
+
+            prompts = structured_prompts
+
+            for prompt in prompts[:1]:
+                key = (cid, prompt, absolute_base + match.start())
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append({
+                    "conversation_id": cid,
+                    "message_id": "",
+                    "parent_message_id": "",
+                    "message_order": None,
+                    "role": "user",
+                    "message_content": prompt,
+                    "response_id": None,
+                    "choice_id": None,
+                    "recovery_basis": basis,
+                    "protocol": "f.req/batchexecute",
+                    "protocol_offset": absolute_base + match.start(),
+                })
+            if len(output) >= 32:
+                break
+        return output
+
+    @classmethod
+    def _protocol_messages_from_text(cls, text, absolute_base=0):
+        output = []
+        seen = set()
+        for extractor in (cls._wrb_messages_from_text, cls._f_req_messages_from_text):
+            for msg in extractor(text, absolute_base):
+                content = cls._normalize_message_content(msg.get("message_content"))
+                if not content:
+                    continue
+                msg = dict(msg)
+                msg["message_content"] = content
+                key = (
+                    msg.get("conversation_id"), msg.get("response_id"), msg.get("choice_id"),
+                    msg.get("role"), content, msg.get("protocol_offset")
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(msg)
+        return output
+
+    @classmethod
+    def _protocol_messages_from_bytes(cls, data, absolute_base=0):
+        """Decode protocol messages from raw bytes, including bounded gzip members when present."""
+        views = []
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            if any(marker in text for marker in ("wrb.fr", "f.req", "StreamGenerate", "batchexecute", "hNvQHb")):
+                views.append((text, absolute_base, "utf-8"))
+        except Exception:
+            pass
+        # Some Chrome/session records are UTF-16LE.
+        try:
+            text16 = data.decode("utf-16le", errors="ignore")
+            if any(marker in text16 for marker in ("wrb.fr", "f.req", "StreamGenerate", "batchexecute", "hNvQHb")):
+                views.append((text16, absolute_base, "utf-16le"))
+        except Exception:
+            pass
+
+        # Cache bodies can contain gzip-compressed HTTP payloads. Decode only a few bounded
+        # members per chunk and cap output to avoid decompression bombs.
+        pos = 0
+        members = 0
+        while members < 4:
+            pos = data.find(b"\x1f\x8b\x08", pos)
+            if pos < 0:
+                break
+            members += 1
+            try:
+                obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                raw = obj.decompress(data[pos:], MAX_PROTOCOL_TEXT)
+                if raw:
+                    decoded = raw.decode("utf-8", errors="ignore")
+                    if any(marker in decoded for marker in ("wrb.fr", "f.req", "StreamGenerate", "batchexecute", "hNvQHb")):
+                        views.append((decoded, absolute_base + pos, "gzip/utf-8"))
+            except (zlib.error, ValueError, OverflowError):
+                pass
+            pos += 3
+
+        output = []
+        seen = set()
+        for text, base, encoding in views:
+            for msg in cls._protocol_messages_from_text(text, base):
+                msg = dict(msg)
+                msg["protocol_encoding"] = encoding
+                key = (
+                    msg.get("conversation_id"), msg.get("response_id"), msg.get("choice_id"),
+                    msg.get("role"), msg.get("message_content"), msg.get("protocol_offset")
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                output.append(msg)
+                if len(output) >= 4096:
+                    return output
+        return output
+
+
+    @staticmethod
     def _context_hit(data, at, base, encoding):
         unit = 2 if encoding == "utf-16le" else 1
         needle_length = len("gemini.google.com") * unit
@@ -1185,11 +2503,22 @@ class GeminiParser:
         Encoded/compressed records are deliberately not interpreted as live
         values. Offsets always point to original bytes, including UTF-16 hits.
         """
+        service_worker = key == "service_worker"
         initial = path.stat()
         size = initial.st_size
-        hits, images, seen_hits, seen_images = [], [], set(), set()
-        truncated_hits = truncated_images = False
+        hits, images, protocol_messages, prompt_candidates = [], [], [], []
+        seen_hits, seen_images, seen_protocol, seen_prompts = set(), set(), set(), set()
+        truncated_hits = truncated_images = truncated_protocol = truncated_prompts = False
         consumed, tail = 0, b""
+        protocol_carry, protocol_carry_base = b"", 0
+        gzip_carry, gzip_carry_base = b"", 0
+
+
+        # Superset of the existing literal/protocol/aggressive-prompt anchors, in both
+        # encodings. This is a scheduling filter, never a new forensic detection rule.
+        sw_needles = tuple(marker.encode(enc) for enc in ("utf-8", "utf-16le")
+                           for marker in ("gemini.google.com", "wrb.fr", "hnvqhb", "f.req",
+                                          "streamgenerate", "batchexecute", "bardchatui"))
         budget = min(size, self.max_binary_bytes) if self.max_binary_bytes else size
         header = b""
         with path.open("rb") as stream:
@@ -1266,17 +2595,1134 @@ class GeminiParser:
                                                "size_method": "RIFF declared length; not full validation" if estimate else None,
                                                "detection_method": "magic_signature_only"})
                             at = data.find(signature, at + len(signature))
+
+                # Keep enumeration, inventory and literal search for every Service Worker
+                # file. Irrelevant chunks need no full text decode or protocol recovery;
+                # overlap and pending records preserve candidates crossing chunk boundaries.
+                if (service_worker and not protocol_carry and not gzip_carry
+                        and b"\x1f\x8b\x08" not in data
+                        and not any(needle in lowered for needle in sw_needles)):
+                    tail = data[-OVERLAP:]
+                    continue
+
+                # Decode structured Gemini request/response payloads independently of the
+                # domain-string hit path. A batchexecute JSON frame can be larger than the normal
+                # raw-search overlap, so preserve an incomplete marker-bearing line across chunks
+                # (bounded by MAX_PROTOCOL_TEXT) instead of silently losing long conversations.
+                if protocol_carry:
+                    protocol_data = protocol_carry + block
+                    protocol_base = protocol_carry_base
+                else:
+                    protocol_data = data
+                    protocol_base = base
+                protocol_carry, protocol_carry_base = b"", 0
+                pending_start = None
+                if not final and len(protocol_data) < MAX_PROTOCOL_TEXT:
+                    marker_positions = [
+                        pos for marker in (b"wrb.fr", b"hNvQHb", b"f.req", b"StreamGenerate", b"batchexecute")
+                        if (pos := protocol_data.find(marker)) >= 0
+                    ]
+                    if marker_positions:
+                        first_marker = min(marker_positions)
+                        line_start = max(protocol_data.rfind(b"\n", 0, first_marker),
+                                         protocol_data.rfind(b"\r", 0, first_marker)) + 1
+                        line_end_n = protocol_data.find(b"\n", first_marker)
+                        line_end_r = protocol_data.find(b"\r", first_marker)
+                        ends = [x for x in (line_end_n, line_end_r) if x >= 0]
+                        if not ends:
+                            candidate_carry = protocol_data[line_start:]
+                            if len(candidate_carry) < MAX_PROTOCOL_TEXT:
+                                protocol_carry = candidate_carry
+                                protocol_carry_base = protocol_base + line_start
+                                pending_start = line_start
+
+                # Defer only a single unfinished line. With a completed prefix, retain the
+                # full old context (f.req can use a Gemini anchor on a neighboring line).
+                # Keep gzip handling unchanged: a binary member is not a text line.
+                protocol_input = protocol_data
+                if service_worker and pending_start == 0 and b"\x1f\x8b\x08" not in protocol_data:
+                    protocol_input = b""
+                protocol_inputs = [(protocol_input, protocol_base)] if protocol_input else []
+                if (service_worker and len(protocol_data) >= MAX_PROTOCOL_TEXT
+                        and b"\x1f\x8b\x08" not in protocol_data):
+                    # A valid frame may precede a very long unterminated suffix. Preserve
+                    # recovery at the bound before the full line exceeds the decoder cap.
+                    protocol_inputs.insert(0, (protocol_data[:MAX_PROTOCOL_TEXT], protocol_base))
+                if gzip_carry:
+                    gzip_probe = gzip_carry + block
+                    protocol_inputs.append((gzip_probe, gzip_carry_base))
+                else:
+                    gzip_probe = data
+                    gzip_carry_base = base
+
+                for protocol_input, input_base in protocol_inputs:
+                    for message in self._protocol_messages_from_bytes(
+                            protocol_input, input_base):
+                        identity = (
+                            message.get("conversation_id"), message.get("response_id"), message.get("choice_id"),
+                            message.get("role"), message.get("message_content"), message.get("protocol_offset"),
+                        )
+                        if identity in seen_protocol:
+                            continue
+                        if len(protocol_messages) >= self.max_matches_per_file:
+                            truncated_protocol = True
+                            break
+                        seen_protocol.add(identity)
+                        protocol_messages.append(message)
+
+                # Aggressive prompt fallback: search the full chunk (not only the ±2 KiB
+                # gemini.google.com hit context) for explicitly labelled user text.  The helper
+                # requires a nearby Gemini-specific anchor and rejects Google Search pages.
+                # This recovers prompt strings that survive locally even when the private RPC
+                # container is truncated or no longer decodable.
+                aggressive_views = []
+                for enc in ("utf-8", "utf-16le"):
+                    try:
+                        decoded_view = data.decode(enc, errors="ignore")
+                    except Exception:
+                        continue
+                    low_view = decoded_view.casefold()
+                    if origin_scoped or any(marker in low_view for marker in (
+                        "gemini.google.com", "hnvQHb".casefold(), "streamgenerate", "bardchatui"
+                    )):
+                        aggressive_views.append((decoded_view, enc))
+                for decoded_view, enc in aggressive_views:
+                    for prompt in self._extract_aggressive_prompt_candidates_from_text(
+                            decoded_view, base, enc, origin_scoped):
+                        identity = (
+                            prompt.get("conversation_id"), prompt.get("role"),
+                            prompt.get("message_content"), prompt.get("protocol_offset"),
+                        )
+                        if identity in seen_prompts:
+                            continue
+                        if len(prompt_candidates) >= AGGRESSIVE_PROMPT_MAX_PER_FILE:
+                            truncated_prompts = True
+                            break
+                        seen_prompts.add(identity)
+                        prompt_candidates.append(prompt)
+
+                # A large gzip-compressed cache response can span raw scan chunks.  Preserve an
+                # incomplete gzip member from its header until zlib reports EOF, subject to the
+                # same bounded protocol size. This lets long compressed hNvQHb/stream responses
+                # be decoded without retaining entire cache files in memory.
+                gzip_carry, next_gzip_base = b"", 0
+                if not final and len(gzip_probe) < MAX_PROTOCOL_TEXT:
+                    search_at = 0
+                    while True:
+                        gz_at = gzip_probe.find(b"\x1f\x8b\x08", search_at)
+                        if gz_at < 0:
+                            break
+                        try:
+                            obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                            raw_probe = obj.decompress(gzip_probe[gz_at:], MAX_PROTOCOL_TEXT)
+                            incomplete = not obj.eof and len(raw_probe) < MAX_PROTOCOL_TEXT
+                        except (zlib.error, ValueError, OverflowError):
+                            incomplete = False
+                        if incomplete:
+                            candidate_gzip = gzip_probe[gz_at:]
+                            if len(candidate_gzip) < MAX_PROTOCOL_TEXT:
+                                gzip_carry = candidate_gzip
+                                next_gzip_base = gzip_carry_base + gz_at
+                                break
+                        search_at = gz_at + 3
+                gzip_carry_base = next_gzip_base
+
                 tail = data[-OVERLAP:]
         current = path.stat()
         changed = (size, initial.st_mtime_ns, initial.st_ctime_ns) != (
             current.st_size, current.st_mtime_ns, current.st_ctime_ns)
-        return {"hits": hits, "images": images, "bytes_read": consumed,
+        return {"hits": hits, "images": images, "protocol_messages": protocol_messages,
+                "prompt_candidates": prompt_candidates, "bytes_read": consumed,
                 "file_size_at_scan_start": size, "scan_limit_reached": consumed < size,
                 "string_result_limit_reached": truncated_hits, "image_result_limit_reached": truncated_images,
+                "protocol_result_limit_reached": truncated_protocol,
+                "prompt_result_limit_reached": truncated_prompts,
                 "file_changed_during_scan": changed, "header_hex": header.hex(),
                 "session_signature": "SNSS" if header[:4] == b"SNSS" else None,
                 "session_version_candidate": struct.unpack_from("<I", header, 4)[0]
                 if len(header) == 8 and header[:4] == b"SNSS" else None}
+
+    def _parse_browser_artifact(self, key):
+        """Run native Chromium decoding first, then preserve the v1.2 raw scanner as fallback/support."""
+        if self.deep_recovery:
+            self._parse_ccl_artifact(key)
+        self._parse_binary_artifact(key)
+
+    def _deep_recovery_status(self, key, observation, *, detail=None, status="partial", error=None):
+        payload = {
+            "record_type": "deep_recovery_status",
+            "decoder": "ccl_chromium_reader",
+            "expected_version": CCL_EXPECTED_VERSION,
+            "expected_commit": CCL_EXPECTED_COMMIT,
+            "native_structure_decoded": status in {"success", "partial"} and not error,
+            **(detail or {}),
+        }
+        return self._emit(key, observation, path=self._expected.get(key), detail=payload,
+                          level="unconfirmed", status=status, error=error)
+
+    @classmethod
+    def _structured_messages_from_json_value(cls, value, *, conversation_hint=None,
+                                             basis="ccl_structured_object", protocol="structured-json",
+                                             max_messages=2000):
+        """Recover only explicit message objects from decoded Gemini-owned JSON-like storage.
+
+        This is deliberately stricter than a string walk: role + text + an explicit/ancestor
+        conversation id are required.  It exists mainly for IndexedDB/Local Storage records whose
+        object model is already deserialized by CCL.
+        """
+        output, seen = [], set()
+        stack = [(value, conversation_hint, "", 0)]
+        visited = 0
+
+        def cid_from_dict(node, current):
+            for name in ("conversation_id", "conversationId", "conversation_uuid", "conversationUuid",
+                         "chat_id", "chatId"):
+                candidate = node.get(name)
+                cid = cls._conversation_protocol_id(candidate) if isinstance(candidate, str) else None
+                if cid:
+                    return cid
+            for name in ("url", "href", "conversation_url", "conversationUrl"):
+                candidate = node.get(name)
+                cid = cls._explicit_conversation_id_from_text(candidate) if isinstance(candidate, str) else None
+                if cid:
+                    return cid
+            return current
+
+        def text_from_content(content):
+            if isinstance(content, str):
+                return cls._normalize_message_content(content)
+            if isinstance(content, list):
+                parts = []
+                for item in content[:200]:
+                    if isinstance(item, str):
+                        cleaned = cls._normalize_message_content(item)
+                        if cleaned:
+                            parts.append(cleaned)
+                    elif isinstance(item, dict):
+                        for field in ("text", "content"):
+                            if isinstance(item.get(field), str):
+                                cleaned = cls._normalize_message_content(item[field])
+                                if cleaned:
+                                    parts.append(cleaned)
+                                    break
+                return "\n".join(parts) if parts else None
+            if isinstance(content, dict):
+                for field in ("text", "message", "value"):
+                    if isinstance(content.get(field), str):
+                        cleaned = cls._normalize_message_content(content[field])
+                        if cleaned:
+                            return cleaned
+                if isinstance(content.get("parts"), list):
+                    return text_from_content(content["parts"])
+            return None
+
+        while stack and visited < 25000 and len(output) < max_messages:
+            node, current_cid, current_title, depth = stack.pop()
+            visited += 1
+            if depth > 18:
+                continue
+            if isinstance(node, str):
+                stripped = node.strip()
+                if stripped[:1] in "[{" and len(stripped) <= MAX_PROTOCOL_TEXT:
+                    try:
+                        stack.append((json.loads(stripped), current_cid, current_title, depth + 1))
+                    except Exception:
+                        pass
+                continue
+            if isinstance(node, list):
+                for child in reversed(node[:1000]):
+                    stack.append((child, current_cid, current_title, depth + 1))
+                continue
+            if not isinstance(node, dict):
+                continue
+
+            cid = cid_from_dict(node, current_cid)
+            title = current_title
+            for title_key in ("conversation_title", "conversationTitle", "title", "name"):
+                if isinstance(node.get(title_key), str) and node.get(title_key).strip():
+                    title = cls._clean_title(node.get(title_key))
+                    break
+
+            role = node.get("role") or node.get("sender")
+            author = node.get("author")
+            if isinstance(author, dict):
+                role = role or author.get("role") or author.get("name")
+            elif isinstance(author, str):
+                role = role or author
+            role = str(role or "").strip().lower()
+            if role == "human":
+                role = "user"
+            elif role in {"model", "gemini"}:
+                role = "assistant"
+
+            content = None
+            for field in ("message_content", "message_text", "text", "content", "parts"):
+                if field in node:
+                    content = text_from_content(node.get(field))
+                    if content:
+                        break
+            if role in {"user", "assistant"} and content and cid:
+                message_id = node.get("message_id") or node.get("messageId") or node.get("message_uuid") or node.get("messageUuid") or node.get("id")
+                parent = node.get("parent_message_id") or node.get("parentMessageId") or node.get("parent_message_uuid") or node.get("parentMessageUuid") or node.get("parent_id")
+                message_time = node.get("created_at") or node.get("create_time") or node.get("timestamp") or node.get("time")
+                item = {
+                    "conversation_id": cid,
+                    "conversation_title": title,
+                    "message_id": str(message_id) if message_id not in (None, "") else "",
+                    "parent_message_id": str(parent) if parent not in (None, "") else "",
+                    "message_order": node.get("message_order") or node.get("index") or node.get("sequence"),
+                    "role": role,
+                    "message_content": content,
+                    "message_timestamp": message_time,
+                    "recovery_basis": basis,
+                    "protocol": protocol,
+                }
+                ident = (cid, item["message_id"], role, content)
+                if ident not in seen:
+                    seen.add(ident)
+                    output.append(item)
+
+            for child in reversed(list(node.values())):
+                if isinstance(child, (dict, list, str)):
+                    stack.append((child, cid, title, depth + 1))
+        return output
+
+    def _emit_deep_message(self, key, path, message, *, locator=None, extra=None):
+        basis = str(message.get("recovery_basis") or "ccl_native")
+        qualified = self._qualified_message_recovery_basis(basis)
+        detail = {
+            "record_type": "finding",
+            "conversation_id": message.get("conversation_id"),
+            "conversation_title": message.get("conversation_title") or "",
+            "message_id": message.get("message_id") or "",
+            "parent_message_id": message.get("parent_message_id") or "",
+            "message_order": message.get("message_order"),
+            "role": message.get("role") or "",
+            "message_content": message.get("message_content") or "",
+            "response_id": message.get("response_id"),
+            "choice_id": message.get("choice_id"),
+            "candidate_rank": message.get("candidate_rank"),
+            "message_timestamp": message.get("message_timestamp") or "",
+            "recovery_basis": basis,
+            "protocol": message.get("protocol") or "ccl-native",
+            "protocol_offset": message.get("protocol_offset"),
+            "protocol_sequence": message.get("protocol_sequence"),
+            "native_chromium_structure_decoded": True,
+            "message_semantics_verified": qualified,
+            "container_decoder": "ccl_chromium_reader",
+            "limitation": (
+                "Container/native structure was decoded, but this candidate did not pass the "
+                "allowlist for message semantics and is retained only as supporting evidence."
+                if not qualified else None
+            ),
+            **(extra or {}),
+        }
+        timestamp = normalize_team_kst_timestamp(message.get("message_timestamp"))
+        return self._emit(
+            key,
+            "Native Chromium Gemini message recovered" if qualified else
+            "Gemini message candidate preserved; message semantics not verified",
+            path=path, detail=detail, locator=locator or {}, timestamp=timestamp,
+            level="direct" if qualified else "support",
+            status="success" if qualified else "partial",
+        )
+
+    def _parse_ccl_artifact(self, key):
+        modules = _load_ccl_modules()
+        if modules is None:
+            self._deep_recovery_status(
+                key, "Native Chromium deep recovery unavailable; raw fallback will continue",
+                detail={"ccl_available": False, "fallback": "raw_scan"},
+                status="partial", error=_CCL_IMPORT_ERROR,
+            )
+            return 0
+        try:
+            if key == "cache":
+                return self._parse_ccl_cache(key, modules)
+            if key == "indexeddb":
+                return self._parse_ccl_indexeddb(key, modules)
+            if key == "local_storage":
+                return self._parse_ccl_local_storage(key, modules)
+            if key == "session_storage":
+                return self._parse_ccl_session_storage(key, modules)
+            if key == "service_worker":
+                return self._parse_ccl_service_worker(key, modules)
+            if key == "sessions":
+                return self._parse_ccl_sessions(key, modules)
+        except Exception as exc:
+            self._deep_recovery_status(
+                key, "Native Chromium deep recovery failed; raw fallback will continue",
+                detail={"ccl_available": True, "fallback": "raw_scan"},
+                status="partial", error=error_text(exc),
+            )
+        return 0
+
+    def _parse_ccl_cache(self, key, modules):
+        """Decode Chromium Cache entries and preserve per-key diagnostics.
+
+        v1.3.1 deliberately distinguishes: metadata present, body stream absent, body read
+        exception, empty body, decompression failure, non-text body, and decoded text with no
+        Gemini message.  This prevents `bodies_decoded=0` from hiding the actual failure mode.
+        """
+        directory = Path(self.artifacts[key])
+        cache_module = modules["cache"]
+        cache_type = cache_module.guess_cache_class(directory)
+        if cache_type is None:
+            self._deep_recovery_status(
+                key, "Chromium cache layout was not recognized by CCL",
+                detail={"ccl_available": True, "cache_layout": "unrecognized"}, status="partial")
+            return 0
+
+        cache = cache_type(directory)
+        entered = False
+        if hasattr(cache, "__enter__"):
+            cache.__enter__(); entered = True
+
+        keys_examined = gemini_keys = variants = bodies_decoded = messages_found = 0
+        metadata_read_errors = body_read_errors = location_read_errors = 0
+        body_stream_absent = empty_bodies = decode_errors = nontext_bodies = decoded_text_bodies = 0
+        api_like_keys = 0
+        diagnostic_rows = 0
+        try:
+            try:
+                keys = list(cache.keys())
+            except Exception as exc:
+                keys = []
+                self._deep_recovery_status(
+                    key, "Chromium Cache key enumeration failed; raw fallback will continue",
+                    detail={"ccl_available": True, "cache_layout": getattr(cache_type, "__name__", str(cache_type)),
+                            "key_enumeration_error": error_text(exc)},
+                    status="partial", error=error_text(exc))
+            keys_examined = len(keys)
+
+            for raw_key in keys:
+                key_text = _ccl_safe_str(raw_key)
+                gemini_url = _cache_key_gemini_url(key_text)
+                if not gemini_url:
+                    continue
+                gemini_keys += 1
+                endpoint_kind = _gemini_cache_endpoint_kind(gemini_url)
+                if endpoint_kind in {"batchexecute", "streamgenerate", "bardchatui", "conversation_page"}:
+                    api_like_keys += 1
+
+                stream_state = _ccl_cache_stream_state(cache, raw_key)
+                meta_error = body_error = meta_loc_error = body_loc_error = None
+                try:
+                    metas = list(cache.get_metadata(raw_key))
+                except Exception as exc:
+                    metas = []
+                    metadata_read_errors += 1
+                    meta_error = error_text(exc)
+                try:
+                    bodies = list(cache.get_cachefile(raw_key))
+                except Exception as exc:
+                    bodies = []
+                    body_read_errors += 1
+                    body_error = error_text(exc)
+                try:
+                    meta_locs = list(cache.get_location_for_metadata(raw_key))
+                except Exception as exc:
+                    meta_locs = []
+                    location_read_errors += 1
+                    meta_loc_error = error_text(exc)
+                try:
+                    body_locs = list(cache.get_location_for_cachefile(raw_key))
+                except Exception as exc:
+                    body_locs = []
+                    location_read_errors += 1
+                    body_loc_error = error_text(exc)
+
+                count = max(len(metas), len(bodies), len(meta_locs), len(body_locs), 1)
+                for variant in range(count):
+                    variants += 1
+                    meta = metas[variant] if variant < len(metas) else None
+                    body = bodies[variant] if variant < len(bodies) else None
+                    meta_loc = meta_locs[variant] if variant < len(meta_locs) else None
+                    body_loc = body_locs[variant] if variant < len(body_locs) else None
+                    content_type = _ccl_header_value(meta, "content-type") or ""
+                    content_encoding = _ccl_header_value(meta, "content-encoding") or ""
+                    content_length = _ccl_header_value(meta, "content-length") or ""
+                    response_time = _ccl_get_attr(meta, "response_time", default=None)
+                    request_time = _ccl_get_attr(meta, "request_time", default=None)
+
+                    diagnostic = {
+                        "record_type": "deep_recovery_diagnostic",
+                        "diagnostic_kind": "cache_entry",
+                        "decoder": "ccl_chromium_reader",
+                        "cache_layout": getattr(cache_type, "__name__", str(cache_type)),
+                        "cache_key_raw": key_text,
+                        "gemini_url": gemini_url,
+                        "endpoint_kind": endpoint_kind,
+                        "variant": variant,
+                        "metadata_present": meta is not None,
+                        "metadata_count": len(metas),
+                        "body_result_count": len(bodies),
+                        "body_present": body is not None,
+                        "body_length": len(body) if isinstance(body, (bytes, bytearray)) else None,
+                        "content_type": content_type,
+                        "content_encoding": content_encoding,
+                        "content_length_header": content_length,
+                        "metadata_location": _ccl_location_str(meta_loc),
+                        "body_location": _ccl_location_str(body_loc),
+                        "request_time": _ccl_safe_str(request_time),
+                        "response_time": _ccl_safe_str(response_time),
+                        "metadata_read_error": meta_error,
+                        "body_read_error": body_error,
+                        "metadata_location_error": meta_loc_error,
+                        "body_location_error": body_loc_error,
+                        **stream_state,
+                    }
+
+                    # CCL Blockfile stream 1 is the cached resource body.  Do not silently
+                    # turn an uninitialised stream into a successful zero-length decode.
+                    if body is None:
+                        body_stream_absent += 1
+                        diagnostic["body_state"] = "absent_or_uninitialized" if not body_error else "read_error"
+                        self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=directory,
+                                   detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                                   level="unconfirmed", status="partial" if body_error else "success",
+                                   error=body_error)
+                        diagnostic_rows += 1
+                        continue
+                    if not isinstance(body, (bytes, bytearray)):
+                        body_read_errors += 1
+                        diagnostic["body_state"] = "unexpected_non_bytes"
+                        diagnostic["body_python_type"] = type(body).__name__
+                        self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=directory,
+                                   detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                                   level="unconfirmed", status="partial",
+                                   error=f"unexpected cache body type: {type(body).__name__}")
+                        diagnostic_rows += 1
+                        continue
+                    if len(body) == 0:
+                        empty_bodies += 1
+                        diagnostic["body_state"] = "empty"
+                        self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=directory,
+                                   detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                                   level="unconfirmed", status="success")
+                        diagnostic_rows += 1
+                        continue
+
+                    decoded, applied, decode_error = _deep_decode_http_body(body, content_encoding)
+                    diagnostic["body_sha256"] = hashlib.sha256(bytes(body)).hexdigest()
+                    diagnostic["applied_decoders"] = applied
+                    if decoded is None:
+                        decode_errors += 1
+                        diagnostic["body_state"] = "decode_error"
+                        diagnostic["decode_error"] = decode_error
+                        self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=_ccl_location_path(body_loc, directory),
+                                   detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                                   level="unconfirmed", status="partial", error=decode_error)
+                        diagnostic_rows += 1
+                        continue
+
+                    bodies_decoded += 1
+                    diagnostic["decoded_body_length"] = len(decoded)
+                    diagnostic["decoded_body_sha256"] = hashlib.sha256(decoded).hexdigest()
+                    text, text_encoding = _deep_decode_text(decoded, content_type)
+                    diagnostic["text_encoding"] = text_encoding
+                    if text is None:
+                        nontext_bodies += 1
+                        diagnostic["body_state"] = "decoded_nontext"
+                        self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=_ccl_location_path(body_loc, directory),
+                                   detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                                   level="unconfirmed", status="success")
+                        diagnostic_rows += 1
+                        continue
+
+                    decoded_text_bodies += 1
+                    diagnostic["body_state"] = "decoded_text"
+                    diagnostic["text_length"] = len(text)
+                    low_text = text.casefold()
+                    diagnostic["protocol_markers"] = [m for m in ("wrb.fr", "hnvQHb", "streamgenerate", "f.req", "batchexecute")
+                                                        if m.casefold() in low_text]
+
+                    messages = []
+                    for msg in self._wrb_messages_from_text(text, 0):
+                        item = dict(msg)
+                        item["recovery_basis"] = "ccl_cache_" + str(item.get("recovery_basis") or "wrb")
+                        messages.append(item)
+                    for msg in self._f_req_messages_from_text(text, 0):
+                        item = dict(msg)
+                        item["recovery_basis"] = "ccl_cache_" + str(item.get("recovery_basis") or "f_req")
+                        messages.append(item)
+
+                    # Already-materialised JSON is common on some cache surfaces.
+                    if text.lstrip()[:1] in "[{":
+                        try:
+                            parsed = json.loads(text.lstrip())
+                        except Exception:
+                            parsed = None
+                        if parsed is not None:
+                            messages.extend(self._structured_messages_from_json_value(
+                                parsed, conversation_hint=conversation_id(gemini_url),
+                                basis="ccl_cache_structured_object", protocol="cache-json"))
+
+                    # Strongly Gemini-owned Cache bodies may still contain an explicitly labelled
+                    # prompt even when a private RPC wrapper is truncated.  Reuse the existing
+                    # conservative fallback only on API/conversation entries, never on static assets.
+                    if not messages and endpoint_kind in {"batchexecute", "streamgenerate", "bardchatui", "conversation_page"}:
+                        for candidate in self._extract_aggressive_prompt_candidates_from_text(
+                                text, 0, text_encoding or "utf-8", True):
+                            if candidate.get("role") == "user" and candidate.get("message_content"):
+                                item = dict(candidate)
+                                item["recovery_basis"] = "ccl_cache_aggressive_prompt"
+                                item.setdefault("protocol", "cache-text")
+                                messages.append(item)
+
+                    dedup = {}
+                    for msg in messages:
+                        ident = (msg.get("conversation_id"), msg.get("message_id"), msg.get("response_id"),
+                                 msg.get("choice_id"), msg.get("role"), msg.get("message_content"))
+                        dedup.setdefault(ident, msg)
+                    diagnostic["message_candidates"] = len(dedup)
+                    if diagnostic["protocol_markers"]:
+                        diagnostic["body_state"] = "decoded_protocol_text"
+
+                    self._emit(key, "Gemini Cache entry deep-recovery diagnostic", path=_ccl_location_path(body_loc, directory),
+                               detail=diagnostic, locator={"cache_key": gemini_url, "variant": variant},
+                               level="unconfirmed", status="success")
+                    diagnostic_rows += 1
+
+                    for msg in dedup.values():
+                        locator = {
+                            "cache_key": gemini_url,
+                            "variant": variant,
+                            "metadata_location": _ccl_location_str(meta_loc),
+                            "body_location": _ccl_location_str(body_loc),
+                        }
+                        body_source_path = _ccl_location_path(body_loc, directory)
+                        self._emit_deep_message(key, body_source_path, msg, locator=locator, extra={
+                            "cache_key": gemini_url,
+                            "cache_variant": variant,
+                            "endpoint_kind": endpoint_kind,
+                            "content_type": content_type,
+                            "content_encoding": content_encoding,
+                            "applied_decoders": applied,
+                            "text_encoding": text_encoding,
+                            "decoded_body_sha256": hashlib.sha256(decoded).hexdigest(),
+                            "body_sha256": hashlib.sha256(bytes(body)).hexdigest(),
+                        })
+                        messages_found += 1
+        finally:
+            if entered:
+                try:
+                    cache.__exit__(None, None, None)
+                except Exception:
+                    pass
+            elif hasattr(cache, "close"):
+                try:
+                    cache.close()
+                except Exception:
+                    pass
+
+        total_errors = metadata_read_errors + body_read_errors + location_read_errors + decode_errors
+        self._deep_recovery_status(
+            key, "Native Chromium Cache deep recovery completed",
+            detail={
+                "ccl_available": True,
+                "cache_layout": getattr(cache_type, "__name__", str(cache_type)),
+                "keys_examined": keys_examined,
+                "gemini_keys": gemini_keys,
+                "api_like_gemini_keys": api_like_keys,
+                "variants_examined": variants,
+                "body_stream_absent": body_stream_absent,
+                "empty_body_variants": empty_bodies,
+                "bodies_decoded": bodies_decoded,
+                "decoded_text_bodies": decoded_text_bodies,
+                "nontext_bodies": nontext_bodies,
+                "metadata_read_errors": metadata_read_errors,
+                "body_read_errors": body_read_errors,
+                "location_read_errors": location_read_errors,
+                "decode_errors": decode_errors,
+                "diagnostic_rows": diagnostic_rows,
+                "message_findings": messages_found,
+                "interpretation": (
+                    "Gemini cache keys were present but their response-body stream was absent/uninitialised."
+                    if gemini_keys and body_stream_absent == variants and not total_errors else
+                    "See deep_recovery_diagnostic cache_entry rows for per-key body state."
+                ),
+            },
+            status="success" if not total_errors else "partial")
+        return messages_found
+
+    @staticmethod
+    def _ccl_idb_key_text(key):
+        value = _ccl_get_attr(key, "value", default=None)
+        return _ccl_safe_str(value if value is not None else key)
+
+    def _parse_ccl_indexeddb(self, key, modules):
+        root = Path(self.artifacts[key])
+        idb_module = modules["indexeddb"]
+        all_directories = sorted(p for p in root.iterdir() if p.is_dir() and p.name.endswith(".leveldb"))
+        # Chromium IndexedDB directory names include the origin.  Do not attempt to open unrelated
+        # ChatGPT/Claude databases and then report their unsupported record types as a Gemini error.
+        directories = [p for p in all_directories if any(token in p.name.casefold() for token in
+                       ("gemini.google.com", "bard.google.com", "gemini", "bard"))]
+        ignored = [p.name for p in all_directories if p not in directories]
+        records_examined = gemini_records = messages_found = errors = 0
+        directory_errors = []
+
+        if not directories:
+            self._deep_recovery_status(
+                key, "No Gemini-owned Chromium IndexedDB directory was present",
+                detail={"ccl_available": True, "leveldb_directories": len(all_directories),
+                        "gemini_leveldb_directories": 0, "ignored_non_gemini_directories": ignored[:50],
+                        "records_examined": 0, "gemini_scoped_records": 0,
+                        "message_findings": 0, "decode_errors": 0},
+                status="success")
+            return 0
+
+        for leveldb_dir in directories:
+            blob_dir = leveldb_dir.with_name(leveldb_dir.name[:-8] + ".blob")
+            try:
+                try:
+                    wrapper = idb_module.WrappedIndexDB(leveldb_dir, blob_dir if blob_dir.exists() else None)
+                except TypeError:
+                    wrapper = idb_module.WrappedIndexDB(leveldb_dir)
+            except Exception as exc:
+                errors += 1
+                directory_errors.append({"directory": leveldb_dir.name, "stage": "open", "error": error_text(exc)})
+                continue
+            try:
+                try:
+                    database_ids = list(getattr(wrapper, "database_ids", []) or [])
+                except Exception as exc:
+                    errors += 1
+                    directory_errors.append({"directory": leveldb_dir.name, "stage": "database_ids", "error": error_text(exc)})
+                    continue
+                for database_id in database_ids:
+                    db_no = _ccl_get_attr(database_id, "dbid_no", "db_id", default=None)
+                    try:
+                        database = wrapper[db_no] if db_no is not None else wrapper[database_id]
+                    except Exception as exc:
+                        errors += 1
+                        directory_errors.append({"directory": leveldb_dir.name, "stage": "database_open",
+                                                 "database_id": _ccl_safe_str(database_id), "error": error_text(exc)})
+                        continue
+                    db_name = _ccl_safe_str(_ccl_get_attr(database, "name", "database_name", default=""))
+                    origin = _ccl_safe_str(_ccl_get_attr(database, "origin", "database_origin", default=""))
+                    origin_is_gemini = is_gemini_url(origin) or "gemini.google.com" in origin.casefold() or "bard.google.com" in origin.casefold()
+                    try:
+                        store_names = list(_ccl_get_attr(database, "object_store_names", default=[]) or [])
+                    except Exception as exc:
+                        errors += 1
+                        directory_errors.append({"directory": leveldb_dir.name, "stage": "object_store_names",
+                                                 "database": db_name, "error": error_text(exc)})
+                        continue
+                    for store_name in store_names:
+                        try:
+                            store = database.get_object_store_by_name(store_name) if hasattr(database, "get_object_store_by_name") else database[store_name]
+                            iterator = store.iterate_records(errors_to_stdout=False)
+                        except Exception as exc:
+                            errors += 1
+                            directory_errors.append({"directory": leveldb_dir.name, "stage": "store_open",
+                                                     "database": db_name, "store": _ccl_safe_str(store_name),
+                                                     "error": error_text(exc)})
+                            continue
+                        try:
+                            for record in iterator:
+                                records_examined += 1
+                                record_key = self._ccl_idb_key_text(_ccl_get_attr(record, "key", "user_key", default=None))
+                                value = _ccl_get_attr(record, "value", default=None)
+                                value_text = ""
+                                if isinstance(value, str):
+                                    value_text = value
+                                elif isinstance(value, bytes):
+                                    value_text, _ = _deep_decode_text(value, None)
+                                    value_text = value_text or ""
+                                elif isinstance(value, (dict, list)):
+                                    try:
+                                        value_text = json.dumps(value, ensure_ascii=False, default=str)
+                                    except Exception:
+                                        value_text = ""
+                                scoped = (origin_is_gemini or "gemini" in db_name.casefold() or
+                                          "bard" in db_name.casefold() or
+                                          "gemini.google.com" in value_text[:8192].casefold())
+                                if not scoped:
+                                    continue
+                                gemini_records += 1
+                                cid_hint = self._explicit_conversation_id_from_text(record_key + " " + value_text[:8192])
+                                messages = self._structured_messages_from_json_value(
+                                    value, conversation_hint=cid_hint,
+                                    basis="ccl_indexeddb_structured_object", protocol="indexeddb-object")
+                                if value_text:
+                                    for msg in self._wrb_messages_from_text(value_text, 0):
+                                        item = dict(msg); item["recovery_basis"] = "ccl_indexeddb_" + str(item.get("recovery_basis") or "wrb"); messages.append(item)
+                                    for msg in self._f_req_messages_from_text(value_text, 0):
+                                        item = dict(msg); item["recovery_basis"] = "ccl_indexeddb_" + str(item.get("recovery_basis") or "f_req"); messages.append(item)
+                                seen = set()
+                                for msg in messages:
+                                    ident = (msg.get("conversation_id"), msg.get("message_id"), msg.get("role"), msg.get("message_content"))
+                                    if ident in seen:
+                                        continue
+                                    seen.add(ident)
+                                    self._emit_deep_message(key, leveldb_dir, msg, locator={
+                                        "database": db_name, "object_store": _ccl_safe_str(store_name),
+                                        "key": record_key, "ldb_seq_no": _ccl_get_attr(record, "ldb_seq_no", default=None),
+                                        "record_location": _ccl_safe_str(_ccl_get_attr(record, "record_location", default="")),
+                                    }, extra={"indexeddb_origin": origin, "indexeddb_key": record_key,
+                                              "record_state": "live" if _ccl_get_attr(record, "is_live", default=None) is True else
+                                                              "historical_or_deleted" if _ccl_get_attr(record, "is_live", default=None) is False else "unknown"})
+                                    messages_found += 1
+                        except Exception as exc:
+                            errors += 1
+                            directory_errors.append({"directory": leveldb_dir.name, "stage": "record_iteration",
+                                                     "database": db_name, "store": _ccl_safe_str(store_name),
+                                                     "error": error_text(exc)})
+            finally:
+                if hasattr(wrapper, "close"):
+                    try:
+                        wrapper.close()
+                    except Exception:
+                        pass
+
+        self._deep_recovery_status(
+            key, "Native Chromium IndexedDB deep recovery completed",
+            detail={"ccl_available": True, "leveldb_directories": len(all_directories),
+                    "gemini_leveldb_directories": len(directories),
+                    "ignored_non_gemini_directories": ignored[:50],
+                    "records_examined": records_examined, "gemini_scoped_records": gemini_records,
+                    "message_findings": messages_found, "decode_errors": errors,
+                    "directory_errors": directory_errors[:20]},
+            status="success" if not errors else "partial")
+        return messages_found
+
+    def _parse_ccl_local_storage(self, key, modules):
+        directory = Path(self.artifacts[key])
+        module = modules["local_storage"]
+        store = module.LocalStoreDb(directory)
+        records_examined = gemini_records = logical_messages = errors = 0
+        try:
+            for storage_key in store.iter_storage_keys():
+                storage_text = _ccl_safe_str(storage_key)
+                if "gemini.google.com" not in storage_text.lower() and "bard.google.com" not in storage_text.lower():
+                    continue
+                try:
+                    records = store.iter_records_for_storage_key(storage_key)
+                    for record in records:
+                        records_examined += 1
+                        gemini_records += 1
+                        value = _ccl_get_attr(record, "value", default=None)
+                        if isinstance(value, bytes):
+                            text, _ = _deep_decode_text(value, None)
+                            text = text or ""
+                        else:
+                            text = _ccl_safe_str(value)
+                        script_key = _ccl_safe_str(_ccl_get_attr(record, "script_key", "key", default=""))
+                        cid_hint = self._explicit_conversation_id_from_text(script_key + " " + text[:8192])
+                        parsed = None
+                        if text.strip()[:1] in "[{":
+                            try:
+                                parsed = json.loads(text.strip())
+                            except Exception:
+                                parsed = None
+                        messages = self._structured_messages_from_json_value(
+                            parsed if parsed is not None else value, conversation_hint=cid_hint,
+                            basis="ccl_local_storage_structured_object", protocol="local-storage")
+                        for extractor, suffix in ((self._wrb_messages_from_text, "wrb"),
+                                                  (self._f_req_messages_from_text, "f_req")):
+                            for msg in extractor(text, 0):
+                                item = dict(msg)
+                                item["recovery_basis"] = "ccl_local_storage_" + str(item.get("recovery_basis") or suffix)
+                                messages.append(item)
+                        seen = set()
+                        for msg in messages:
+                            ident = (msg.get("conversation_id"), msg.get("message_id"), msg.get("role"), msg.get("message_content"))
+                            if ident in seen:
+                                continue
+                            seen.add(ident)
+                            origin_file = _ccl_safe_str(_ccl_get_attr(record, "file", "origin_file", default=""))
+                            source = directory / Path(origin_file).name if origin_file else directory
+                            self._emit_deep_message(key, source, msg, locator={
+                                "storage_key": storage_text, "script_key": script_key,
+                                "leveldb_seq_number": _ccl_get_attr(record, "leveldb_seq_number", "leveldb_sequence_number", "sequence_number", default=None),
+                            }, extra={"storage_key": storage_text, "script_key": script_key,
+                                      "persistent_source_class": "local_storage_logical"})
+                            logical_messages += 1
+                except Exception:
+                    errors += 1
+        finally:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+        stale = self._scan_ccl_raw_leveldb(
+            key, directory, modules, source_tag="local_storage_stale",
+            protocol_name="local-storage-leveldb")
+        messages_found = logical_messages + stale["message_findings"]
+        errors += stale["decode_errors"]
+        self._deep_recovery_status(
+            key, "Native Chromium Local Storage deep recovery completed",
+            detail={"ccl_available": True, "records_examined": records_examined,
+                    "gemini_scoped_records": gemini_records,
+                    "logical_message_findings": logical_messages,
+                    "stale_leveldb": stale, "message_findings": messages_found,
+                    "decode_errors": errors},
+            status="success" if not errors else "partial")
+        return messages_found
+
+    def _scan_ccl_raw_leveldb(self, key, directory, modules, *, source_tag, protocol_name):
+        """Inspect LevelDB physical records, including stale/deleted table entries.
+
+        Only records whose key/value explicitly contains a Gemini/Bard origin are treated as
+        Gemini-scoped.  This keeps stale-record recovery conservative and prevents generic f.req
+        strings from another web app being promoted as Gemini evidence.
+        """
+        directory = Path(directory)
+        stats = {
+            "directory": str(directory), "present": directory.is_dir(),
+            "records_examined": 0, "deleted_records": 0, "explicit_deleted_records": 0,
+            "compressed_records": 0, "gemini_scoped_records": 0,
+            "protocol_marker_records": 0, "message_findings": 0,
+            "deleted_message_findings": 0, "decode_errors": 0,
+            "stale_record_note": (
+                "RawLevelDb exposes physical .log/.ldb/.sst records, including obsolete versions. "
+                "deleted_records counts only explicit LevelDB tombstones; an older stale value may still have state=Live."
+            ),
+        }
+        if not directory.is_dir():
+            return stats
+        raw_module = modules.get("leveldb")
+        if raw_module is None:
+            stats["decode_errors"] = 1
+            stats["error"] = "CCL raw LevelDB module unavailable"
+            return stats
+        try:
+            with raw_module.RawLevelDb(directory) as raw_db:
+                for record in raw_db.iterate_records_raw():
+                    stats["records_examined"] += 1
+                    state = _ccl_safe_str(_ccl_get_attr(record, "state", default="unknown"))
+                    state_name = _ccl_safe_str(_ccl_get_attr(_ccl_get_attr(record, "state", default=None), "name", default=state))
+                    if state_name.casefold() == "deleted":
+                        stats["deleted_records"] += 1
+                        stats["explicit_deleted_records"] += 1
+                    if bool(_ccl_get_attr(record, "was_compressed", default=False)):
+                        stats["compressed_records"] += 1
+
+                    user_key = _ccl_get_attr(record, "user_key", "key", default=b"")
+                    value = _ccl_get_attr(record, "value", default=b"")
+                    key_bytes = bytes(user_key) if isinstance(user_key, (bytes, bytearray)) else _ccl_safe_str(user_key).encode("utf-8", "ignore")
+                    value_bytes = bytes(value) if isinstance(value, (bytes, bytearray)) else _ccl_safe_str(value).encode("utf-8", "ignore")
+                    raw = key_bytes + b"\n" + value_bytes
+                    low = raw.lower()
+                    domain_ascii = b"gemini.google.com" in low or b"bard.google.com" in low
+                    domain_utf16 = ("gemini.google.com".encode("utf-16le") in low
+                                    or "bard.google.com".encode("utf-16le") in low)
+
+                    key_text, _ = _deep_decode_text(key_bytes, None)
+                    if key_text is None:
+                        key_text = _ccl_safe_str(user_key)
+                    value_text, _ = _deep_decode_text(value_bytes, None)
+                    value_text = value_text or ""
+                    low_text = (key_text + "\n" + value_text).casefold()
+                    protocol_marker = any(
+                        marker in low_text
+                        for marker in ("wrb.fr", "hnvqhb", "streamgenerate", "f.req", "batchexecute")
+                    )
+                    if protocol_marker:
+                        stats["protocol_marker_records"] += 1
+                    if domain_ascii or domain_utf16:
+                        stats["gemini_scoped_records"] += 1
+                    # Generic structured-object recovery requires an explicit Gemini/Bard origin.
+                    # Protocol decoders may additionally inspect a record without an origin string,
+                    # because Session Storage physical records can separate origin metadata from values;
+                    # the protocol decoders themselves remain Gemini-specific and reject unrelated traffic.
+                    if not (domain_ascii or domain_utf16 or protocol_marker):
+                        continue
+
+                    cid_hint = self._explicit_conversation_id_from_text(key_text + " " + value_text[:8192])
+                    parsed = None
+                    if value_text.strip()[:1] in "[{":
+                        try:
+                            parsed = json.loads(value_text.strip())
+                        except Exception:
+                            parsed = None
+                    messages = []
+                    if domain_ascii or domain_utf16:
+                        messages.extend(self._structured_messages_from_json_value(
+                            parsed if parsed is not None else value,
+                            conversation_hint=cid_hint,
+                            basis=f"ccl_{source_tag}_structured_object",
+                            protocol=protocol_name))
+                    if protocol_marker:
+                        for extractor, suffix in ((self._wrb_messages_from_text, "wrb"),
+                                                  (self._f_req_messages_from_text, "f_req")):
+                            for msg in extractor(value_text, 0):
+                                item = dict(msg)
+                                item["recovery_basis"] = f"ccl_{source_tag}_" + str(item.get("recovery_basis") or suffix)
+                                messages.append(item)
+                    seen = set()
+                    for msg in messages:
+                        ident = (msg.get("conversation_id"), msg.get("message_id"), msg.get("role"), msg.get("message_content"))
+                        if ident in seen:
+                            continue
+                        seen.add(ident)
+                        origin_file = _ccl_safe_str(_ccl_get_attr(record, "origin_file", default=""))
+                        source = directory / Path(origin_file).name if origin_file else directory
+                        self._emit_deep_message(
+                            key, source, msg,
+                            locator={"raw_leveldb": True,
+                                     "sequence": _ccl_get_attr(record, "seq", default=None),
+                                     "state": state_name,
+                                     "origin_file": origin_file,
+                                     "offset": _ccl_get_attr(record, "offset", default=None)},
+                            extra={"record_state": state_name,
+                                   "was_compressed": bool(_ccl_get_attr(record, "was_compressed", default=False)),
+                                   "persistent_source_class": source_tag})
+                        stats["message_findings"] += 1
+                        if state_name.casefold() == "deleted":
+                            stats["deleted_message_findings"] += 1
+        except Exception as exc:
+            stats["decode_errors"] += 1
+            stats["error"] = error_text(exc)
+        return stats
+
+    def _parse_ccl_session_storage(self, key, modules):
+        directory = Path(self.artifacts[key])
+        module = modules["session_storage"]
+        records_examined = gemini_records = logical_messages = errors = 0
+        store = module.SessionStoreDb(directory)
+        try:
+            for host in store.iter_hosts():
+                host_text = _ccl_safe_str(host)
+                if "gemini.google.com" not in host_text.lower() and "bard.google.com" not in host_text.lower():
+                    continue
+                try:
+                    for record in store.iter_records_for_host(host):
+                        records_examined += 1
+                        gemini_records += 1
+                        record_key = _ccl_safe_str(_ccl_get_attr(record, "key", default=""))
+                        value = _ccl_get_attr(record, "value", default=None)
+                        if isinstance(value, bytes):
+                            text, _ = _deep_decode_text(value, None)
+                            text = text or ""
+                        else:
+                            text = _ccl_safe_str(value)
+                        cid_hint = self._explicit_conversation_id_from_text(host_text + " " + record_key + " " + text[:8192])
+                        parsed = None
+                        if text.strip()[:1] in "[{":
+                            try:
+                                parsed = json.loads(text.strip())
+                            except Exception:
+                                parsed = None
+                        messages = self._structured_messages_from_json_value(
+                            parsed if parsed is not None else value, conversation_hint=cid_hint,
+                            basis="ccl_session_storage_structured_object", protocol="session-storage")
+                        for extractor, suffix in ((self._wrb_messages_from_text, "wrb"),
+                                                  (self._f_req_messages_from_text, "f_req")):
+                            for msg in extractor(text, 0):
+                                item = dict(msg)
+                                item["recovery_basis"] = "ccl_session_storage_" + str(item.get("recovery_basis") or suffix)
+                                messages.append(item)
+                        seen = set()
+                        for msg in messages:
+                            ident = (msg.get("conversation_id"), msg.get("message_id"), msg.get("role"), msg.get("message_content"))
+                            if ident in seen:
+                                continue
+                            seen.add(ident)
+                            self._emit_deep_message(
+                                key, directory, msg,
+                                locator={"host": host_text, "key": record_key,
+                                         "leveldb_sequence_number": _ccl_get_attr(record, "leveldb_sequence_number", default=None)},
+                                extra={"session_storage_host": host_text, "session_storage_key": record_key,
+                                       "persistent_source_class": "session_storage_logical"})
+                            logical_messages += 1
+                except Exception:
+                    errors += 1
+        finally:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+        stale = self._scan_ccl_raw_leveldb(
+            key, directory, modules, source_tag="session_storage_stale",
+            protocol_name="session-storage-leveldb")
+        messages_found = logical_messages + stale["message_findings"]
+        errors += stale["decode_errors"]
+        self._deep_recovery_status(
+            key, "Native Chromium Session Storage deep recovery completed",
+            detail={"ccl_available": True, "records_examined": records_examined,
+                    "gemini_scoped_records": gemini_records,
+                    "logical_message_findings": logical_messages,
+                    "stale_leveldb": stale, "message_findings": messages_found,
+                    "decode_errors": errors},
+            status="success" if not errors else "partial")
+        return messages_found
+
+    def _parse_ccl_service_worker(self, key, modules):
+        root = Path(self.artifacts[key])
+        database = root / "Database"
+        cache_storage = root / "CacheStorage"
+        script_cache = root / "ScriptCache"
+        stale = self._scan_ccl_raw_leveldb(
+            key, database, modules, source_tag="service_worker_stale",
+            protocol_name="service-worker-database") if database.is_dir() else {
+                "directory": str(database), "present": False, "records_examined": 0,
+                "deleted_records": 0, "explicit_deleted_records": 0,
+                "compressed_records": 0, "gemini_scoped_records": 0,
+                "protocol_marker_records": 0, "message_findings": 0,
+                "deleted_message_findings": 0, "decode_errors": 0,
+                "stale_record_note": "Service Worker Database directory was not present.",
+            }
+        errors = int(stale.get("decode_errors") or 0)
+        self._deep_recovery_status(
+            key, "Chromium Service Worker persistent-storage inspection completed",
+            detail={"ccl_available": True,
+                    "database_present": database.is_dir(),
+                    "cache_storage_present": cache_storage.is_dir(),
+                    "script_cache_present": script_cache.is_dir(),
+                    "cache_storage_analysis": "raw_scan_fallback" if cache_storage.is_dir() else "not_present",
+                    "script_cache_analysis": "raw_scan_fallback" if script_cache.is_dir() else "not_present",
+                    "database_leveldb": stale,
+                    "message_findings": int(stale.get("message_findings") or 0),
+                    "decode_errors": errors,
+                    "limitation": "Service Worker script/cache presence is supporting storage evidence; it is not a conversation body unless an explicit structured Gemini message is decoded."},
+            status="success" if not errors else "partial")
+        return int(stale.get("message_findings") or 0)
+
+    def _parse_ccl_sessions(self, key, modules):
+        snss_module = modules["snss"]
+        paths = [Path(p) for p in self.artifacts[key]]
+        navigation_records = gemini_navigation = errors = 0
+        for path in paths:
+            file_type = snss_module.SnssFileType.Session if path.name.startswith("Session_") else snss_module.SnssFileType.Tab
+            try:
+                with path.open("rb") as stream:
+                    snss = snss_module.SnssFile(file_type, stream)
+                    ordinal = 0
+                    for command in snss.iter_session_commands():
+                        ordinal += 1
+                        if not isinstance(command, snss_module.NavigationEntry):
+                            continue
+                        navigation_records += 1
+                        url = _ccl_safe_str(_ccl_get_attr(command, "url", default=""))
+                        original = _ccl_safe_str(_ccl_get_attr(command, "original_request_url", default=""))
+                        if not is_gemini_url(url) and not is_gemini_url(original):
+                            continue
+                        gemini_navigation += 1
+                        chosen = url if is_gemini_url(url) else original
+                        self._emit(key, "Native SNSS Gemini navigation entry decoded", path=path,
+                                   detail={"record_type": "finding", "url": chosen,
+                                           "conversation_id": conversation_id(chosen),
+                                           "title": _ccl_safe_str(_ccl_get_attr(command, "title", default="")),
+                                           "navigation_index": _ccl_get_attr(command, "index", default=None),
+                                           "recovery_basis": "ccl_snss_navigation",
+                                           "native_chromium_structure_decoded": True,
+                                           "container_decoder": "ccl_chromium_reader",
+                                           "limitation": "SNSS NavigationEntry is navigation evidence, not message-body evidence."},
+                                   locator={"file": path.name, "ordinal": ordinal}, level="support", status="success")
+            except Exception:
+                errors += 1
+        self._deep_recovery_status(key, "Native Chromium Sessions deep recovery completed",
+                                   detail={"ccl_available": True, "files_examined": len(paths),
+                                           "navigation_records": navigation_records,
+                                           "gemini_navigation_records": gemini_navigation,
+                                           "message_findings": 0, "decode_errors": errors},
+                                   status="success" if not errors else "partial")
+        return 0
 
     def _parse_binary_artifact(self, key):
         start = len(self.results)
@@ -1288,13 +3734,15 @@ class GeminiParser:
             root = Path(artifact)
             paths = self._walk_files(root, key)
         file_count, files_read, findings = 0, 0, 0
+        bytes_read_total = string_match_total = protocol_message_total = prompt_candidate_total = image_signature_total = 0
+        files_with_gemini_context = files_with_protocol = files_with_prompt_candidates = 0
+        scan_limited_files = result_limited_files = changed_files = 0
+        scan_started = time.perf_counter()
         for path in paths:
             if key == "sessions" and self.max_files and file_count >= self.max_files:
                 self._issue(key, root, f"Configured file limit ({self.max_files}) reached", status="partial")
                 break
             file_count += 1
-            if file_count % 100 == 0:
-                self._say(f"[.] {self.ARTIFACTS[key]}: scanned {file_count} files")
             try:
                 relative = str(path.relative_to(root)).replace("\\", "/")
                 origin = key == "indexeddb" and bool(re.search(
@@ -1303,14 +3751,31 @@ class GeminiParser:
                 scan = self._scan_binary_file(path, key, origin)
                 files_read += 1
                 hits, images = scan.pop("hits"), scan.pop("images")
-                gemini_associated = bool(hits) or origin
+                protocol_messages = scan.pop("protocol_messages", [])
+                prompt_candidates = scan.pop("prompt_candidates", [])
+                gemini_associated = bool(hits) or origin or bool(protocol_messages) or bool(prompt_candidates)
+                bytes_read_total += int(scan.get("bytes_read") or 0)
+                string_match_total += len(hits)
+                protocol_message_total += len(protocol_messages)
+                prompt_candidate_total += len(prompt_candidates)
+                image_signature_total += len(images)
+                files_with_gemini_context += int(gemini_associated)
+                files_with_protocol += int(bool(protocol_messages))
+                files_with_prompt_candidates += int(bool(prompt_candidates))
+                scan_limited_files += int(bool(scan.get("scan_limit_reached")))
+                result_limited_files += int(any(bool(scan.get(name)) for name in (
+                    "string_result_limit_reached", "image_result_limit_reached",
+                    "protocol_result_limit_reached", "prompt_result_limit_reached")))
+                changed_files += int(bool(scan.get("file_changed_during_scan")))
                 inventory = {"record_type": "inventory", **metadata, **scan,
                              "origin_namespace_matches_gemini": origin, "string_match_count": len(hits),
+                             "structured_protocol_message_count": len(protocol_messages),
+                             "aggressive_prompt_candidate_count": len(prompt_candidates),
                              "scan_status": "success" if gemini_associated else "no_relevant_trace",
                              "image_signature_count": len(images), "gemini_related_strings_found": bool(hits),
                              "image_signatures": images if not gemini_associated else [],
                              "image_signatures_gemini_association": "same_file_raw_context_only" if gemini_associated else "not_established",
-                             "limitations": ["Native format, compression, live/deleted state and record timestamps are not decoded.",
+                             "limitations": ["This record is from the raw fallback scanner; native CCL decoding is reported separately when available.",
                                              "File modification time is not a conversation or download timestamp."]}
                 self._emit(key, "Artifact file examined by raw byte search", path=path, detail=inventory,
                            level="unconfirmed", status="partial",
@@ -1323,6 +3788,132 @@ class GeminiParser:
                                locator={"offset": hit["offset"], "encoding": hit["encoding"], "context_offset": hit["context_offset"]},
                                action="conversation_candidate" if hit["conversation_ids"] else None, status="partial")
                     findings += 1
+
+                for prompt in prompt_candidates:
+                    detail = {
+                        "record_type": "finding",
+                        "conversation_id": prompt.get("conversation_id") or None,
+                        "message_id": "",
+                        "parent_message_id": "",
+                        "message_order": None,
+                        "role": "user",
+                        "prompt_text": prompt.get("message_content") or "",
+                        "recovery_basis": "aggressive_raw_prompt",
+                        "protocol": prompt.get("protocol") or "raw-labelled-fallback",
+                        "protocol_encoding": prompt.get("protocol_encoding"),
+                        "protocol_offset": prompt.get("protocol_offset"),
+                        "prompt_field": prompt.get("prompt_field"),
+                        "offset_is_approximate": bool(prompt.get("offset_is_approximate")),
+                        "filename": path.name,
+                        "origin_namespace_matches_gemini": origin,
+                        "limitation": (
+                            "Prompt text was recovered from an explicitly labelled user-text field in a bounded "
+                            "Gemini-scoped raw browser context. Native Gemini RPC decoding was unavailable; Google "
+                            "Search and unrelated service contexts are explicitly excluded, but this fallback remains "
+                            "weaker than a decoded hNvQHb/wrb.fr/StreamGenerate record."
+                        ),
+                    }
+                    locator = {
+                        "offset": prompt.get("protocol_offset"),
+                        "encoding": prompt.get("protocol_encoding"),
+                        "recovery": "aggressive_raw_prompt",
+                        "conversation_id": prompt.get("conversation_id"),
+                    }
+                    locator = {k: v for k, v in locator.items() if v not in (None, "")}
+                    self._emit(
+                        key, "Gemini-scoped raw user prompt recovered", path=path, detail=detail,
+                        locator=locator, action=None, level="support", status="partial"
+                    )
+                    findings += 1
+
+                for message in protocol_messages:
+                    detail = {
+                        "record_type": "finding",
+                        "conversation_id": message.get("conversation_id"),
+                        "message_id": message.get("message_id") or "",
+                        "parent_message_id": message.get("parent_message_id") or "",
+                        "message_order": message.get("message_order"),
+                        "role": message.get("role") or "",
+                        "message_content": message.get("message_content") or "",
+                        "response_id": message.get("response_id"),
+                        "choice_id": message.get("choice_id"),
+                        "recovery_basis": message.get("recovery_basis"),
+                        "protocol": message.get("protocol"),
+                        "protocol_encoding": message.get("protocol_encoding"),
+                        "protocol_offset": message.get("protocol_offset"),
+                        "protocol_sequence": message.get("protocol_sequence"),
+                        "candidate_rank": message.get("candidate_rank"),
+                        "attachments": safe_value(message.get("attachments") or []),
+                        "attachment_count": len(message.get("attachments") or []),
+                        "message_timestamp": message.get("message_timestamp") or "",
+                        "filename": path.name,
+                        "origin_namespace_matches_gemini": origin,
+                        "limitation": (
+                            "Message text was decoded from a Gemini web request/response payload found in raw browser artifact bytes. "
+                            "The surrounding Chrome cache/session container itself is not natively decoded, so record timestamp/deletion state may remain unavailable."
+                        ),
+                    }
+                    role = str(detail.get("role") or "").lower()
+                    # The protocol record itself is evidence.  Semantic user-action promotion is
+                    # done once in _derive_semantic_actions(), avoiding duplicate Timeline rows.
+                    action = None
+                    message_timestamp = normalize_team_kst_timestamp(message.get("message_timestamp"))
+                    locator = {
+                        "offset": message.get("protocol_offset"),
+                        "encoding": message.get("protocol_encoding"),
+                        "protocol": message.get("protocol"),
+                        "conversation_id": message.get("conversation_id"),
+                        "response_id": message.get("response_id"),
+                        "choice_id": message.get("choice_id"),
+                        "protocol_sequence": message.get("protocol_sequence"),
+                    }
+                    locator = {k: v for k, v in locator.items() if v not in (None, "")}
+                    self._emit(
+                        key, "Structured Gemini message payload recovered", path=path, detail=detail,
+                        locator=locator, timestamp=message_timestamp, action=action, level="support", status="partial"
+                    )
+                    findings += 1
+
+                    # READ_CHAT attachment metadata is stronger than a raw filename/keyword hit,
+                    # but the surrounding Chrome container is still not natively decoded.  Emit
+                    # a conservative upload candidate so the analyst can see the structured link
+                    # between a Gemini turn and the attached file without claiming upload success.
+                    if role in {"user", "human"}:
+                        for attachment in message.get("attachments") or []:
+                            filename = str((attachment or {}).get("filename") or "").strip()
+                            if not filename:
+                                continue
+                            if IMAGE_FILE_RE.search(filename):
+                                upload_action = "image_upload_candidate"
+                            elif DOCUMENT_FILE_RE.search(filename):
+                                upload_action = "document_upload_candidate"
+                            else:
+                                continue
+                            upload_detail = {
+                                "record_type": "finding",
+                                "filename": filename,
+                                "media_kind": (attachment or {}).get("media_kind"),
+                                "mime_type": (attachment or {}).get("mime_type"),
+                                "conversation_id": message.get("conversation_id"),
+                                "response_id": message.get("response_id"),
+                                "associated_prompt": message.get("message_content") or "",
+                                "recovery_basis": "history_rpc_attachment_metadata",
+                                "protocol": message.get("protocol"),
+                                "protocol_offset": message.get("protocol_offset"),
+                                "structured_attachment_metadata": True,
+                                "limitation": (
+                                    "Attachment metadata was recovered from a structured Gemini conversation-history payload. "
+                                    "The local Chrome container is not natively decoded, so this is exported as an upload candidate rather than proof of a completed network upload."
+                                ),
+                            }
+                            self._emit(
+                                key, "Structured Gemini conversation attachment metadata recovered",
+                                path=path, detail=upload_detail, locator=locator,
+                                timestamp=message_timestamp,
+                                action=upload_action, level="support", status="partial"
+                            )
+                            findings += 1
+
                 if key == "cache" and gemini_associated:
                     for candidate in images:
                         self._emit(key, "Image signature found in a file containing Gemini-related raw context",
@@ -1335,14 +3926,29 @@ class GeminiParser:
                         findings += 1
             except (OSError, ValueError, struct.error) as exc:
                 self._issue(key, path, error_text(exc))
+            if file_count % 100 == 0:
+                self._say(f"[.] {self.ARTIFACTS[key]}: processed {file_count} files")
         read_errors = sum(r["status"] == "parse_error" for r in self.results[start:])
         scan_status = ("parse_error" if read_errors and not files_read else
                        "partial" if read_errors else "success" if findings else "no_relevant_trace")
+        elapsed = round(time.perf_counter() - scan_started, 3)
         self._emit(key, "Raw artifact scan completed", path=root,
                    status="parse_error" if read_errors and not files_read else "partial", level="unconfirmed",
                    detail={"record_type": "scan_summary", "files_examined": file_count,
                            "files_read": files_read, "read_error_count": read_errors,
                            "finding_count": findings, "scan_status": scan_status,
+                           "bytes_read": bytes_read_total,
+                           "string_match_count": string_match_total,
+                           "structured_protocol_message_count": protocol_message_total,
+                           "aggressive_prompt_candidate_count": prompt_candidate_total,
+                           "image_signature_count": image_signature_total,
+                           "files_with_gemini_context": files_with_gemini_context,
+                           "files_with_structured_protocol": files_with_protocol,
+                           "files_with_aggressive_prompt_candidates": files_with_prompt_candidates,
+                           "scan_limit_reached_files": scan_limited_files,
+                           "result_limit_reached_files": result_limited_files,
+                           "files_changed_during_scan": changed_files,
+                           "elapsed_sec": elapsed,
                            "native_structure_decoded": False,
                            "max_binary_bytes_per_file": self.max_binary_bytes or None,
                            "max_matches_per_file": self.max_matches_per_file})
@@ -1763,15 +4369,14 @@ class GeminiParser:
             return True
         if isinstance(basis, str) and basis in {"gemini_url", "google_account_url_with_gemini_reference"}:
             return True
-        if isinstance(basis, list) and any(isinstance(x, dict) and
-                                           (is_gemini_url(x.get("url")) or x.get("type") == "temporal_proximity_only")
+        if isinstance(basis, list) and any(isinstance(x, dict) and is_gemini_url(x.get("url"))
                                            for x in basis):
             return True
         if detail.get("relevance_scope") in {"gemini", "gemini_host"}:
             return True
         if detail.get("matched_string") or detail.get("origin_namespace_matches_gemini"):
             return True
-        if detail.get("gemini_attribution") in {"url_associated_candidate", "temporal_candidate", "linked_download_candidate"}:
+        if detail.get("gemini_attribution") in {"url_associated_candidate", "linked_download_candidate"}:
             return True
         action = row.get("action_candidate")
         if action == "file_delete_candidate":
@@ -2106,21 +4711,31 @@ class GeminiParser:
                     if not pattern.search(text):
                         continue
                     filename_for_rule = self._extract_filename(text)
-                    # Generic UI/static strings are common in raw browser artifacts.  Require
-                    # an event-scoped anchor before promoting them to a Timeline candidate.
+                    # Raw/static UI labels are common in browser state and scripts.  Even when
+                    # a conversation/file anchor is nearby they do not prove that the action ran.
+                    # Preserve them as supporting candidates only; a future native event decoder
+                    # may emit the non-candidate action when event-specific structure is present.
                     if action in {"conversation_delete", "conversation_edit", "conversation_retry", "temporary_chat"} and not cid:
                         continue
                     if action == "attachment_remove" and not (cid or filename_for_rule):
                         continue
                     if action == "image_generation" and not cid:
                         continue
-                    derived_action = "image_generation_candidate" if action == "image_generation" else action
+                    candidate_map = {
+                        "conversation_delete": "conversation_delete_candidate",
+                        "conversation_edit": "conversation_edit_candidate",
+                        "conversation_retry": "conversation_retry_candidate",
+                        "temporary_chat": "temporary_chat_candidate",
+                        "attachment_remove": "attachment_remove_candidate",
+                        "image_generation": "image_generation_candidate",
+                    }
+                    derived_action = candidate_map.get(action, action + "_candidate")
                     add(self._copy_as_derived(source, derived_action,
                         "GEM-SEM-" + derived_action.upper().replace("_", "-") + "-001",
-                        "Explicit Gemini-scoped semantic marker observed with an event-scoped anchor",
+                        "Gemini-scoped semantic/UI marker preserved as supporting finding",
                         detail_extra={"conversation_id": cid, "filename": filename_for_rule,
-                        "semantic_marker": pattern.pattern,
-                        "limitation": "A Gemini-scoped marker plus conversation/file anchor is present; event-specific native decoding remains stronger evidence."},
+                        "semantic_marker": pattern.pattern, "supporting_finding": True,
+                        "limitation": "A nearby Gemini conversation/file anchor plus a semantic/UI label does not prove that the user executed the action."},
                         level="support", status="partial"))
 
                 # Upload preparation / attachment trace with recoverable filename.
@@ -2144,10 +4759,11 @@ class GeminiParser:
                             continue
                         prompt = self._normalize_recovered_text(candidate.get("text"))
                         if prompt:
-                            add(self._copy_as_derived(source, "prompt_send", "GEM-PROMPT-SEND-001",
-                                "User prompt text and explicit send marker observed in one bounded Gemini context",
+                            add(self._copy_as_derived(source, "prompt_send_candidate", "GEM-PROMPT-SEND-001",
+                                "Prompt text and send-like label co-occur in bounded Gemini raw context",
                                 detail_extra={"prompt_text": prompt, "conversation_id": cid,
-                                "limitation": "Raw context associates text with a send marker; native Gemini message decoding is still unavailable."},
+                                "supporting_finding": True,
+                                "limitation": "Raw co-occurrence does not establish a submitted Gemini message; native/structured message semantics are required for Timeline or Conversation promotion."},
                                 level="support", status="partial"))
 
                 # Model selection/change trace.
@@ -2158,23 +4774,33 @@ class GeminiParser:
                         if model and model.casefold() not in {m.casefold() for m in models}:
                             models.append(model)
                     if models:
-                        add(self._copy_as_derived(source, "model_change", "GEM-MODEL-001",
-                            "Explicit Gemini model selection/change trace observed",
+                        add(self._copy_as_derived(source, "model_change_candidate", "GEM-MODEL-001",
+                            "Gemini model selection/change marker preserved as supporting finding",
                             detail_extra={"previous_model": models[-2] if len(models) >= 2 else None,
                                           "new_model": models[-1], "conversation_id": cid,
-                                          "limitation": "If only one model value is recovered, the previous model is unknown."},
+                                          "supporting_finding": True,
+                                          "limitation": "Raw/state model labels do not prove an executed model change; event-specific structure is required for Timeline promotion."},
                             level="support", status="partial"))
 
             # Structured message -> prompt send / recovered conversation.
             structured = self._structured_message_from_row(source)
             if structured and str(structured.get("role") or "").lower() in {"user", "human"}:
-                add(self._copy_as_derived(source, "prompt_send", "GEM-PROMPT-SEND-STRUCT-001",
-                    "Structured user message recovered",
+                recovery_basis = str(structured.get("recovery_basis") or "")
+                aggressive = recovery_basis.startswith("aggressive_raw_prompt")
+                add(self._copy_as_derived(source, "prompt_send",
+                    "GEM-PROMPT-SEND-RAW-001" if aggressive else "GEM-PROMPT-SEND-STRUCT-001",
+                    "Gemini-scoped raw user prompt recovered" if aggressive else "Structured user message recovered",
                     detail_extra={"prompt_text": structured.get("content"),
                                   "conversation_id": structured.get("conversation_id"),
                                   "message_id": structured.get("message_id"),
-                                  "limitation": "Structured recovered user message is treated as a sent-message record."},
-                    level="direct", status="success"))
+                                  "recovery_basis": recovery_basis,
+                                  "limitation": (
+                                      "Prompt text is strongly Gemini-scoped but comes from a labelled raw fallback; transmission is likely but native RPC decoding was unavailable."
+                                      if aggressive else
+                                      "Structured recovered user message is treated as a sent-message record."
+                                  )},
+                    level="support" if aggressive else "direct",
+                    status="partial" if aggressive else "success"))
 
             # Semantic download classification.
             if source.get("action_candidate") == "file_download":
@@ -2392,12 +5018,16 @@ class GeminiParser:
             removed = before_ids - after_ids if after_ids else set()
             for cid in sorted(removed):
                 source = bstate[(profile, cid)][2]
-                derived = self._copy_as_derived(source, "conversation_delete", "GEM-CONV-DELETE-CMP-001",
-                    "Conversation ID present in baseline but absent after action window",
+                baseline_observed = self._display_timestamp(source)
+                derived = self._copy_as_derived(source, "conversation_delete_candidate", "GEM-CONV-DELETE-CMP-001",
+                    "Conversation ID present in baseline History but absent after comparison",
                     detail_extra={"conversation_id": cid, "comparison_mode": "before_after",
                                   "baseline_present": True, "after_present": False,
-                                  "limitation": "Absence after comparison supports deletion only when other conversations remain; deleted content is not recovered."},
+                                  "baseline_observed_time": baseline_observed,
+                                  "event_timestamp_known": False, "supporting_finding": True,
+                                  "limitation": "A History-state difference does not distinguish browser-history removal from server-side Gemini conversation deletion; no deletion time is inferred."},
                     level="support", status="partial")
+                derived["timestamp"] = normalize_timestamp(None)
                 additions.append(derived)
             common = before_ids & after_ids
             for cid in sorted(common):
@@ -2405,12 +5035,16 @@ class GeminiParser:
                 atitle = astate[(profile, cid)][1]
                 if btitle and atitle and btitle != atitle:
                     source = astate[(profile, cid)][2]
-                    additions.append(self._copy_as_derived(source, "conversation_edit", "GEM-CONV-EDIT-CMP-001",
-                        "Conversation title changed across baseline comparison",
+                    after_observed = self._display_timestamp(source)
+                    derived = self._copy_as_derived(source, "conversation_edit_candidate", "GEM-CONV-EDIT-CMP-001",
+                        "Conversation title differs across baseline History comparison",
                         detail_extra={"conversation_id": cid, "previous_title": btitle, "conversation_title": atitle,
-                                      "comparison_mode": "before_after",
-                                      "limitation": "Title change is consistent with conversation modification but does not identify the exact edited message."},
-                        level="support", status="partial"))
+                                      "comparison_mode": "before_after", "after_observed_time": after_observed,
+                                      "event_timestamp_known": False, "supporting_finding": True,
+                                      "limitation": "A History title difference does not identify a user message edit or its execution time."},
+                        level="support", status="partial")
+                    derived["timestamp"] = normalize_timestamp(None)
+                    additions.append(derived)
 
         # History clear candidate from table-cardinality decrease. Requires the new inventory rows.
         b_hist = self._inventory_by_profile(before, "Chrome History")
@@ -2583,7 +5217,10 @@ class GeminiParser:
         detail = row.get("detail") or {}
         url = cls._row_url(row).lower()
         if action == "account_activity_candidate":
-            return detail.get("relevance_basis") == "google_account_url_with_gemini_reference" and any(
+            # Re-evaluate attribution from the URL instead of trusting an older stored
+            # relevance_basis.  This also cleans up legacy result JSON where generic Google
+            # OAuth for Claude/LM Studio/Drive was incorrectly tagged as Gemini-related.
+            return history_relevance(url) == "google_account_url_with_gemini_reference" and any(
                 token in url for token in ("signin", "login", "servicelogin", "challenge", "identifier",
                                            "accountchooser", "checkcookie")
             )
@@ -2620,6 +5257,33 @@ class GeminiParser:
             return "CheckCookie"
         return "login-related URL"
 
+    @staticmethod
+    def _forensic_scope(row):
+        """Keep correlation inside one evidence partition and Windows/Chrome profile."""
+        detail = row.get("detail") or {}
+        locator = row.get("source_locator") or {}
+        evidence = detail.get("image_path") or locator.get("image_path")
+        if not evidence:
+            # Profile-mode rows carry artifact paths instead of image provenance. Strip only
+            # known artifact suffixes so History and Cache share their original profile root.
+            source = str(row.get("source_path") or "").replace("\\", "/")
+            profile_path = re.match(
+                r"^(.*)/(?:History(?:-wal|-shm|-journal)?|Cache|Code Cache|Sessions|Local Storage|"
+                r"Session Storage|IndexedDB|Service Worker)(?:/.*)?$", source, re.I,
+            )
+            evidence = profile_path.group(1) if profile_path else source
+        if not evidence:
+            # Missing provenance is not proof that two independent rows share evidence.
+            evidence = f"unscoped:{id(row)}"
+        partition = detail.get("profile_partition_offset")
+        if partition is None:
+            partition = detail.get("partition_offset")
+        if partition is None:
+            partition = locator.get("partition_offset")
+        return (str(evidence or "").replace("\\", "/").casefold(),
+                str(partition) if partition is not None else "",
+                str(detail.get("windows_user") or ""), str(detail.get("chrome_profile") or ""))
+
     @classmethod
     def _aggregate_login_flows(cls, rows, gap_seconds=180):
         """Collapse a burst of login-navigation URLs into one analyst timeline event.
@@ -2632,17 +5296,22 @@ class GeminiParser:
         if not traces:
             return []
 
+        scoped_traces = {}
+        for row in traces:
+            scoped_traces.setdefault(cls._forensic_scope(row), []).append(row)
         groups = []
-        current = [traces[0]]
-        for row in traces[1:]:
-            prev_dt = cls._row_timestamp_dt(current[-1])
-            cur_dt = cls._row_timestamp_dt(row)
-            if prev_dt is not None and cur_dt is not None and (cur_dt - prev_dt).total_seconds() <= gap_seconds:
-                current.append(row)
-            else:
-                groups.append(current)
-                current = [row]
-        groups.append(current)
+        for scoped_rows in scoped_traces.values():
+            current = [scoped_rows[0]]
+            for row in scoped_rows[1:]:
+                prev_dt = cls._row_timestamp_dt(current[-1])
+                cur_dt = cls._row_timestamp_dt(row)
+                if prev_dt is not None and cur_dt is not None and (cur_dt - prev_dt).total_seconds() <= gap_seconds:
+                    current.append(row)
+                else:
+                    groups.append(current)
+                    current = [row]
+            groups.append(current)
+        groups.sort(key=lambda group: cls._row_timestamp_dt(group[0]))
 
         summaries = []
         for group in groups:
@@ -2675,6 +5344,8 @@ class GeminiParser:
                 "windows_user": first_detail.get("windows_user"),
                 "chrome_profile": first_detail.get("chrome_profile"),
                 "filesystem_type": first_detail.get("filesystem_type"),
+                "image_path": first_detail.get("image_path"),
+                "partition_offset": first_detail.get("partition_offset"),
                 "limitation": (
                     "Google/Gemini login-related navigation was observed as one URL flow. "
                     "URL navigation alone does not prove that authentication completed successfully."
@@ -2687,6 +5358,7 @@ class GeminiParser:
                 detail, first.get("source_path"),
                 {"table": "visits", "id": ids[0] if ids else None,
                  "flow_visit_ids": ids[:50],
+                 "partition_offset": (first.get("source_locator") or {}).get("partition_offset"),
                  "filesystem_path": (first.get("source_locator") or {}).get("filesystem_path")},
                 "support", "success", None
             ])))
@@ -2725,16 +5397,25 @@ class GeminiParser:
         if row.get("status") not in {"success", "partial"}:
             return False
 
+        # The final team Timeline is for user actions, not every supporting clue.
+        # Keep weak/ambiguous candidates in gemini_results.json, but do not promote them
+        # to timeline.csv without event-specific evidence.
+        if action == "conversation_create" and detail.get("creation_basis") == "first_observed_local_history_visit":
+            return False
+        if action == "account_switch" and detail.get("account_switch_order_known") is False:
+            return False
+        if action in SUPPORTING_ONLY_ACTIONS:
+            return False
+
         if action in {
             "conversation_access", "file_download",
             "login", "logout", "account_switch", "conversation_create", "conversation_delete",
             "conversation_edit", "conversation_retry", "prompt_send", "prompt_draft", "image_upload",
-            "image_upload_candidate", "document_upload", "document_upload_candidate", "attachment_remove",
-            "document_download", "document_download_candidate", "image_generation", "image_generation_candidate",
-            "generated_image_download", "generated_image_download_candidate", "generated_image_delete",
-            "data_export", "data_export_candidate", "share_link_create", "share_link_candidate", "model_change",
-            "account_name_change", "account_name_change_candidate", "temporary_chat", "temporary_chat_url", "prompt_delete_candidate",
-            "incognito_mode_candidate", "history_clear_candidate", "cache_clear_candidate",
+            "document_upload", "attachment_remove",
+            "document_download", "image_generation",
+            "generated_image_download", "generated_image_delete",
+            "data_export", "share_link_create", "model_change",
+            "account_name_change", "temporary_chat", "temporary_chat_url",
         }:
             return True
 
@@ -2822,7 +5503,6 @@ class GeminiParser:
             "image_upload_candidate": "이미지 업로드",
             "document_upload": "문서 업로드",
             "document_upload_candidate": "문서 업로드",
-            "attachment_remove": "이미지/문서 업로드 삭제",
             "document_download": "문서 다운로드",
             "document_download_candidate": "문서 다운로드",
             "image_generation": "이미지 생성 요청",
@@ -2842,8 +5522,8 @@ class GeminiParser:
             "incognito_mode_candidate": "브라우저 시크릿 모드",
             "history_clear_candidate": "방문기록 삭제",
             "cache_clear_candidate": "캐시 삭제",
-            "gemini_access_candidate": "서비스 접속",          # 팀 행위 분류 체계: 서비스명 없는 이름. 근거(Gemini URL 방문)는 Behavior_details 에
-            "conversation_access": "대화 접근",
+            "gemini_access_candidate": "서비스 접속",
+            "conversation_access": "서비스 접속",
             "conversation_candidate": "대화 관련 흔적",
             "cached_image_candidate": "이미지 생성 관련 흔적",
         }
@@ -2856,6 +5536,16 @@ class GeminiParser:
                 return "로그인"
             return "계정 활동 접근"
 
+        if action == "attachment_remove":
+            filename = detail.get("filename") or detail.get("original_filename") or ""
+            if IMAGE_FILE_RE.search(str(filename)):
+                return "이미지 업로드 삭제"
+            if DOCUMENT_FILE_RE.search(str(filename)):
+                return "문서 업로드 삭제"
+            # The team taxonomy has no generic upload-delete label. Keep an
+            # unclassified removal only in JSON/coverage instead of inventing one.
+            return "업로드 삭제 관련 흔적"
+
         if action == "file_delete_candidate" and cls._looks_like_gemini_generated_image(detail):
             return "생성 이미지 다운로드 삭제"
 
@@ -2863,8 +5553,9 @@ class GeminiParser:
             kind = cls._download_media_kind(detail)
             if kind == "document":
                 return "문서 다운로드"
-            if kind == "image":
-                return "이미지 다운로드"
+            # The shared taxonomy distinguishes generated-image downloads, but has
+            # no generic '이미지 다운로드' action. Non-generated images use the
+            # agreed upper-level '파일 다운로드' label.
             return "파일 다운로드"
 
         if not action:
@@ -2928,11 +5619,13 @@ class GeminiParser:
                 return tagged("신규 대화 후보(History 최초 관찰, 생성 직접 증거 미확인)", title or cid)
             return tagged("대화 생성 기록", title or cid)
         if action == "conversation_delete":
-            return tagged("대화 삭제 요청/이벤트", title or cid)
+            return tagged("대화 삭제 이벤트/요청 근거", title or cid)
         if action == "conversation_edit":
-            return tagged("동일 부모 아래 사용자 메시지 분기", title or cid)
+            return tagged("대화 수정 이벤트/메시지 관계 근거", title or cid)
         if action == "conversation_retry":
-            return tagged("동일 사용자 메시지 아래 응답 분기", title or cid)
+            return tagged("응답 재시도/재생성 이벤트 근거", title or cid)
+        if action in {"conversation_delete_candidate", "conversation_edit_candidate", "conversation_retry_candidate"}:
+            return tagged("대화 관련 semantic/UI marker(행위 실행 미확인)", title or cid)
         if action == "prompt_send":
             prompt = detail.get("prompt_text") or detail.get("message_content") or detail.get("message_text") or ""
             first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
@@ -2941,6 +5634,10 @@ class GeminiParser:
             prompt = detail.get("prompt_text") or detail.get("draft_text") or ""
             first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
             return tagged("프롬프트 작성 흔적(전송 미확인)", first)
+        if action == "prompt_send_candidate":
+            prompt = detail.get("prompt_text") or detail.get("message_content") or ""
+            first = str(prompt).strip().splitlines()[0] if str(prompt).strip() else title or cid
+            return tagged("프롬프트/전송 라벨 공존 흔적(실제 전송 미확인)", first)
         if action == "prompt_delete_candidate":
             return tagged("Gemini 활동/프롬프트 삭제 관련 페이지 접근(삭제 내용 미확인)", url or title)
         if action in {"image_upload", "document_upload"}:
@@ -2952,6 +5649,8 @@ class GeminiParser:
         if action == "attachment_remove":
             summary = detail.get("summary") or row.get("observation") or filename
             return tagged("첨부 제거 이벤트", summary)
+        if action == "attachment_remove_candidate":
+            return tagged("첨부 제거 관련 marker(실행 미확인)", filename or title or cid)
         if action in {"document_download", "generated_image_download"}:
             return tagged("다운로드 완료 기록", filename)
         if action in {"document_download_candidate", "generated_image_download_candidate"}:
@@ -2977,6 +5676,10 @@ class GeminiParser:
             after = detail.get("new_model") or detail.get("model") or "?"
             prefix = "대화 내 모델 변경" if cid else "모델 선택 이벤트"
             return f"{prefix}_{before} → {after}"
+        if action == "model_change_candidate":
+            before = detail.get("previous_model") or "?"
+            after = detail.get("new_model") or detail.get("model") or "?"
+            return f"모델 관련 상태/라벨 흔적(변경 실행 미확인)_{before} → {after}"
         if action == "account_name_change":
             before = detail.get("previous_name") or "?"
             after = detail.get("new_name") or "?"
@@ -2984,7 +5687,9 @@ class GeminiParser:
         if action == "account_name_change_candidate":
             return tagged("계정 이름 변경 화면 접근(변경 완료 미확인)", url or title)
         if action == "temporary_chat":
-            return tagged("임시 대화 객체(is_temporary=true)", title or cid)
+            return tagged("임시 채팅 상태/이벤트 근거", title or cid)
+        if action == "temporary_chat_candidate":
+            return tagged("임시 채팅 관련 semantic/UI marker(사용 실행 미확인)", title or cid)
         if action == "temporary_chat_url":
             return tagged("임시 채팅 URL 접근 흔적(대화 미확인)", url)
         if action == "incognito_mode_candidate":
@@ -3158,7 +5863,7 @@ class GeminiParser:
             low = rendered.lower()
             # Never use the E01/DD container itself as Artifact_path when an internal
             # filesystem artifact is known.
-            if low.endswith((".e01", ".dd", ".img", ".raw")):
+            if low.endswith((".e01", ".dd", ".img", ".raw", ".001")):
                 return
             if rendered not in paths:
                 paths.append(rendered)
@@ -3422,7 +6127,15 @@ class GeminiParser:
         seen = set()
         for row in self.results:
             detail = row.get("detail") or {}
-            if self._explicit_send_marker(self._semantic_text(row)):
+            semantic_text = self._semantic_text(row)
+            if self._is_google_search_context(semantic_text):
+                continue
+            cids = self._conversation_ids_for_row(row)
+            strong_gemini = bool(cids or detail.get("origin_namespace_matches_gemini") is True
+                                 or re.search(r"(?i)(?:hNvQHb|StreamGenerate|BardChatUi|gemini\.google\.com/_/)", semantic_text))
+            if self._is_cross_service_prompt_context(semantic_text) and not strong_gemini:
+                continue
+            if self._explicit_send_marker(semantic_text):
                 # The semantic rule engine will emit prompt_send; do not duplicate it as an unsent draft.
                 continue
             candidates = detail.get("message_candidates")
@@ -3435,7 +6148,7 @@ class GeminiParser:
                 role = str(candidate.get("role_hint") or "").lower()
                 if field not in {"prompt", "query", "input"} and role != "user":
                     continue
-                text = self._normalize_recovered_text(candidate.get("text"))
+                text = self._decode_aggressive_prompt_text(candidate.get("text"), field)
                 if not text:
                     continue
                 source = self._team_artifact_path(row)
@@ -3530,34 +6243,73 @@ class GeminiParser:
 
     @classmethod
     def _timestamp_value_for_display(cls, value):
-        """Normalize an explicit message timestamp into the team KST display string.
+        """Return a timestamp only when it can satisfy the team CSV contract.
 
-        Accepts the parser timestamp dict (raw/utc/kst) or an ISO/string value.  This helper
-        exists separately from _display_timestamp because structured message records may carry
-        their own message_timestamp/message_time independent of the enclosing artifact row.
+        The integration runner accepts only ``YYYY-MM-DD HH:MM:SS.ffffff KST`` or ``-``.
+        Structured message timestamps may be independent of the enclosing artifact row, so
+        timezone-less, numeric-without-format, or otherwise ambiguous values are not guessed.
+        They are returned as an empty value and become ``-`` only at CSV rendering time.
         """
         if value in (None, ""):
             return ""
         if isinstance(value, dict):
-            candidate = value.get("kst") or value.get("utc") or value.get("raw")
+            candidate = value.get("kst") or value.get("utc")
+            if not candidate:
+                return ""
         else:
             candidate = value
-        if candidate in (None, ""):
-            return ""
+
+        # A bare number has no trustworthy unit/epoch here.  Do not manufacture a time.
         if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
-            # Prefer Chrome/WebKit conversion for large microsecond values; otherwise Unix time.
-            kind = "chrome" if abs(candidate) >= 10**12 else "unix"
-            normalized = normalize_timestamp(candidate, kind=kind)
-            candidate = normalized.get("kst") or normalized.get("utc") or normalized.get("raw")
+            return ""
+        text = str(candidate).strip()
+        if not text:
+            return ""
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST", text):
+            return text
+        # Digit-only strings are equally ambiguous (seconds/ms/WebKit/FILETIME, etc.).
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            return ""
         try:
-            parsed = datetime.fromisoformat(str(candidate).replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
-                # A timezone-less structured timestamp is preserved rather than silently assumed.
-                return str(candidate)
+                return ""
             parsed = parsed.astimezone(KST)
             return parsed.strftime("%Y-%m-%d %H:%M:%S") + f".{parsed.microsecond:06d} KST"
         except (TypeError, ValueError, OverflowError):
-            return str(candidate)
+            return ""
+
+    @staticmethod
+    def _qualified_message_recovery_basis(basis):
+        """Allow only protocol/native structures that explicitly encode message semantics.
+
+        Raw/heuristic text may remain valuable supporting evidence in JSON, but must never be
+        re-used as recovered conversation content or a confirmed prompt-send event.
+        """
+        value = str(basis or "").strip().casefold()
+        if not value:
+            return False
+        rejected = (
+            "aggressive_raw_prompt", "gemini_f_req_heuristic",
+            "labeled_string_in_bounded_raw_context", "structured_artifact_fields",
+        )
+        if any(token in value for token in rejected):
+            return False
+        exact = {
+            "structured_stream_query", "structured_stream_choice",
+            "history_rpc_user_prompt", "history_rpc_assistant_candidate",
+            "gemini_f_req_structured",
+        }
+        if value in exact:
+            return True
+        # CCL/native storage wrappers prepend an artifact namespace to the same qualified
+        # protocol basis. Explicit deserialized message objects are also allowed because
+        # _structured_messages_from_json_value() requires role + content + conversation id.
+        if any(value.endswith("_" + suffix) for suffix in exact):
+            return True
+        if "structured_object" in value and value.startswith("ccl_"):
+            return True
+        return False
 
     @classmethod
     def _structured_message_from_row(cls, row):
@@ -3566,6 +6318,9 @@ class GeminiParser:
         Raw Session/Cache/LevelDB context is deliberately NOT promoted to message content.
         """
         detail = row.get("detail") or {}
+        recovery_basis = str(detail.get("recovery_basis") or "")
+        if detail.get("message_semantics_verified") is False or not cls._qualified_message_recovery_basis(recovery_basis):
+            return None
         cids = cls._conversation_ids_for_row(row)
         cid = cids[0] if cids else None
         content = None
@@ -3579,7 +6334,10 @@ class GeminiParser:
         message_id = detail.get("message_id") or detail.get("message_uuid")
         parent_id = detail.get("parent_message_id") or detail.get("parent_message_uuid")
         # Require explicit message semantics.  A generic raw context/string is not enough.
-        if not cid or not content or not (role or message_id or content_key in {"prompt_text", "response_text"}):
+        # conversation_id may be absent in a request payload; recovered_conversation_rows()
+        # may correlate a user prompt to a unique History conversation title afterward.
+        content = cls._normalize_message_content(content) if content else None
+        if not content or not (role or message_id or content_key in {"prompt_text", "response_text"}):
             return None
         msg_time = detail.get("message_timestamp") or detail.get("message_time")
         if isinstance(msg_time, dict):
@@ -3603,6 +6361,13 @@ class GeminiParser:
             "artifact": row.get("artifact") or "",
             "artifact_path": cls._team_artifact_path(row),
             "artifact_detail": cls._timeline_artifact_detail(row),
+            "recovery_basis": recovery_basis,
+            "protocol": detail.get("protocol"),
+            "protocol_offset": detail.get("protocol_offset"),
+            "protocol_sequence": detail.get("protocol_sequence"),
+            "response_id": detail.get("response_id"),
+            "choice_id": detail.get("choice_id"),
+            "candidate_rank": detail.get("candidate_rank"),
         }
 
     @classmethod
@@ -3649,66 +6414,407 @@ class GeminiParser:
         return output
 
     def recovered_conversation_rows(self):
-        """Return only actually recovered Gemini messages in the team Conversation schema.
+        """Return recovered Gemini messages in the team Conversation schema.
 
-        Raw byte hits, URL fragments and bounded-context text candidates are intentionally excluded.
-        If no structured message is recovered, the CSV is header-only; the reason/coverage remains
-        available in gemini_results.json and optional coverage.csv. This matches the team meaning of
-        recovered_conversations.csv: one recovered message = one row.
+        Only structurally decoded persistent Gemini request/response messages qualify.
+        History titles and aggressive raw-prompt candidates are metadata/supporting evidence only.
+        Streamed wrb.fr chunks are consolidated by response id so partial cumulative answers are
+        not emitted as separate assistant messages. A cid-less structured request prompt is linked
+        only when its text uniquely matches a locally observed Gemini History title.
         """
-        output = []
-        seen = set()
+        history_titles = {}
+        title_index = {}
+        for source_index, row in enumerate(self.results):
+            if row.get("artifact") != "Chrome History":
+                continue
+            detail = row.get("detail") or {}
+            cid = detail.get("conversation_id")
+            title = self._clean_title(detail.get("conversation_title") or detail.get("title"))
+            if not cid or not title:
+                continue
+            cid = str(cid)
+            scope = self._forensic_scope(row)
+            history_titles.setdefault((scope, cid), title)
+            canonical = re.sub(r"\s+", " ", title).strip().casefold()
+            title_index.setdefault(scope, {}).setdefault(canonical, set()).add(cid)
 
-        for row in self.results:
+
+
+        candidates = []
+        for source_index, row in enumerate(self.results):
             detail = row.get("detail") or {}
             if detail.get("record_type") not in {"finding", "finding_summary"}:
+                continue
+            recovery_basis = str(detail.get("recovery_basis") or "")
+            if not self._qualified_message_recovery_basis(recovery_basis):
+                # Raw/heuristic/derived text remains JSON supporting evidence only.
                 continue
             msg = self._structured_message_from_row(row)
             if not msg:
                 continue
-            rendered = {
+
+            cid = str(msg.get("conversation_id") or "").strip()
+            content = self._normalize_message_content(msg.get("content"))
+            if not content:
+                continue
+            scope = self._forensic_scope(row)
+            role = str(msg.get("role") or "UNKNOWN").strip().lower()
+            if role == "human":
+                role = "user"
+            elif role == "model":
+                role = "assistant"
+
+            # Request payloads can carry the prompt without a conversation id. Correlate only
+            # against a unique, non-generic Gemini History title. This prevents arbitrary f.req
+            # strings from becoming recovered conversations.
+            if not cid and role == "user":
+                canonical = re.sub(r"\s+", " ", content).strip().casefold()
+                generic_titles = {"새로운 대화 시작", "new chat", "gemini", "google gemini"}
+                # Generic Gemini landing/new-chat titles are not message semantics.  Reject
+                # them before both exact and prefix correlation so an exact title match cannot
+                # accidentally assign a cid-less request to an arbitrary conversation.
+                scoped_titles = title_index.get(scope, {})
+                matches = set() if canonical in generic_titles else set(scoped_titles.get(canonical, set()))
+                if not matches and canonical not in generic_titles:
+                    for candidate_title, candidate_cids in scoped_titles.items():
+                        if candidate_title in generic_titles:
+                            continue
+                        shorter = min(len(canonical), len(candidate_title))
+                        if shorter < 16:
+                            continue
+                        if canonical.startswith(candidate_title) or candidate_title.startswith(canonical):
+                            matches.update(candidate_cids)
+                if len(matches) == 1:
+                    cid = next(iter(matches))
+
+            if not cid:
+                continue
+
+            title = self._clean_title(msg.get("title") or "") or history_titles.get((scope, cid), "")
+            candidates.append({
                 "Model": msg.get("model_name") or "gemini-web",
                 "timestamp": msg.get("message_time") or "",
-                "conversation_uuid": msg.get("conversation_id") or "",
-                "conversation_title": self._clean_title(msg.get("title") or ""),
+                "conversation_uuid": cid,
+                "conversation_title": title,
                 "message_uuid": msg.get("message_id") or "",
                 "parent_message_uuid": msg.get("parent_message_id") or "",
                 "message order": msg.get("message_order") if msg.get("message_order") is not None else "",
-                "role": msg.get("role") or "UNKNOWN",
-                "content": msg.get("content") or "",
+                "role": role or "UNKNOWN",
+                "content": content,
                 "Artifact_path": msg.get("artifact_path") or "",
-            }
-            # A recovered conversation row must carry actual text and a conversation identifier.
-            if not rendered["conversation_uuid"] or not str(rendered["content"]).strip():
+                "_source_index": source_index,
+                "_scope": scope,
+                "_protocol_offset": msg.get("protocol_offset"),
+                "_protocol_sequence": msg.get("protocol_sequence"),
+                "_basis": msg.get("recovery_basis") or "",
+                "_response_id": str(msg.get("response_id") or ""),
+                "_choice_id": str(msg.get("choice_id") or ""),
+                "_candidate_rank": msg.get("candidate_rank"),
+            })
+
+        # History titles remain metadata only. They are never synthesized into user-message rows.
+
+        def basis_score(row):
+            basis = str(row.get("_basis") or "")
+            if basis.startswith("ccl_cache_"):
+                return 9
+            if basis.startswith("ccl_indexeddb_"):
+                return 8
+            if basis.startswith("ccl_local_storage_"):
+                return 7
+            if basis.startswith("ccl_session_storage_"):
+                return 7
+            if basis.startswith("ccl_service_worker_"):
+                return 6
+            if basis.startswith("history_rpc_"):
+                return 6
+            if basis.startswith("structured_stream"):
+                return 4
+            if basis == "gemini_f_req_structured":
+                return 3
+            if "f_req" in basis:
+                return 2
+            return 1
+
+        def row_quality(row):
+            return (
+                basis_score(row),
+                len(str(row.get("content") or "")),
+                1 if row.get("message_uuid") else 0,
+                1 if row.get("timestamp") else 0,
+                int(row.get("_protocol_offset") or 0),
+                int(row.get("_source_index") or 0),
+            )
+
+        # READ_CHAT parent metadata points to the response-candidate branch that was actually
+        # continued. Collect those choice ids across all artifacts/pages before collapsing groups.
+        referenced_history_choices = {
+            (str(row.get("conversation_uuid") or ""), str(row.get("_choice_id") or ""))
+            for row in candidates
+            if row.get("role") == "user" and "history_rpc_" in str(row.get("_basis") or "")
+            and row.get("_choice_id")
+        }
+
+        # First consolidate records that have a real message/response turn identifier. This is
+        # critical for streamed Gemini answers: later wrb.fr chunks usually repeat the same
+        # response_id with progressively longer text, and only the best/final text should remain.
+        strong_groups = {}
+        fallback = []
+        for row in candidates:
+            response_id = row.get("_response_id")
+            message_id = row.get("message_uuid")
+            if response_id:
+                key = ("response", row["conversation_uuid"], row["role"], response_id)
+            elif message_id:
+                key = ("message", row["conversation_uuid"], row["role"], message_id)
+            else:
+                fallback.append(row)
                 continue
-            key = tuple(str(rendered.get(k, "")) for k in CONVERSATION_FIELDS)
-            if key in seen:
+            strong_groups.setdefault(key, []).append(row)
+
+        output = []
+        for group in strong_groups.values():
+            history_assistants = [
+                row for row in group
+                if row.get("role") == "assistant" and "history_rpc_" in str(row.get("_basis") or "")
+            ]
+            if history_assistants:
+                continued = [
+                    row for row in history_assistants
+                    if (str(row.get("conversation_uuid") or ""), str(row.get("_choice_id") or ""))
+                    in referenced_history_choices
+                ]
+                if continued:
+                    best = max(continued, key=row_quality).copy()
+                else:
+                    # Latest/uncontinued regenerated turn: use the first candidate returned by
+                    # Gemini, matching the web client's own fallback when no child pointer exists.
+                    best = min(
+                        history_assistants,
+                        key=lambda row: (
+                            int(row.get("_candidate_rank")) if str(row.get("_candidate_rank")).isdigit() else 10**9,
+                            -row_quality(row)[0],
+                        ),
+                    ).copy()
+            else:
+                best = max(group, key=row_quality).copy()
+            offsets = [int(r.get("_protocol_offset")) for r in group if r.get("_protocol_offset") is not None]
+            sources = [int(r.get("_source_index") or 0) for r in group]
+            best["_turn_offset"] = min(offsets) if offsets else int(best.get("_protocol_offset") or 0)
+            best["_turn_source_index"] = min(sources) if sources else int(best.get("_source_index") or 0)
+            output.append(best)
+
+        # A request-side f.req prompt can duplicate the user query already recovered from the
+        # matching response. Suppress that weaker copy, but do not collapse two strong response
+        # turns merely because the user happened to submit identical text twice.
+        strong_semantics = {
+            (
+                str(row.get("conversation_uuid") or ""),
+                str(row.get("role") or "").lower(),
+                re.sub(r"\s+", " ", str(row.get("content") or "")).strip(),
+            )
+            for row in output
+        }
+        fallback_unique = {}
+        for row in fallback:
+            semantic = (
+                str(row.get("conversation_uuid") or ""),
+                str(row.get("role") or "").lower(),
+                re.sub(r"\s+", " ", str(row.get("content") or "")).strip(),
+            )
+            if semantic in strong_semantics:
                 continue
-            seen.add(key)
-            output.append(rendered)
+            if str(row.get("_basis") or "").startswith("aggressive_raw_prompt"):
+                continue
+            fallback_key = semantic
+            previous = fallback_unique.get(fallback_key)
+            if previous is None or row_quality(row) > row_quality(previous):
+                fallback_unique[fallback_key] = row
+        for row in fallback_unique.values():
+            row = row.copy()
+            row["_turn_offset"] = int(row.get("_protocol_offset") or 0)
+            row["_turn_source_index"] = int(row.get("_source_index") or 0)
+            output.append(row)
 
         by_cid = {}
         for row in output:
             by_cid.setdefault(str(row["conversation_uuid"]), []).append(row)
-        for group in by_cid.values():
-            group.sort(key=lambda r: (str(r.get("timestamp") or ""), str(r.get("message_uuid") or "")))
+        for cid, group in by_cid.items():
+            # Preserve explicit order and timestamps. Untimed READ_CHAT turns use their
+            # chronological protocol sequence before byte/source position.
+            group.sort(key=lambda r: (
+                0 if str(r.get("message order") or "").isdigit() else 1,
+                int(r["message order"]) if str(r.get("message order") or "").isdigit() else 10**9,
+                0 if r.get("timestamp") not in (None, "", "-") else 1,
+                str(r.get("timestamp") or ""),
+                (int(r["_protocol_sequence"])
+                 if r.get("timestamp") in (None, "", "-")
+                 and "history_rpc_" in str(r.get("_basis") or "")
+                 and r.get("_protocol_sequence") is not None else 0),
+                int(r.get("_turn_source_index") or 0),
+                int(r.get("_turn_offset") or 0),
+                int(r.get("_protocol_sequence") or 0),
+                0 if r.get("role") == "user" else 1 if r.get("role") == "assistant" else 2,
+            ))
             used = {int(r["message order"]) for r in group if str(r.get("message order") or "").isdigit()}
             nxt = 1
-            for r in group:
-                if r.get("message order") in (None, ""):
+            for row in group:
+                if row.get("message order") in (None, ""):
                     while nxt in used:
                         nxt += 1
-                    r["message order"] = nxt
+                    row["message order"] = nxt
                     used.add(nxt)
                     nxt += 1
+                if not row.get("conversation_title"):
+                    row["conversation_title"] = history_titles.get((row["_scope"], cid), "")
 
         output.sort(key=lambda r: (
             str(r.get("conversation_uuid") or ""),
             int(r["message order"]) if str(r.get("message order") or "").isdigit() else 10**9,
             str(r.get("timestamp") or ""),
-            str(r.get("message_uuid") or ""),
+            int(r.get("_turn_source_index") or 0),
         ))
-        return output
+        return [{field: row.get(field, "") for field in CONVERSATION_FIELDS} for row in output]
+
+    def _emit_conversation_scope_summaries(self):
+        """Emit JSON-only primary metadata and persistent-body recovery summaries.
+
+        These rows deliberately do not feed either team CSV. History/SNSS navigation identifies
+        conversations and access traces; body recovery is reported separately so a title is never
+        mistaken for the user's prompt.
+        """
+        # Build the final qualified conversation view first.  This reuses the same filtering,
+        # correlation and de-duplication rules as recovered_conversations.csv, so an aggressive
+        # raw prompt can never make the JSON summary claim that a body was recovered.
+        conversation_rows = self.recovered_conversation_rows()
+        recovered_cids = {
+            str(row.get("conversation_uuid") or "")
+            for row in conversation_rows if row.get("conversation_uuid")
+        }
+
+        conversations = {}
+        structured_by_artifact = Counter()
+        for row in self.results:
+            detail = row.get("detail") or {}
+            artifact = str(row.get("artifact") or "")
+
+            # Count only rows that meet the persistent structured-message policy.  Raw prompt
+            # candidates remain useful support evidence but are not conversation-body findings.
+            basis = str(detail.get("recovery_basis") or "")
+            if (detail.get("record_type") in {"finding", "finding_summary"}
+                    and self._qualified_message_recovery_basis(basis)
+                    and self._structured_message_from_row(row) is not None):
+                structured_by_artifact[artifact] += 1
+
+            if artifact not in {"Chrome History", "Chrome Sessions"} or detail.get("record_type") != "finding":
+                continue
+            # Metadata summaries describe primary History/SNSS observations only. Semantic
+            # action rows are derived copies of those observations and must not be counted again
+            # as additional History/Session records after semantic derivation has completed.
+            if detail.get("derived_rule_id"):
+                continue
+            for cid in self._conversation_ids_for_row(row):
+                if not cid:
+                    continue
+                cid = str(cid)
+                item = conversations.setdefault(cid, {
+                    "conversation_id": cid, "titles": [], "history_records": 0,
+                    "session_navigation_records": 0, "evidence_sources": [], "timestamps": [],
+                })
+                title = self._clean_title(detail.get("conversation_title") or detail.get("title"))
+                if title and title not in item["titles"]:
+                    item["titles"].append(title)
+                if artifact not in item["evidence_sources"]:
+                    item["evidence_sources"].append(artifact)
+                if artifact == "Chrome History":
+                    item["history_records"] += 1
+                elif artifact == "Chrome Sessions" and detail.get("recovery_basis") == "ccl_snss_navigation":
+                    item["session_navigation_records"] += 1
+                shown = self._display_timestamp(row)
+                if shown and shown not in {"-", "N/A - raw scan has no record timestamp"}:
+                    item["timestamps"].append(shown)
+
+        for cid, item in sorted(conversations.items()):
+            times = sorted(set(item.pop("timestamps")))
+            title = item["titles"][0] if item["titles"] else ""
+            payload = {
+                "record_type": "conversation_metadata_summary",
+                **item,
+                "conversation_title": title,
+                "first_observed": times[0] if times else "",
+                "last_observed": times[-1] if times else "",
+                "body_recovered_from_persistent_artifact": cid in recovered_cids,
+                "scope": "persistent_disk_artifacts",
+                "limitation": "History/Sessions prove navigation/access metadata, not the literal conversation body.",
+            }
+            self._emit("conversation_scope", "Gemini conversation metadata summary",
+                       detail=payload, level="support", status="success")
+
+        deep_rows = []
+        deep_limitations = {}
+        for row in self.results:
+            detail = row.get("detail") or {}
+            if detail.get("record_type") != "deep_recovery_status":
+                continue
+            artifact = str(row.get("artifact") or "-")
+            summary = {
+                "artifact": artifact,
+                "status": row.get("status") or "-",
+                "message_findings": int(detail.get("message_findings") or 0),
+                "decode_errors": int(detail.get("decode_errors") or 0),
+                "ccl_available": bool(detail.get("ccl_available")),
+                "native_structure_decoded": bool(detail.get("native_structure_decoded")),
+            }
+            deep_rows.append(summary)
+            reasons = []
+            if not summary["ccl_available"]:
+                reasons.append("ccl_unavailable")
+            if summary["decode_errors"]:
+                reasons.append(f"decode_errors={summary['decode_errors']}")
+            if row.get("status") in {"parse_error", "locked_database", "unsupported"}:
+                reasons.append(str(row.get("status")))
+            if reasons:
+                deep_limitations.setdefault(artifact, []).extend(reasons)
+
+        body_artifacts = ["Chrome Cache", "Chrome Sessions", "Chrome IndexedDB",
+                          "Chrome Local Storage", "Chrome Session Storage", "Chrome Service Worker"]
+        unavailable = {
+            artifact: self.artifact_status.get(key)
+            for key, artifact in self.ARTIFACTS.items()
+            if artifact in body_artifacts and key in self.artifact_status
+            and self.artifact_status.get(key) in {"parse_error", "locked_database", "unsupported"}
+        }
+        for artifact, reasons in deep_limitations.items():
+            unavailable.setdefault(artifact, ",".join(sorted(set(reasons))))
+
+        if conversation_rows:
+            recovery_status = "persistent_body_recovered"
+        elif not self.deep_recovery:
+            recovery_status = "persistent_body_not_assessed"
+        elif unavailable:
+            recovery_status = "persistent_body_not_found_with_limitations"
+        else:
+            recovery_status = "persistent_body_not_found"
+        self._emit(
+            "conversation_scope", "Persistent Gemini conversation-body recovery summary",
+            detail={
+                "record_type": "conversation_recovery_summary",
+                "scope": "persistent_disk_artifacts",
+                "recovery_status": recovery_status,
+                "metadata_conversation_count": len(conversations),
+                "recovered_conversation_rows": len(conversation_rows),
+                "structured_message_findings_by_artifact": dict(structured_by_artifact),
+                "body_source_artifacts": body_artifacts,
+                "artifact_limitations": unavailable,
+                "deep_recovery_statuses": deep_rows,
+                "memory_analysis_included": False,
+                "network_capture_included": False,
+                "limitation": (
+                    "No persistent body finding means no stable body was recovered from the examined supported local artifacts; "
+                    "it does not prove that the conversation never existed. Live-memory/HAR findings are intentionally outside this parser input scope."
+                ),
+            },
+            level="unconfirmed", status="partial" if unavailable else "success")
 
     def _artifact_analysis_states(self):
         """Collect per-artifact parser coverage from analysis_status records."""
@@ -3724,7 +6830,36 @@ class GeminiParser:
         return states
 
     def _weak_action_support(self, behavior):
-        """Return a conservative reason when evidence exists but cannot prove the behavior."""
+        """Return a conservative reason when supporting evidence exists but cannot prove the behavior."""
+        action_map = {
+            "계정 전환": {"account_switch"},
+            "새로운 대화 생성": {"conversation_create"},
+            "기존 대화 삭제": {"conversation_delete_candidate"},
+            "대화 수정": {"conversation_edit_candidate"},
+            "대화 재시도": {"conversation_retry_candidate"},
+            "사용자 프롬프트 입력/전송": {"prompt_send_candidate"},
+            "사용자 프롬프트 삭제": {"prompt_delete_candidate"},
+            "이미지 업로드": {"image_upload_candidate"},
+            "문서 업로드": {"document_upload_candidate"},
+            "이미지 생성 요청": {"image_generation_candidate", "cached_image_candidate"},
+            "대화 데이터 Export": {"data_export_candidate"},
+            "공유 링크 생성": {"share_link_candidate"},
+            "모델 변경": {"model_change_candidate"},
+            "계정 이름 변경": {"account_name_change_candidate"},
+            "임시 채팅 사용": {"temporary_chat_candidate", "temporary_chat_url"},
+            "브라우저 시크릿 모드": {"incognito_mode_candidate"},
+            "방문기록 삭제": {"history_clear_candidate"},
+            "캐시 삭제": {"cache_clear_candidate"},
+        }
+        actions = action_map.get(behavior, set())
+        supporting = [
+            row for row in self.results
+            if row.get("action_candidate") in actions
+            and (row.get("detail") or {}).get("record_type") in {"finding", "finding_summary"}
+        ]
+        if supporting:
+            return f"Supporting Finding {len(supporting)}건 확인; 최종 사용자 행위로 승격할 직접/구조적 근거는 부족함"
+
         if behavior == "사용자 프롬프트 입력/전송":
             drafts = self._raw_prompt_draft_rows()
             if drafts:
@@ -3748,7 +6883,7 @@ class GeminiParser:
         if behavior == "캐시 삭제":
             pref = [r for r in self.results if r.get("artifact") in {"Chrome Preferences", "Chrome Secure Preferences"} and "clear_data.cache" in str((r.get("detail") or {}).get("key_path") or "").lower()]
             if pref:
-                return "clear_data.cache 설정 흔적은 확인했지만 설정값만으로 실제 캐시 삭제 실행을 확정할 수 없음; USN/전후 비교 필요"
+                return "clear_data.cache 설정 흔적은 확인했지만 설정값만으로 실제 캐시 삭제 실행을 확정할 수 없음; 직접 삭제 증거 필요"
         if behavior == "브라우저 시크릿 모드":
             return "일반 Profile의 비잔존만으로 시크릿 모드 사용을 증명할 수 없음; 명시적 OTR/incognito 흔적이 없으면 판단 보류"
         return None
@@ -3766,7 +6901,7 @@ class GeminiParser:
         for behavior, artifacts in ACTION_COVERAGE_ARTIFACTS.items():
             if detected.get(behavior):
                 status = "DETECTED"
-                reason = f"timeline event/candidate {detected[behavior]}건"
+                reason = f"timeline event {detected[behavior]}건"
             else:
                 weak = self._weak_action_support(behavior)
                 relevant_states = [state for artifact in artifacts for state in states.get(artifact, [])]
@@ -3804,11 +6939,86 @@ class GeminiParser:
             })
         return rows
 
+    def qa_summary(self):
+        """Return non-destructive QA metrics derived from already parsed records.
+
+        This is intentionally separate from the two team CSV schemas.  It helps reviewers tell
+        whether an empty conversation result came from no protocol payloads, decoder failure,
+        scan limits, or simply no recoverable messages.
+        """
+        scan_summaries = []
+        for row in self.results:
+            detail = row.get("detail") or {}
+            if detail.get("record_type") == "scan_summary":
+                scan_summaries.append({
+                    "artifact": row.get("artifact") or "-",
+                    "status": detail.get("scan_status") or row.get("status") or "-",
+                    "files_examined": int(detail.get("files_examined") or 0),
+                    "files_read": int(detail.get("files_read") or 0),
+                    "bytes_read": int(detail.get("bytes_read") or 0),
+                    "string_match_count": int(detail.get("string_match_count") or 0),
+                    "structured_protocol_message_count": int(detail.get("structured_protocol_message_count") or 0),
+                    "aggressive_prompt_candidate_count": int(detail.get("aggressive_prompt_candidate_count") or 0),
+                    "files_with_aggressive_prompt_candidates": int(detail.get("files_with_aggressive_prompt_candidates") or 0),
+                    "scan_limit_reached_files": int(detail.get("scan_limit_reached_files") or 0),
+                    "result_limit_reached_files": int(detail.get("result_limit_reached_files") or 0),
+                    "read_error_count": int(detail.get("read_error_count") or 0),
+                    "elapsed_sec": detail.get("elapsed_sec"),
+                })
+        deep_summaries = []
+        for row in self.results:
+            detail = row.get("detail") or {}
+            if detail.get("record_type") == "deep_recovery_status":
+                deep_summaries.append({
+                    "artifact": row.get("artifact") or "-",
+                    "status": row.get("status") or "-",
+                    "native_structure_decoded": bool(detail.get("native_structure_decoded")),
+                    "message_findings": int(detail.get("message_findings") or 0),
+                    "ccl_available": bool(detail.get("ccl_available")),
+                    "decode_errors": int(detail.get("decode_errors") or 0),
+                })
+        structured_rows = [
+            row for row in self.results
+            if (row.get("detail") or {}).get("record_type") == "finding"
+            and not (row.get("detail") or {}).get("derived_rule_id")
+            and self._qualified_message_recovery_basis((row.get("detail") or {}).get("recovery_basis"))
+            and (row.get("detail") or {}).get("message_content")
+            and str((row.get("detail") or {}).get("role") or "").lower() in {"user", "human", "assistant", "model"}
+        ]
+        scope_summaries = [
+            (row.get("detail") or {}) for row in self.results
+            if (row.get("detail") or {}).get("record_type") == "conversation_recovery_summary"
+        ]
+        metadata_summaries = [
+            (row.get("detail") or {}) for row in self.results
+            if (row.get("detail") or {}).get("record_type") == "conversation_metadata_summary"
+        ]
+        return {
+            "parser_version": PARSER_VERSION,
+            "total_records": len(self.results),
+            "timeline_rows": len(self.timeline_rows()),
+            "conversation_rows": len(self.recovered_conversation_rows()),
+            "structured_message_findings": len(structured_rows),
+            "conversation_metadata_summaries": len(metadata_summaries),
+            "conversation_recovery": scope_summaries[-1] if scope_summaries else {},
+            "deep_recovery": deep_summaries,
+            "artifact_scans": scan_summaries,
+        }
+
     def validate_team_contract(self):
         """Validate the final two CSV views before handoff/integration."""
         timeline = [self._timeline_row(row) for row in self.timeline_rows()]
         conversations = self.recovered_conversation_rows()
         errors = []
+
+        def rendered(row):
+            return self._spreadsheet_safe(row)
+
+        def validate_timestamp(value, label):
+            text = str(value or "").strip()
+            if text != "-" and not TEAM_TIMESTAMP_RE.fullmatch(text):
+                errors.append(f"{label} invalid timestamp={text!r}")
+
         if TIMELINE_FIELDS != ("Model", "Timestamp", "User_behavior", "Behavior_details ", "Verdict", "Artifact_path", "Artifact_details "):
             errors.append("timeline header contract changed")
         if CONVERSATION_FIELDS != ("Model", "timestamp", "conversation_uuid", "conversation_title", "message_uuid", "parent_message_uuid", "message order", "role", "content", "Artifact_path"):
@@ -3816,6 +7026,12 @@ class GeminiParser:
         for index, row in enumerate(timeline):
             if tuple(row.keys()) != TIMELINE_FIELDS:
                 errors.append(f"timeline row {index} field order mismatch")
+            safe_row = rendered(row)
+            if any(str(safe_row.get(field) or "").strip() == "" for field in TIMELINE_FIELDS):
+                errors.append(f"timeline row {index} contains empty rendered cell")
+            if safe_row.get("Model") != "gemini-web":
+                errors.append(f"timeline row {index} invalid model={safe_row.get('Model')!r}")
+            validate_timestamp(safe_row.get("Timestamp"), f"timeline row {index}")
             if row.get("Verdict") not in TEAM_VERDICTS:
                 errors.append(f"timeline row {index} invalid verdict={row.get('Verdict')!r}")
             if row.get("User_behavior") not in TEAM_BEHAVIORS:
@@ -3828,12 +7044,22 @@ class GeminiParser:
         for index, row in enumerate(conversations):
             if tuple(row.keys()) != CONVERSATION_FIELDS:
                 errors.append(f"conversation row {index} field order mismatch")
+            safe_row = rendered(row)
+            if any(str(safe_row.get(field) or "").strip() == "" for field in CONVERSATION_FIELDS):
+                errors.append(f"conversation row {index} contains empty rendered cell")
+            if safe_row.get("Model") != "gemini-web":
+                errors.append(f"conversation row {index} invalid model={safe_row.get('Model')!r}")
+            validate_timestamp(safe_row.get("timestamp"), f"conversation row {index}")
             if not str(row.get("conversation_uuid") or "").strip():
                 errors.append(f"conversation row {index} missing conversation_uuid")
             if not str(row.get("content") or "").strip():
                 errors.append(f"conversation row {index} missing recovered content")
-            if str(row.get("role") or "").lower() == "evidence":
-                errors.append(f"conversation row {index} raw evidence role leaked")
+            role = str(row.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                errors.append(f"conversation row {index} invalid role={role!r}")
+            order = str(row.get("message order") or "").strip()
+            if not order.isdigit() or int(order) < 1:
+                errors.append(f"conversation row {index} invalid message order={order!r}")
             if "본문 미복구" in str(row.get("content") or ""):
                 errors.append(f"conversation row {index} non-recovered placeholder leaked")
         conversation_keys = [tuple(str(row.get(k, "")) for k in CONVERSATION_FIELDS) for row in conversations]
@@ -3909,8 +7135,148 @@ class ImageReadError(OSError):
     """An image object is unreadable, incomplete, or outside its bounds."""
 
 
+class BitLockerError(ImageReadError):
+    """Only fixed, key-free messages cross the BitLocker input boundary."""
+
+    def __init__(self, status, message):
+        self.status = status
+        super().__init__(message)
+
+
+class PartitionView(io.RawIOBase):
+    """Bounded read-only file object; closing it never closes the evidence."""
+
+    def __init__(self, image, offset, length):
+        super().__init__()
+        if offset < 0 or length <= 0 or offset + length > image.get_size():
+            raise ImageReadError("Invalid partition view bounds")
+        self.image, self.offset, self.length = image, offset, length
+        self.position = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def get_size(self):
+        self._checkClosed()
+        return self.length
+
+    def tell(self):
+        self._checkClosed()
+        return self.position
+
+    def seek(self, offset, whence=0):
+        self._checkClosed()
+        if whence not in (0, 1, 2):
+            raise ValueError("Invalid partition seek origin")
+        position = offset + (self.position if whence == 1 else self.length if whence == 2 else 0)
+        if position < 0:
+            raise ValueError("Negative partition seek")
+        self.position = position
+        return position
+
+    def read(self, size=-1):
+        self._checkClosed()
+        available = max(0, self.length - self.position)
+        size = available if size is None or size < 0 else min(size, available)
+        if not size:
+            return b""
+        try:
+            data = self.image.read(self.offset + self.position, size)
+        except Exception:
+            raise ImageReadError("Unable to read BitLocker partition bytes") from None
+        if len(data) != size:
+            raise ImageReadError("Short read within BitLocker partition")
+        self.position += len(data)
+        return data
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+
+
+
+class DissectBitLockerVolume:
+    """Own the read-only clear-key stream and NTFS backend until reader.close()."""
+
+    @staticmethod
+    def has_signature(boot):
+        # Windows Vista/7/used-space-only/BitLocker To Go signatures.
+        identifier = bytes.fromhex("3bd66749292ed84a8399f6a339e3d001")
+        used_space = bytes.fromhex("3b4da89280dd0e4d9e4eb1e3284eaed8")
+        return (boot[3:11] == b"-FVE-FS-" or boot[160:176] in (identifier, used_space)
+                or boot[424:440] == identifier)
+
+    def __init__(self, reader, metadata):
+        self.view = self.bde = self.stream = self.ntfs = self.filesystem = None
+        self.size = 0
+        metadata.update(bitlocker_backend="dissect.fve -> dissect.ntfs",
+                        bitlocker_has_clear_key=None)
+        try:
+            try:
+                from dissect.fve.bde import BDE
+                from dissect.ntfs import NTFS
+            except Exception:
+                metadata["bitlocker_reason"] = "dependency_unavailable"
+                raise BitLockerError("BITLOCKER_UNSUPPORTED",
+                                     "BitLocker requires compatible dissect.fve and dissect.ntfs dependencies") from None
+
+            metadata["bitlocker_reason"] = "metadata_parse_failed"
+            self.view = PartitionView(reader.image, metadata["partition_offset"], metadata["partition_length"])
+            self.bde = BDE(self.view)
+            metadata["bitlocker_has_clear_key"] = bool(self.bde.has_clear_key())
+            if not metadata["bitlocker_has_clear_key"]:
+                metadata["bitlocker_reason"] = "clear_key_missing"
+                raise BitLockerError("BITLOCKER_LOCKED", "BitLocker volume has no image-internal clear key")
+
+            metadata["bitlocker_reason"] = "clear_key_unlock_failed"
+            self.bde.unlock_with_clear_key()
+            metadata["bitlocker_reason"] = "decrypted_stream_open_failed"
+            self.stream = self.bde.open()
+            self.stream.seek(0, io.SEEK_END)
+            self.size = int(self.stream.tell())
+            if self.size <= 0 or self.size > metadata["partition_length"]:
+                raise ImageReadError("Invalid decrypted BitLocker volume size")
+            self.stream.seek(0)
+            metadata["bitlocker_reason"] = "ntfs_open_failed"
+            self.ntfs = NTFS(self.stream)
+            self.filesystem = DissectForensicFilesystem(reader, self.ntfs, metadata, self)
+            metadata.update(bitlocker_reason="clear_key_unlocked", bitlocker_unlock_method="clear_key")
+        except BitLockerError:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            raise BitLockerError("BITLOCKER_OPEN_ERROR",
+                                 "BitLocker clear-key volume could not be opened; see bitlocker_reason") from None
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        stream, self.stream = self.stream, None
+        self.filesystem = self.ntfs = self.bde = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if self.view is not None:
+            self.view.close()
+            self.view = None
+
+
 class ForensicImageReader:
-    """Read-only RAW -> pytsk3 / EWF -> pyewf -> pytsk3 adapter.
+    """Read-only RAW/split-RAW -> pytsk3 / EWF -> pyewf -> pytsk3 adapter.
+
+    Split RAW images are accepted as ``name.001, name.002, ...``.  Only the
+    first ``.001`` segment is supplied by the caller; following segments are
+    discovered in the same directory and exposed to pytsk3 as one continuous
+    read-only image.  No temporary merged DD is created.
 
     No OS mount, filesystem repair, raw MFT decoder, or write API is used.
     Imports are lazy so --help and the original --profile mode stay usable.
@@ -3921,25 +7287,93 @@ class ForensicImageReader:
         self.image_type = None
         self.segments = []
         self.tsk = self.image = self.ewf = None
+        self.raw_handles = []
         self.size = 0
         self.initial_stats = {}
+        self._bitlocker_volumes = []
+
+    @staticmethod
+    def _split_raw_match(path):
+        return SPLIT_RAW_RE.fullmatch(Path(path).name)
+
+    def _discover_split_raw_segments(self):
+        """Return a validated contiguous ``.001/.002/...`` RAW segment set."""
+        match = self._split_raw_match(self.path)
+        if not match:
+            raise ImageReadError("Split RAW input does not use a numeric .001 segment name")
+        if int(match.group("num")) != 1:
+            raise ImageReadError("Split RAW input must start with the first .001 segment")
+
+        parent = self.path.parent
+        stem = match.group("stem")
+        found = {}
+        try:
+            entries = list(parent.iterdir())
+        except OSError as exc:
+            raise ImageReadError("Unable to enumerate split RAW segment directory: " + error_text(exc)) from exc
+
+        for entry in entries:
+            candidate = SPLIT_RAW_RE.fullmatch(entry.name)
+            if not candidate or candidate.group("stem").casefold() != stem.casefold():
+                continue
+            number = int(candidate.group("num"))
+            if number < 1:
+                continue
+            if number in found:
+                raise ImageReadError(f"Duplicate split RAW segment number .{number:03d}")
+            found[number] = entry.absolute()
+
+        if 1 not in found:
+            raise ImageReadError("Split RAW first segment .001 was not found")
+        highest = max(found)
+        missing = [number for number in range(1, highest + 1) if number not in found]
+        if missing:
+            rendered = ", ".join(f".{number:03d}" for number in missing[:20])
+            if len(missing) > 20:
+                rendered += f", ... (+{len(missing) - 20} more)"
+            raise ImageReadError("Split RAW segment sequence has a gap; missing: " + rendered)
+
+        segments = [found[number] for number in range(1, highest + 1)]
+        for segment in segments:
+            try:
+                info = segment.stat()
+            except OSError as exc:
+                raise ImageReadError("Unable to stat split RAW segment: " + str(segment) + ": " + error_text(exc)) from exc
+            if not within(segment, parent) or is_link(segment) or not stat.S_ISREG(info.st_mode):
+                raise ImageReadError("Invalid or linked split RAW segment: " + str(segment))
+            if info.st_size <= 0:
+                raise ImageReadError("Split RAW segment is empty: " + str(segment))
+        return segments
 
     def identify(self):
         info = self.path.stat()
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Image input must be a regular file")
-        if self.path.suffix.lower() not in IMAGE_SUFFIXES:
-            raise ValueError("Unsupported image extension; use .dd, .img, .raw, or the first .E01 segment")
-        with self.path.open("rb") as stream:
-            signature = stream.read(16)
-        if signature.startswith((b"EVF\x09\x0d\x0a\xff\x00", b"EVF2\x0d\x0a\x81\x00")):
-            self.image_type = "EWF"
-        elif self.path.suffix.lower() == ".e01":
-            raise ValueError(".E01 input has no supported physical EWF signature")
-        else:
-            self.image_type = "RAW"
         if not info.st_size:
             raise ValueError("Image file is empty")
+
+        # Inspect the physical header before relying on the filename.  This keeps
+        # genuine EWF data from being silently treated as RAW solely by extension.
+        with self.path.open("rb") as stream:
+            signature = stream.read(16)
+        suffix = self.path.suffix.lower()
+        split_match = self._split_raw_match(self.path)
+        is_ewf = signature.startswith((b"EVF\x09\x0d\x0a\xff\x00", b"EVF2\x0d\x0a\x81\x00"))
+
+        if is_ewf:
+            if suffix != ".e01":
+                raise ValueError("EWF signature detected; supply the first .E01 segment")
+            self.image_type = "EWF"
+        elif suffix == ".e01":
+            raise ValueError(".E01 input has no supported physical EWF signature")
+        elif split_match:
+            if int(split_match.group("num")) != 1:
+                raise ValueError("Split RAW input must start with the first .001 segment")
+            self.image_type = "SPLIT_RAW"
+        elif suffix in {".dd", ".img", ".raw"}:
+            self.image_type = "RAW"
+        else:
+            raise ValueError("Unsupported image extension; use .dd, .img, .raw, first .001 split-RAW segment, or first .E01 segment")
         return self.image_type
 
     def __enter__(self):
@@ -3980,6 +7414,77 @@ class ForensicImageReader:
                         return None
 
                 self.image = EwfImage()
+            elif self.image_type == "SPLIT_RAW":
+                self.segments = self._discover_split_raw_segments()
+                sizes = [int(segment.stat().st_size) for segment in self.segments]
+                starts = []
+                total = 0
+                for size in sizes:
+                    starts.append(total)
+                    total += size
+
+                self.raw_handles = []
+                try:
+                    for segment in self.segments:
+                        self.raw_handles.append(segment.open("rb"))
+                except Exception:
+                    for handle in self.raw_handles:
+                        try:
+                            handle.close()
+                        except Exception:
+                            pass
+                    self.raw_handles = []
+                    raise
+
+                handles, tsk = self.raw_handles, self.tsk
+
+                class SplitRawImage(tsk.Img_Info):
+                    def __init__(self):
+                        super().__init__(url="", type=tsk.TSK_IMG_TYPE_EXTERNAL)
+
+                    def read(self, offset, size):
+                        offset, size = int(offset), int(size)
+                        if offset < 0 or size < 0:
+                            raise ImageReadError("Negative split RAW read offset/size")
+                        if size == 0 or offset >= total:
+                            return b""
+                        end = min(total, offset + size)
+                        index = bisect.bisect_right(starts, offset) - 1
+                        if index < 0:
+                            index = 0
+                        position = offset
+                        output = bytearray()
+                        while position < end and index < len(handles):
+                            local_offset = position - starts[index]
+                            available = sizes[index] - local_offset
+                            if available <= 0:
+                                index += 1
+                                continue
+                            wanted = min(end - position, available)
+                            handles[index].seek(local_offset)
+                            block = handles[index].read(wanted)
+                            if len(block) != wanted:
+                                raise ImageReadError(
+                                    f"Short read in split RAW segment {self_path(index)}: "
+                                    f"wanted {wanted}, got {len(block)}"
+                                )
+                            output.extend(block)
+                            position += len(block)
+                            index += 1
+                        return bytes(output)
+
+                    def get_size(self):
+                        return total
+
+                    def close(self):
+                        # The outer ForensicImageReader owns the segment handles.
+                        return None
+
+                segment_paths = self.segments
+                def self_path(index):
+                    return str(segment_paths[index]) if 0 <= index < len(segment_paths) else "?"
+
+                self.image = SplitRawImage()
             else:
                 self.segments = [self.path]
                 self.image = self.tsk.Img_Info(str(self.path), type=self.tsk.TSK_IMG_TYPE_RAW)
@@ -3994,6 +7499,9 @@ class ForensicImageReader:
         return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.segments}
 
     def close(self):
+        volumes, self._bitlocker_volumes = self._bitlocker_volumes, []
+        for volume in reversed(volumes):
+            volume.close()
         try:
             if self.image is not None:
                 self.image.close()
@@ -4002,6 +7510,12 @@ class ForensicImageReader:
             if self.ewf is not None:
                 handle, self.ewf = self.ewf, None
                 handle.close()
+            handles, self.raw_handles = self.raw_handles, []
+            for handle in handles:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
@@ -4040,20 +7554,31 @@ class ForensicImageReader:
                 yield metadata, None, "Partition extends beyond available image bytes"
                 continue
             try:
-                fs = self.tsk.FS_Info(self.image, offset=offset)
+                boot = self.image.read(offset, min(512, length))
+                metadata["bitlocker_status"] = "NOT_ENCRYPTED"
+                fs_image, fs_offset = self.image, offset
+                if DissectBitLockerVolume.has_signature(boot):
+                    metadata["filesystem_type"] = "BitLocker_locked"
+                    # legacy compatibility field; external BitLocker credentials are no longer supported
+                    metadata["bitlocker_key_supplied"] = False
+                    decrypted = DissectBitLockerVolume(self, metadata)
+                    self._bitlocker_volumes.append(decrypted)
+                    metadata.update(bitlocker_status="BITLOCKER_UNLOCKED", bitlocker_read_only=True,
+                                    decrypted_volume_size=decrypted.size)
+                    metadata.update(filesystem_type="NTFS")
+                    yield metadata, decrypted.filesystem, None
+                    continue
+                fs = self.tsk.FS_Info(fs_image, offset=fs_offset)
                 ftype = int(fs.info.ftype)
                 is_ntfs = bool(ftype & self.tsk.TSK_FS_TYPE_NTFS_DETECT)
                 metadata.update(filesystem_type="NTFS" if is_ntfs else "non_NTFS:" + str(ftype),
                                 filesystem_type_code=ftype)
                 yield metadata, ForensicFilesystem(self, fs, metadata) if is_ntfs else None, None
+            except BitLockerError as exc:
+                metadata["bitlocker_status"] = exc.status
+                yield metadata, None, str(exc)
             except (OSError, RuntimeError) as exc:
                 metadata["filesystem_type"] = "unrecognized"
-                try:
-                    boot = self.image.read(offset, 16)
-                    if b"-FVE-FS-" in boot:
-                        metadata["filesystem_type"] = "BitLocker_locked"
-                except (OSError, RuntimeError) as read_exc:
-                    metadata["boot_read_error"] = error_text(read_exc)
                 yield metadata, None, error_text(exc)
 
 
@@ -4151,6 +7676,116 @@ class ForensicFilesystem:
                 "filesystem_type": "NTFS", "inode": node["inode"], "sequence": node["sequence"]}
 
 
+class DissectForensicFilesystem(ForensicFilesystem):
+    """Expose allocated Dissect NTFS records through the existing collector interface."""
+
+    def __init__(self, reader, fs, metadata, owner):
+        super().__init__(reader, fs, metadata)
+        from dissect.ntfs.c_ntfs import ATTRIBUTE_TYPE_CODE, FILE_NUMBER_ROOT, FILE_RECORD_SEGMENT_IN_USE
+        self._data_type = ATTRIBUTE_TYPE_CODE.DATA
+        self._standard_type = ATTRIBUTE_TYPE_CODE.STANDARD_INFORMATION
+        self._in_use = FILE_RECORD_SEGMENT_IN_USE
+        self._root_segment = FILE_NUMBER_ROOT
+        self._owner = owner
+
+    def _directory_record(self, path):
+        # Integer MFT lookup cannot follow a symlink/junction. Non-root paths are
+        # resolved by the inherited component-wise, case-insensitive lookup.
+        if path == "/":
+            record = self.fs.mft.get(self._root_segment)
+        else:
+            node = self.lookup(path)
+            if node is None or not node["is_dir"]:
+                raise ImageReadError("Image directory not found")
+            record = node["_record"]
+        if record.is_reparse_point():
+            raise ImageReadError("Reparse point is not followed")
+        return record
+
+    def listdir(self, path):
+        path = str(PurePosixPath(path))
+        parts = PurePosixPath(path).parts
+        if not parts or parts[0] != "/" or ".." in parts:
+            raise ValueError("Image filesystem path must be absolute without traversal")
+        if path in self._directories:
+            return self._directories[path]
+        try:
+            record = self._directory_record(path)
+            nodes = []
+            # Keep directory-index names: dereference=True expands record-wide
+            # hard-link names, which can belong to a different parent directory.
+            for name, entry in record.listdir(dereference=False, ignore_dos=True).items():
+                if name in (".", ".."):
+                    continue
+                name = self._name(name)
+                if not name or any(c in name for c in ("/", "\\", "\x00")):
+                    raise ImageReadError("Invalid image directory entry name")
+                child = entry.dereference()
+                if not child.header.Flags & self._in_use:
+                    continue
+                if entry.header.FileReference.SequenceNumber != child.header.SequenceNumber:
+                    continue
+                standard = child.attributes[self._standard_type]
+                if len(standard) != 1:
+                    raise ImageReadError("Missing or ambiguous NTFS standard information")
+                is_dir = child.is_dir()
+                nodes.append({"path": str(PurePosixPath(path) / name), "name": name,
+                              "inode": int(child.segment), "sequence": int(child.header.SequenceNumber),
+                              "size": 0 if is_dir or not child.has_stream() else child.size(),
+                              "is_dir": is_dir, "is_file": child.is_file(),
+                              "created_ns": standard.creation_time_ns,
+                              "modified_ns": standard.last_modification_time_ns,
+                              "metadata_changed_ns": standard.last_change_time_ns,
+                              "_record": child})
+            self._directories[path] = sorted(nodes, key=lambda n: n["name"].casefold())
+            return self._directories[path]
+        except (ImageReadError, ValueError):
+            raise
+        except Exception:
+            raise ImageReadError("Unable to enumerate Dissect NTFS directory") from None
+
+    def is_reparse(self, node):
+        if "inode" not in node:
+            return False
+        try:
+            return node["_record"].is_reparse_point()
+        except Exception:
+            raise ImageReadError("Unable to inspect NTFS reparse attribute") from None
+
+    def streams(self, node):
+        try:
+            record = node["_record"]
+            streams, seen = [], set()
+            for attr in record.attributes[self._data_type]:
+                name = attr.name
+                if name in seen:
+                    continue  # One logical stream can span multiple DATA attributes.
+                seen.add(name)
+                streams.append({"name": name, "type": int(self._data_type.value),
+                                "id": int(attr.header.header.Instance), "size": record.size(name=name)})
+            return streams
+        except Exception:
+            raise ImageReadError("Unable to enumerate NTFS DATA streams") from None
+
+    def chunks(self, node, stream=None):
+        size = stream["size"] if stream else node["size"]
+        try:
+            record = node["_record"]
+            with record.open(name=stream["name"]) if stream else record.open() as source:
+                offset = 0
+                while offset < size:
+                    amount = min(CHUNK, size - offset)
+                    data = source.read(amount)
+                    if len(data) != amount:
+                        raise ImageReadError("Short/invalid NTFS stream read at file offset " + str(offset))
+                    yield data
+                    offset += len(data)
+        except ImageReadError:
+            raise
+        except Exception:
+            raise ImageReadError("Unable to read NTFS DATA stream") from None
+
+
 class ImageArtifactCollector:
     """Extract only parser artifacts and lazily requested downloads to owned scratch."""
 
@@ -4158,7 +7793,7 @@ class ImageArtifactCollector:
              "Network/Cookies": "cookies", "Network/Cookies-wal": "cookies", "Network/Cookies-shm": "cookies",
              "Network/Cookies-journal": "cookies", "Preferences": "preferences", "Secure Preferences": "secure_preferences"}
     TREES = {"Sessions": "sessions", "Cache/Cache_Data": "cache", "Local Storage/leveldb": "local_storage",
-             "Session Storage": "session_storage", "IndexedDB": "indexeddb"}
+             "Session Storage": "session_storage", "IndexedDB": "indexeddb", "Service Worker": "service_worker"}
 
     def __init__(self, owner, fs, filesystems, context, profile_node, scratch):
         self.owner, self.fs, self.filesystems, self.context = owner, fs, filesystems, context
@@ -4374,6 +8009,7 @@ class ImageProfileParser(GeminiParser):
     def __init__(self, collector, **options):
         super().__init__(collector.profile, evidence_root=collector.volume, image_mode=False, **options)
         self.collector = collector
+        self._staged_from_forensic_image = True
 
     def resolve_download_path(self, target_path, current_path=None):
         return self.collector.resolve_download(target_path, current_path)
@@ -4534,8 +8170,9 @@ class GeminiImageParser(GeminiParser):
                     row["status"] = "parse_error" if row["status"] == "artifact_not_found" else "partial"
                     if row["evidence_level"] == "direct":
                         row["evidence_level"] = "support"
-                if row["detail"].get("drive_letter_mapping") and row["evidence_level"] == "direct":
-                    row["evidence_level"] = "support"
+                # An unknown original drive letter is a path/provenance limitation, not
+                # evidence that the user action itself is weaker.  Preserve direct evidence
+                # when History + target file + hash/size checks establish the download.
                 row.update(collector.rewrite(row))
                 row["source_path"] = str(self.image_path)
                 row["detail"].update(context)
@@ -4628,9 +8265,15 @@ class GeminiImageParser(GeminiParser):
                 self._source_files.update(str(p).casefold() for p in reader.segments)
                 self._image_record("Image opened read-only", detail={"record_type": "image_status", "image_size": reader.size,
                                    "image_segments": [str(p) for p in reader.segments],
-                                   "reader_pipeline": "pyewf -> pytsk3" if self.image_type == "EWF" else "pytsk3"})
+                                   "reader_pipeline": ("pyewf -> pytsk3" if self.image_type == "EWF" else
+                                                       "split-raw -> pytsk3" if self.image_type == "SPLIT_RAW" else "pytsk3")})
                 filesystems = []
                 for metadata, fs, error in reader.filesystems():
+                    bitlocker_status = metadata.get("bitlocker_status", "NOT_ENCRYPTED")
+                    if bitlocker_status != "NOT_ENCRYPTED":
+                        self._say(f"[BitLocker] partition offset {metadata['partition_offset']}: {bitlocker_status}")
+                        if error:
+                            self._say("[BitLocker] " + error)
                     self._image_record("Partition/filesystem probe", self._context(**metadata),
                                        status="success" if fs else "unsupported",
                                        error=error, detail={"record_type": "partition_status", **metadata})
@@ -4680,6 +8323,534 @@ class GeminiImageParser(GeminiParser):
         return self.results
 
 
+class LiveArtifactCollector:
+    """Read-only, non-atomic filesystem acquisition; no Gemini interpretation.
+
+    Use as a context manager. Only verified stable copies are published to the
+    profile parser. SQLite main/WAL/SHM/journal are acquired as one group.
+    """
+
+    PROFILE_MARKERS = ("History", "Preferences", "Network/Cookies", "Sessions",
+                       "Local Storage", "IndexedDB", "Session Storage", "Service Worker")
+    TREES = {"Sessions": "sessions", "Cache/Cache_Data": "cache",
+             "Local Storage/leveldb": "local_storage", "Session Storage": "session_storage",
+             "IndexedDB": "indexeddb", "Service Worker": "service_worker"}
+    CHROME_PARTS = ("AppData", "Local", "Google", "Chrome", "User Data")
+
+    class Changed(OSError):
+        pass
+
+    class Unsafe(OSError):
+        pass
+
+    def __init__(self, source_path, *, evidence_root=None, temp_root=None, copy_attempts=2):
+        self.source = Path(os.path.abspath(Path(source_path).expanduser()))
+        self.evidence_root = Path(os.path.abspath(Path(evidence_root).expanduser())) if evidence_root else None
+        self.temp_root = Path(temp_root).expanduser().absolute() if temp_root else None
+        if not isinstance(copy_attempts, int) or not 1 <= copy_attempts <= 3:
+            raise ValueError("copy_attempts must be between 1 and 3")
+        self.copy_attempts = copy_attempts
+        self.profiles, self.events, self.manifest, self.aliases = [], [], {}, {}
+        self.zone_cache = {}
+        self.scratch = self.volume = self._temporary = None
+
+    @staticmethod
+    def _signature(info):
+        return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino)
+
+    @staticmethod
+    def _identity_signature(info):
+        # Windows path stat and fd fstat can expose different ctime semantics.
+        # Keep ctime in _signature for all same-API snapshot comparisons.
+        return (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)
+
+    @classmethod
+    def _safe_stat(cls, path):
+        # lstat every ancestor: Python 3.10 also rejects Windows junctions and
+        # other reparse points, without relying on Path.is_junction (3.12+).
+        path = Path(path).absolute()
+        for item in (*reversed(path.parents), path):
+            info = item.lstat()
+            if (stat.S_ISLNK(info.st_mode) or
+                    getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise cls.Unsafe("Linked or reparse path skipped")
+            if item != path and not stat.S_ISDIR(info.st_mode):
+                raise cls.Unsafe("Non-directory path component skipped")
+        return info
+
+    @staticmethod
+    def _failure_state(exc):
+        if isinstance(exc, LiveArtifactCollector.Changed):
+            return "changed_during_copy"
+        if isinstance(exc, LiveArtifactCollector.Unsafe):
+            return "unsafe_path"
+        if getattr(exc, "winerror", None) in (32, 33):
+            return "locked"
+        if isinstance(exc, PermissionError):
+            return "permission_denied"
+        if isinstance(exc, FileNotFoundError):
+            return "not_found"
+        return "copy_error"
+
+    def _event(self, path, key, state, *, profile=None, **detail):
+        self.events.append({"record_type": "acquisition_status", "artifact_key": key,
+                            "acquisition_state": state, "source_path": str(path),
+                            "profile_source": str(profile) if profile else None, **detail})
+
+    def _directory(self, path, key="discovery", profile=None):
+        try:
+            info = self._safe_stat(path)
+            if not stat.S_ISDIR(info.st_mode):
+                raise self.Unsafe("Expected an ordinary directory")
+            return True
+        except OSError as exc:
+            self._event(path, key, self._failure_state(exc), profile=profile)
+            return False
+
+    def _entries(self, path, key="discovery", profile=None):
+        if not self._directory(path, key, profile):
+            return []
+        try:
+            return sorted(Path(path).iterdir(), key=lambda p: (p.name.casefold(), p.name))
+        except OSError as exc:
+            self._event(path, key, self._failure_state(exc), profile=profile)
+            return []
+
+    def _profile_candidate(self, path):
+        if not (path.name.casefold() == "default" or re.fullmatch(r"Profile [0-9]+", path.name, re.I)):
+            return False
+        if not self._directory(path):
+            return False
+        for relative in self.PROFILE_MARKERS:
+            try:
+                info = self._safe_stat(path / relative)
+                is_file = relative in {"History", "Preferences", "Network/Cookies"}
+                if stat.S_ISREG(info.st_mode) if is_file else stat.S_ISDIR(info.st_mode):
+                    return True
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self._event(path / relative, "discovery", self._failure_state(exc), profile=path)
+        return False
+
+    def _user_for_data(self, data):
+        if len(data.parts) >= 6 and tuple(p.casefold() for p in data.parts[-5:]) == tuple(p.casefold() for p in self.CHROME_PARTS):
+            return data.parents[4]
+        return None
+
+    def _add_profiles(self, data, user):
+        for candidate in self._entries(data):
+            if self._profile_candidate(candidate):
+                self.profiles.append({"source": candidate, "user": user})
+        if not any(p["source"].parent == data for p in self.profiles):
+            self._event(data, "discovery", "not_found", reason="no_chrome_profiles")
+
+    def discover(self):
+        """Recognize a volume/Users/user/User Data/conventional profile only."""
+        self.profiles = []
+        if not self._directory(self.source):
+            return []
+        if self.evidence_root and not self._directory(self.evidence_root):
+            self.evidence_root = None
+        if self._profile_candidate(self.source):
+            data = self.source.parent
+            user = self._user_for_data(data)
+            self.profiles.append({"source": self.source, "user": user})
+        elif self.source.name.casefold() == "user data":
+            user = self._user_for_data(self.source)
+            self._add_profiles(self.source, user)
+        else:
+            user = None
+            users = self.source if self.source.name.casefold() == "users" else self.source / "Users"
+            try:
+                info = self._safe_stat(users)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise self.Unsafe("Users is not a directory")
+            except FileNotFoundError:
+                # A user with no Chrome profile is a valid empty acquisition.
+                user = self.source
+                self._add_profiles(user.joinpath(*self.CHROME_PARTS), user)
+            except OSError as exc:
+                self._event(users, "discovery", self._failure_state(exc))
+            else:
+                self.evidence_root = self.evidence_root or users.parent
+                for candidate in self._entries(users):
+                    try:
+                        if not stat.S_ISDIR(self._safe_stat(candidate).st_mode):
+                            continue
+                        self._add_profiles(candidate.joinpath(*self.CHROME_PARTS), candidate)
+                    except OSError as exc:
+                        self._event(candidate, "discovery", self._failure_state(exc))
+        if not self.evidence_root:
+            known_user = user if user else (self.profiles[0]["user"] if self.profiles else None)
+            if known_user and known_user.parent.name.casefold() == "users":
+                self.evidence_root = known_user.parent.parent
+        for spec in self.profiles:
+            spec["context"] = {"windows_user": spec["user"].name if spec["user"] else None,
+                               "chrome_profile": spec["source"].name,
+                               "source_profile": str(spec["source"]), "acquisition_mode": "filesystem",
+                               "source_snapshot": "non_atomic_filesystem_copy", "staged_copy": True}
+        return self.profiles
+
+    def __enter__(self):
+        self.discover()
+        base = self.temp_root or Path(tempfile.gettempdir())
+        self._safe_stat(base)
+        protected = [p["source"].parent for p in self.profiles]
+        protected += [p["user"] / "Downloads" for p in self.profiles if p["user"]]
+        if self.evidence_root:
+            protected.append(self.evidence_root / "$Recycle.Bin")
+        if any(within(base, path) for path in protected):
+            raise ValueError("Temporary workspace must be outside Chrome, Downloads and Recycle Bin sources")
+        self._temporary = tempfile.TemporaryDirectory(prefix="gemini_filesystem_", dir=base)
+        self.scratch = Path(self._temporary.name)
+        self.volume = self.scratch / "volume"
+        try:
+            self.volume.mkdir(mode=0o700)
+            if self.evidence_root:
+                self.aliases[str(self.volume)] = str(self.evidence_root)
+            for index, spec in enumerate(self.profiles):
+                spec["staged"] = self.scratch / ("profile_" + str(index))
+                spec["staged"].mkdir(mode=0o700)
+                self.aliases[str(spec["staged"])] = str(spec["source"])
+        except BaseException:
+            self._temporary.cleanup()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._temporary is not None:
+            try:
+                self._temporary.cleanup()
+            except OSError:
+                self._event(self.source, "cleanup", "copy_error", reason="private_workspace_cleanup_failed")
+            finally:
+                self._temporary = None
+
+    def _copy_one(self, source, destination, before):
+        """Bounded read from a verified descriptor; never open source for write."""
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or self._identity_signature(opened) != self._identity_signature(before):
+                raise self.Changed("Source replaced before copy")
+            if self._signature(self._safe_stat(source)) != self._signature(before):
+                raise self.Changed("Source changed before copy")
+            with destination.open("xb") as output:
+                remaining = before.st_size
+                while remaining:
+                    block = stream.read(min(CHUNK, remaining))
+                    if not block:
+                        raise self.Changed("Source shortened during copy")
+                    output.write(block)
+                    digest.update(block)
+                    remaining -= len(block)
+                if stream.read(1) or self._signature(os.fstat(stream.fileno())) != self._signature(opened):
+                    raise self.Changed("Source changed during copy")
+        return digest.hexdigest()
+
+    def _group(self, pairs, key, profile=None, *, sqlite_group=False):
+        """Publish a whole stable group; discard incomplete/unstable attempts."""
+        last_state, failure_path, snapshots = "copy_error", pairs[0][0], {}
+        for attempt in range(self.copy_attempts):
+            copied = []
+            try:
+                before = {}
+                for source, destination in pairs:
+                    failure_path = source
+                    try:
+                        info = self._safe_stat(source)
+                        if not stat.S_ISREG(info.st_mode):
+                            raise self.Unsafe("Expected an ordinary file")
+                        before[source] = info
+                    except FileNotFoundError:
+                        before[source] = None
+                snapshots = {str(p): ({"size": s.st_size, "mtime_ns": s.st_mtime_ns} if s else None)
+                             for p, s in before.items()}
+                if before[pairs[0][0]] is None:
+                    state = "changed_during_copy" if last_state == "changed_during_copy" else "not_found"
+                    self._event(pairs[0][0], key, state, profile=profile,
+                                sqlite_group=sqlite_group, members=snapshots,
+                                attempts=attempt + 1, passed_to_parser=False)
+                    return False
+                with tempfile.TemporaryDirectory(prefix="attempt_", dir=self.scratch) as work:
+                    for index, (source, destination) in enumerate(pairs):
+                        failure_path = source
+                        info = before[source]
+                        if info is None:
+                            continue
+                        metadata = GeminiParser._file_metadata(source)
+                        temporary = Path(work) / str(index)
+                        digest = self._copy_one(source, temporary, info)
+                        copied.append((source, destination, temporary, info, digest, metadata))
+                    for source, _ in pairs:
+                        failure_path = source
+                        try:
+                            after = self._safe_stat(source)
+                        except FileNotFoundError:
+                            after = None
+                        prior = before[source]
+                        if (prior is None) != (after is None) or (prior and self._signature(prior) != self._signature(after)):
+                            raise self.Changed("Acquisition group changed during copy")
+                    for source, destination, temporary, info, digest, metadata in copied:
+                        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        os.utime(temporary, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        os.replace(temporary, destination)
+                        self.aliases[str(destination)] = str(source)
+                        self.manifest[str(destination)] = {"source": str(source), "sha256": digest,
+                            "metadata": metadata, "signature": self._signature(info), "artifact_key": key}
+                self._event(pairs[0][0], key, "copied", profile=profile, attempts=attempt + 1,
+                            sqlite_group=sqlite_group, members=snapshots, stable=True,
+                            absent_sidecars=[str(p) for p, s in before.items() if s is None])
+                return True
+            except OSError as exc:
+                last_state = self._failure_state(exc)
+                if isinstance(exc, FileNotFoundError) and before.get(failure_path) is not None:
+                    last_state = "changed_during_copy"
+                # No incomplete attempt is passed to the artifact engine.
+                for _, destination, *_ in copied:
+                    if str(destination) in self.manifest:
+                        destination.unlink(missing_ok=True)
+                        self.manifest.pop(str(destination), None)
+                        self.aliases.pop(str(destination), None)
+                if last_state not in {"changed_during_copy", "not_found"}:
+                    break
+        self._event(pairs[0][0], key, last_state, profile=profile, attempts=attempt + 1,
+                    sqlite_group=sqlite_group, members=snapshots, failed_source=str(failure_path),
+                    stable=False, passed_to_parser=False)
+        return False
+
+    def _tree(self, source, destination, key, profile=None, predicate=None):
+        if not self._directory(source, key, profile):
+            return
+        pending = [(source, destination)]
+        while pending:
+            folder, target = pending.pop()
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.aliases[str(target)] = str(folder)
+            for entry in self._entries(folder, key, profile):
+                try:
+                    info = self._safe_stat(entry)
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append((entry, target / entry.name))
+                    elif stat.S_ISREG(info.st_mode) and (predicate is None or predicate(entry.name)):
+                        self._group([(entry, target / entry.name)], key, profile)
+                    elif not stat.S_ISREG(info.st_mode):
+                        self._event(entry, key, "unsafe_path", profile=profile, reason="non_regular_file")
+                except OSError as exc:
+                    self._event(entry, key, self._failure_state(exc), profile=profile)
+
+    def collect_profile(self, spec):
+        source, target = spec["source"], spec["staged"]
+        for relative, key in (("History", "history"), ("Network/Cookies", "cookies")):
+            pairs = [(source / (relative + suffix), target / (relative + suffix))
+                     for suffix in ("", "-wal", "-shm", "-journal")]
+            self._group(pairs, key, source, sqlite_group=True)
+        for relative, key in (("Preferences", "preferences"), ("Secure Preferences", "secure_preferences")):
+            self._group([(source / relative, target / relative)], key, source)
+        for relative, key in self.TREES.items():
+            predicate = (lambda n: n.startswith(("Session_", "Tabs_"))) if key == "sessions" else None
+            self._tree(source / relative, target / relative, key, source, predicate)
+
+    def collect_recycle(self):
+        if self.evidence_root:
+            self._tree(self.evidence_root / "$Recycle.Bin", self.volume / "$Recycle.Bin",
+                       "recycle_bin", predicate=lambda n: n.startswith("$I"))
+        else:
+            self._event(self.source, "recycle_bin", "not_found", reason="volume_root_unknown")
+
+    def original_path(self, value):
+        text = str(value)
+        for prefix in sorted(self.aliases, key=len, reverse=True):
+            if text == prefix or text.startswith(prefix + os.sep) or text.startswith(prefix + ":"):
+                return self.aliases[prefix] + text[len(prefix):]
+        return text
+
+    def rewrite(self, value):
+        if isinstance(value, dict):
+            return {k: self.rewrite(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.rewrite(v) for v in value]
+        if isinstance(value, Path):
+            value = str(value)
+        if isinstance(value, str):
+            for prefix in sorted(self.aliases, key=len, reverse=True):
+                value = value.replace(prefix, self.aliases[prefix])
+            if self.scratch:
+                value = value.replace(str(self.scratch), "[private acquisition workspace]")
+        return value
+
+    def payload_exists(self, local):
+        source = Path(self.original_path(local))
+        try:
+            return stat.S_ISREG(self._safe_stat(source).st_mode)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            self._event(source, "recycle_bin", self._failure_state(exc), reason="payload_presence_only")
+            return None
+
+    def resolve_download(self, spec, target_path, current_path):
+        # Reuse the existing strict path mapping and attribution engine. Supplying
+        # a root disables fallback to arbitrary files on the analyst's machine.
+        resolver = GeminiParser(spec["source"], image_mode=False,
+                                user_root=spec["user"] if not self.evidence_root else None,
+                                evidence_root=self.evidence_root or (spec["source"] if not spec["user"] else None))
+        result = resolver.resolve_download_path(target_path, current_path)
+        if not result.get("resolved_path"):
+            return result
+        original = Path(result["resolved_path"])
+        token = hashlib.sha256(str(original).encode("utf-8")).hexdigest()
+        local = self.scratch / "downloads" / token / original.name
+        # Reuse a stable acquisition made earlier in this run; do not read the
+        # source again merely because another profile references the same file.
+        if str(local) not in self.manifest and not self._group([(original, local)], "downloaded_file", spec["source"]):
+            return {**result, "file_exists": None, "resolved_path": None,
+                    "resolution_error": "Referenced download could not be safely staged"}
+        return {**result, "resolved_path": str(local)}
+
+    def zone(self, local):
+        if str(local) not in self.zone_cache:
+            manifest = self.manifest[str(local)]
+            source = Path(manifest["source"])
+            try:
+                if self._signature(self._safe_stat(source)) != manifest["signature"]:
+                    raise self.Changed("Download changed before ADS inspection")
+                result = GeminiParser._read_zone(source)
+                if self._signature(self._safe_stat(source)) != manifest["signature"]:
+                    raise self.Changed("Download changed during ADS inspection")
+            except OSError as exc:
+                self._event(source, "downloaded_file", self._failure_state(exc), reason="zone_inspection")
+                result = {"status": "partial", "values": {}, "error": "Source changed or was inaccessible during Zone.Identifier inspection"}
+            self.zone_cache[str(local)] = result
+        return self.zone_cache[str(local)]
+
+
+class FilesystemProfileParser(GeminiParser):
+    """Only acquisition hooks differ; all artifact/semantic routines are inherited."""
+
+    def __init__(self, collector, spec, **options):
+        super().__init__(spec["staged"], image_mode=False, **options)
+        self.collector, self.spec = collector, spec
+
+    def _emit(self, key, observation, **kwargs):
+        # Establish original, stable scope before title correlation, message IDs
+        # or summaries are derived. No parser routine reopens row.source_path.
+        kwargs = self.collector.rewrite(kwargs)
+        kwargs["detail"] = {**(kwargs.get("detail") or {}), **self.spec["context"]}
+        if key == "recycle_bin" and kwargs["detail"].get("payload_path"):
+            kwargs["detail"]["payload_exists"] = self.collector.payload_exists(kwargs["detail"]["payload_path"])
+            kwargs["detail"]["payload_extracted"] = False
+        return super()._emit(key, self.collector.rewrite(observation), **kwargs)
+
+    def discover_artifacts(self):
+        super().discover_artifacts()
+        for event in self.collector.events:
+            key = event["artifact_key"]
+            if event.get("profile_source") != str(self.spec["source"]) or key not in self.artifact_status:
+                continue
+            if event["acquisition_state"] not in {"copied", "not_found"} and self.artifact_status[key] == "artifact_not_found":
+                self.artifact_status[key] = "locked_database" if event["acquisition_state"] == "locked" else "parse_error"
+                self._discovery_errors[key] = "Filesystem acquisition incomplete: " + event["acquisition_state"]
+        return self.artifacts.copy()
+
+    def resolve_download_path(self, target_path, current_path=None):
+        return self.collector.resolve_download(self.spec, target_path, current_path)
+
+    def _read_zone(self, path):
+        return self.collector.zone(path)
+
+    def _file_metadata(self, path):
+        return self.collector.manifest[str(path)]["metadata"]
+
+
+class GeminiFilesystemParser(GeminiParser):
+    """Internal directory API. The existing CLI remains unchanged.
+
+    parse() owns acquisition and cleanup. Inherited export methods operate on
+    original-path results after the private staging directory has been removed.
+    """
+
+    def __init__(self, source_path, *, evidence_root=None, temp_root=None, copy_attempts=2, **options):
+        super().__init__(source_path, image_mode=False, evidence_root=evidence_root, **options)
+        self.filesystem_temp_root = temp_root
+        self.copy_attempts = copy_attempts
+        self.profile_summaries = []
+        self.acquisition_manifest = {}
+
+    def parse(self):
+        self.results, self._downloads, self.profile_summaries = [], [], []
+        self._source_files = set()
+        self.artifacts = {}
+        self.acquisition_manifest = {}
+        collector = LiveArtifactCollector(self.profile_path, evidence_root=self.evidence_root,
+                                          temp_root=self.filesystem_temp_root, copy_attempts=self.copy_attempts)
+        try:
+            with collector:
+                self.artifacts["recycle_bin"] = ([str(collector.evidence_root / "$Recycle.Bin")]
+                                                  if collector.evidence_root else [])
+                for spec in collector.profiles:
+                    start = len(collector.events)
+                    try:
+                        collector.collect_profile(spec)
+                        parser = FilesystemProfileParser(collector, spec, **self._artifact_options())
+                        self.results.extend(parser.parse())
+                        self._downloads.extend(parser._downloads)
+                        self._source_files.update(str(Path(r["source_path"]).absolute()).casefold()
+                                                  for r in parser.results if r.get("source_path"))
+                        failures = any(e["acquisition_state"] not in {"copied", "not_found"} for e in collector.events[start:])
+                        row = self._emit("Filesystem Acquisition", "Chrome profile examined from private staging",
+                            path=spec["source"], status="partial" if failures else "success", level="unconfirmed",
+                            detail={"record_type": "profile_status", **spec["context"],
+                                    "artifact_status": parser.artifact_status, "acquisition_incomplete": failures})
+                    except Exception:
+                        row = self._emit("Filesystem Acquisition", "Profile acquisition or analysis failed; other profiles continue",
+                            path=spec["source"], status="partial", level="unconfirmed",
+                            error="Filesystem profile could not be fully analyzed",
+                            detail={"record_type": "profile_status", **spec["context"], "acquisition_incomplete": True})
+                    self.profile_summaries.append(row)
+                # Parse $I metadata once, after all History downloads are known.
+                # Reuse the original recycle parser and semantic rules unchanged.
+                collector.collect_recycle()
+                recycle_spec = {"source": collector.evidence_root or collector.source,
+                                "staged": collector.volume, "user": None,
+                                "context": {"acquisition_mode": "filesystem", "source_snapshot": "non_atomic_filesystem_copy",
+                                            "staged_copy": True, "windows_user": None, "chrome_profile": None}}
+                recycle = FilesystemProfileParser(collector, recycle_spec, **self._artifact_options())
+                root = collector.volume / "$Recycle.Bin"
+                recycle.artifacts = {"recycle_bin": [str(root)] if root.is_dir() else []}
+                recycle._expected = {"recycle_bin": root}
+                recycle._downloads = self._downloads
+                if collector.evidence_root:
+                    recycle._parse_recycle_bin("recycle_bin")
+                    recycle._derive_semantic_actions()
+                    self.results.extend(recycle.results)
+                self.acquisition_manifest = {m["source"]: {k: v for k, v in m.items() if k != "source"}
+                                             for m in collector.manifest.values()}
+                self._source_files.update(str(Path(p).absolute()).casefold() for p in self.acquisition_manifest)
+        except (OSError, ValueError):
+            self._emit("Filesystem Acquisition", "Filesystem acquisition could not be completed",
+                       path=self.profile_path, status="partial", level="unconfirmed",
+                       detail={"record_type": "acquisition_status", "acquisition_state": "copy_error"})
+        finally:
+            for event in collector.events:
+                state = event["acquisition_state"]
+                status = {"copied": "success", "not_found": "artifact_not_found", "locked": "locked_database"}.get(state, "partial")
+                self._emit(self.ARTIFACTS.get(event["artifact_key"], "Filesystem Acquisition"),
+                           "Filesystem acquisition status", path=event["source_path"], status=status, level="unconfirmed",
+                           detail={**event, "acquisition_mode": "filesystem", "atomic_snapshot": False})
+            self._emit("Filesystem Acquisition", "Filesystem acquisition is not an atomic snapshot",
+                       path=self.profile_path, level="unconfirmed", status="partial",
+                       detail={"record_type": "acquisition_summary", "acquisition_mode": "filesystem",
+                               "atomic_snapshot": False, "profiles_discovered": len(collector.profiles),
+                               "profiles_examined": len(self.profile_summaries),
+                               "staged_file_count": len(self.acquisition_manifest),
+                               "limitation": "Stable size/mtime checks do not prove an atomic live snapshot; locked or unstable files may be absent from this analysis."})
+        return self.results
+
+
 def nonnegative_int(value):
     number = int(value)
     if number < 0:
@@ -4708,7 +8879,7 @@ def _clean_console_path(value):
 def _prompt_image_path():
     """Interactive image-path prompt used only when no CLI image/profile was supplied."""
     print("\n[입력]")
-    print("분석할 이미지 파일 경로를 입력하세요 (.dd / .img / .raw / .E01)")
+    print("분석할 이미지 파일 경로를 입력하세요 (.dd / .img / .raw / .001 / .E01)")
     print(r"예: C:\Users\me\Desktop\gemini_parser\victim.E01")
     while True:
         raw = _clean_console_path(input("> "))
@@ -4727,7 +8898,7 @@ def _prompt_image_path():
             print("파일 경로가 아닙니다. 다시 입력해 주세요.")
             continue
         if path.suffix.lower() not in IMAGE_SUFFIXES:
-            print("지원하지 않는 형식입니다. .dd, .img, .raw, .E01 중 하나를 입력해 주세요.")
+            print("지원하지 않는 형식입니다. .dd, .img, .raw, 첫 .001, .E01 중 하나를 입력해 주세요.")
             continue
         return str(path)
 
@@ -4771,8 +8942,16 @@ def _apply_interactive_image_input(args):
     return args
 
 
+def analyze_filesystem(source_path, **options):
+    """Parse a directory through private filesystem acquisition and validate output."""
+    parser = GeminiFilesystemParser(source_path, **options)
+    parser.parse()
+    parser.validate_team_contract()
+    return parser
+
+
 def analyze_image(image_path, **options):
-    """Integration-friendly API: parse one DD/RAW/E01 image and validate final output contract.
+    """Integration-friendly API: parse one DD/RAW/split-RAW/E01 image and validate final output contract.
 
     Returns the configured GeminiImageParser instance so a controller can consume:
       parser.results
@@ -4798,12 +8977,13 @@ def analyze_image_with_baseline(image_path, baseline_image_path, **options):
 
 
 def main(argv=None):
-    cli = argparse.ArgumentParser(description="Gemini Web forensic image parser: RAW/DD via pytsk3; E01 via pyewf + pytsk3")
-    cli.add_argument("image", nargs="?", help="Primary input: .dd / .img / .raw / first .E01 segment")
+    cli = argparse.ArgumentParser(description="Gemini Web forensic parser: image input or --folder filesystem acquisition; RAW/DD/split-RAW via pytsk3; E01 via pyewf + pytsk3; BitLocker clear key via dissect.fve + dissect.ntfs")
+    cli.add_argument("image", nargs="?", help="Primary input: .dd / .img / .raw / first .001 split-RAW segment / first .E01 segment")
+    cli.add_argument("--folder", help="Filesystem acquisition input: Chrome User Data (recommended), profile, Windows user, Users or volume root")
     cli.add_argument("--profile", help="Development/debug input: extracted Chrome Profile directory")
     cli.add_argument("--baseline-image", help="Optional BEFORE image for state-difference rules (conversation/history/cache deletion/edit)")
-    cli.add_argument("--user-root", help="Acquired user directory (also accepts a Users/drive evidence tree)")
-    cli.add_argument("--evidence-root", help="Optional acquired volume root for drive-path mapping and $Recycle.Bin")
+    cli.add_argument("--user-root", help="Acquired user directory; --profile development/debug mode only")
+    cli.add_argument("--evidence-root", help="Optional acquired volume root for drive-path mapping and $Recycle.Bin; --profile or --folder mode")
     cli.add_argument("--output", help=r"Result directory. Interactive example: C:\Users\me\Desktop\gemini_parser\result")
     cli.add_argument("--csv", action="store_true", help="Also export team-format timeline.csv and recovered_conversations.csv")
     cli.add_argument("--debug-output", action="store_true",
@@ -4813,12 +8993,22 @@ def main(argv=None):
     cli.add_argument("--max-matches-per-file", type=positive_int, default=200, help="String/image finding cap per file (default: 200 each)")
     cli.add_argument("--max-files", type=nonnegative_int, default=0, help="File cap per binary artifact tree; 0 is unlimited")
     cli.add_argument("--max-json-mib", type=positive_int, default=64, help="Preferences input size cap (default: 64 MiB)")
-    cli.add_argument("--temp-root", help="Parent directory for private image extraction workspaces")
-    cli.add_argument("--keep-temp", action="store_true", help="Retain extracted files for debugging (default: clean up)")
-    cli.add_argument("--max-extracted-mib", type=nonnegative_int, default=0,
-                     help="Extraction byte limit per profile; 0 is unlimited. Incomplete extraction is reported.")
+    cli.add_argument("--temp-root", help="Parent directory for private image or filesystem staging; for --folder it must already exist")
+    cli.add_argument("--keep-temp", action="store_true", help="Image only: retain extracted files for debugging (default: clean up)")
+    cli.add_argument("--max-extracted-mib", type=nonnegative_int, default=None,
+                     help="Image only: extraction byte limit per profile; default/0 is unlimited. Incomplete extraction is reported.")
     args = cli.parse_args(argv)
-    if not args.image and not args.profile:
+    if sum(value is not None for value in (args.image, args.folder, args.profile)) > 1:
+        cli.error("provide one image path OR --folder OR --profile")
+    if args.folder is not None:
+        if not args.folder.strip():
+            cli.error("--folder requires a non-empty directory path")
+        if (args.baseline_image is not None
+                or args.keep_temp or args.max_extracted_mib is not None):
+            cli.error("--baseline-image, --keep-temp and --max-extracted-mib are image-only options; not supported with --folder")
+    if args.user_root is not None and args.profile is None:
+        cli.error("--user-root applies only to --profile mode")
+    if args.image is None and args.folder is None and args.profile is None:
         try:
             args = _apply_interactive_image_input(args)
         except (EOFError, KeyboardInterrupt):
@@ -4826,25 +9016,29 @@ def main(argv=None):
             return 130
     if args.debug_output:
         args.csv = True
-    if args.image and args.profile:
-        cli.error("provide one image path OR --profile")
     if args.baseline_image and not args.image:
         cli.error("--baseline-image is supported only with an image input")
     if args.image and (args.user_root or args.evidence_root):
-        cli.error("--user-root and --evidence-root apply only to --profile mode")
+        cli.error("--user-root applies only to --profile; --evidence-root applies to --profile or --folder")
     options = dict(correlation_seconds=args.correlation_seconds,
                    max_binary_bytes=args.max_binary_mib * 1024 * 1024,
                    max_matches_per_file=args.max_matches_per_file, max_files=args.max_files,
                    max_json_bytes=args.max_json_mib * 1024 * 1024, verbose=True)
-    parser = (GeminiImageParser(args.image, temp_root=args.temp_root, keep_temp=args.keep_temp,
-                               max_extracted_bytes=args.max_extracted_mib * 1024 * 1024, **options)
-              if args.image else GeminiParser(args.profile, args.user_root, evidence_root=args.evidence_root,
-                                              image_mode=False, **options))
+    if args.image:
+        parser = GeminiImageParser(args.image, temp_root=args.temp_root, keep_temp=args.keep_temp,
+                                   max_extracted_bytes=(args.max_extracted_mib or 0) * 1024 * 1024, **options)
+    elif args.folder is not None:
+        parser = GeminiFilesystemParser(args.folder, evidence_root=args.evidence_root,
+                                        temp_root=args.temp_root, **options)
+    else:
+        parser = GeminiParser(args.profile, args.user_root, evidence_root=args.evidence_root,
+                              image_mode=False, **options)
     try:
         if args.image:
             ForensicImageReader(args.image).identify()
         elif not parser.profile_path.is_dir():
-            print("Error: Chrome Profile directory does not exist or is not a directory: " + str(parser.profile_path), file=sys.stderr)
+            label = "Filesystem source" if args.folder is not None else "Chrome Profile"
+            print("Error: " + label + " directory does not exist or is not a directory: " + str(parser.profile_path), file=sys.stderr)
             return 2
         for label, root in (("user-root", parser.user_root), ("evidence-root", parser.evidence_root)):
             if root is not None and not root.is_dir():
@@ -4853,8 +9047,9 @@ def main(argv=None):
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         output = Path(args.output).expanduser().absolute() if args.output else Path.cwd() / ("gemini_output_" + stamp)
         # Fail early for unsafe or existing export destinations.
-        if args.profile and within(output, parser.profile_path):
-            raise ValueError("Output must be outside the evidence Chrome Profile")
+        if (args.profile or args.folder is not None) and within(output, parser.profile_path):
+            raise ValueError("Output must be outside the evidence filesystem source" if args.folder is not None
+                             else "Output must be outside the evidence Chrome Profile")
         planned = ["gemini_results.json"]
         if args.csv:
             planned += ["timeline.csv", "recovered_conversations.csv"]
@@ -4865,13 +9060,13 @@ def main(argv=None):
                 raise FileExistsError("Output already exists; choose a new --output directory: " + str(output / filename))
         print("========================================\nGemini Web Forensic Parser\n========================================")
         print(f"Parser version: {PARSER_VERSION} | Output contract: {OUTPUT_CONTRACT_VERSION}")
-        print(("Image:\n" if args.image else "Profile:\n") + str(parser.profile_path) + "\n", flush=True)
+        print(("Image:\n" if args.image else "Folder:\n" if args.folder is not None else "Profile:\n") + str(parser.profile_path) + "\n", flush=True)
         if args.baseline_image:
             print("Baseline image:\n" + str(Path(args.baseline_image).expanduser().absolute()) + "\n", flush=True)
         results = parser.parse()
         if args.baseline_image:
             baseline = GeminiImageParser(args.baseline_image, temp_root=args.temp_root, keep_temp=args.keep_temp,
-                                         max_extracted_bytes=args.max_extracted_mib * 1024 * 1024, **options)
+                                         max_extracted_bytes=(args.max_extracted_mib or 0) * 1024 * 1024, **options)
             baseline.parse()
             parser.compare_with_baseline(baseline.results)
             results = parser.results
@@ -4895,6 +9090,12 @@ def main(argv=None):
         print(f"Analyst-facing findings: {len(analyst_findings)}")
         print(f"Direct: {levels['direct']}\nSupport: {levels['support']}\nUnconfirmed: {levels['unconfirmed']}")
         print("Team output contract: PASS", contract)
+        qa = parser.qa_summary()
+        if qa.get("artifact_scans"):
+            print("Structured protocol message findings:", qa.get("structured_message_findings", 0))
+            print("Recovered conversation rows:", qa.get("conversation_rows", 0))
+            for item in qa["artifact_scans"]:
+                print("[QA] {artifact}: files={files_read}/{files_examined}, bytes={bytes_read}, protocol_messages={structured_protocol_message_count}, limits={scan_limit_reached_files}/{result_limit_reached_files}, errors={read_error_count}, elapsed={elapsed_sec}s".format(**item))
 
         key_findings = parser.timeline_rows()[:20]
         print("\n[Timeline Preview]")
@@ -4922,6 +9123,12 @@ def main(argv=None):
             outcomes = Counter(r["detail"]["profile_outcome"] for r in parser.profile_summaries)
             print("Profiles:", dict(outcomes))
             if any(r["detail"].get("reason") == "image_open_failed" for r in results):
+                return 2
+            examined = results + (baseline.results if args.baseline_image else [])
+            if any(r["detail"].get("bitlocker_status") in {
+                    "BITLOCKER_LOCKED", "BITLOCKER_UNSUPPORTED",
+                    "BITLOCKER_OPEN_ERROR"} for r in examined):
+                print("BitLocker: one or more partitions could not be unlocked; see partition_status in JSON.", file=sys.stderr)
                 return 2
         # Partial/unsupported raw formats are expected non-fatal analysis outcomes.
         return 0

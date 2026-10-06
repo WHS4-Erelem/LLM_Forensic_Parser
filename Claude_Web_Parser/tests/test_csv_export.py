@@ -25,8 +25,6 @@ from claude_web_forensics.output.csv_export import (
     CONVERSATION_COLUMNS,
     CONVERSATIONS_FILE,
     MODEL_NAME,
-    RECOVERY_COMPLETE,
-    RECOVERY_PARTIAL,
     TIMELINE_COLUMNS,
     TIMELINE_FILE,
     ArtifactPathResolver,
@@ -34,7 +32,6 @@ from claude_web_forensics.output.csv_export import (
     build_conversation_rows,
     build_timeline_rows,
     message_order,
-    recovery_status,
     write_csv,
     write_results,
 )
@@ -66,13 +63,11 @@ def resolver_for(store, letters=None):
 
 
 def event(code="E05-05", verdict=VERDICT_CONFIRMED, refs=(), ts=T, detail="report.pdf",
-          action_id=None) -> FinalEvent:
+          action_id=None, lines=None) -> FinalEvent:
     return FinalEvent(
         action_id=action_id or f"ACT-{code}-{ts}", timestamp=ts, action_code=code,
-        action_label=label_for(code), verdict=verdict, account_uuid="acct",
-        target="t", evidence_artifacts=["History"], detail_refs=list(refs),
-        action_detail=detail, conversation_uuid="conv-1",
-        artifact_details=["[History] 다운로드 상태=COMPLETE", "[Cache] 유형=download_file"],
+        action_label=label_for(code), verdict=verdict, action_detail=detail,
+        evidence=[(ref, (lines or {}).get(ref, "")) for ref in refs], conversation_uuid="conv-1",
     )
 
 
@@ -159,24 +154,37 @@ def test_artifact_path_is_the_logical_image_path_not_the_family_name():
     mft = record("mft", "m1", source_path="/Users/llmtest/Downloads/a.pdf", artifact_path="/$MFT")
     usn = record("usn", "u1", source_path="/$Extend/$UsnJrnl:$J")
     store = make_store(history, cache, cache2, mft, usn)
+    lines = {
+        history.evidence_id: "[History] 다운로드 상태=COMPLETE",
+        cache.evidence_id: "[Cache] 유형=download_file",
+        cache2.evidence_id: "[Cache] 두 번째 레코드",
+        mft.evidence_id: "[$MFT] 경로=/Users/llmtest/Downloads/a.pdf",
+    }
     row = build_timeline_rows(
         [event(refs=[history.evidence_id, cache.evidence_id, cache2.evidence_id,
-                     mft.evidence_id, usn.evidence_id])],
+                     mft.evidence_id, usn.evidence_id], lines=lines)],
         resolver_for(store),
     )[0]
     paths = row[5].split("|")
     base = r"C:\Users\llmtest\AppData\Local\Google\Chrome\User Data\Default"
-    assert paths == sorted([
+    # Detector order (most direct first), duplicates removed.
+    assert paths == [
         rf"{base}\History",
         rf"{base}\Cache\Cache_Data\data_3",
         r"C:\$MFT",
         r"C:\$Extend\$UsnJrnl:$J",
-    ])
-    assert len(paths) == len(set(paths))                  # duplicates removed
+    ]
     for family_name in ("Cache", "History", "$MFT"):
         assert row[5] != family_name
-    assert row[6] != row[5]                               # 상세 keeps the parsed description
-    assert row[6] == "[History] 다운로드 상태=COMPLETE\n[Cache] 유형=download_file"
+    details = row[6].split("\n")
+    # Exactly one detail line per path, in the same order.
+    assert len(details) == len(paths)
+    assert details[:3] == [
+        "[History] 다운로드 상태=COMPLETE",
+        "[Cache] 유형=download_file; 두 번째 레코드",       # same path: one merged line
+        "[$MFT] 경로=/Users/llmtest/Downloads/a.pdf",
+    ]
+    assert details[3].startswith("[$UsnJrnl]")             # default summary of that record
 
 
 def test_unknown_or_staging_paths_are_left_empty_not_invented():
@@ -188,6 +196,7 @@ def test_unknown_or_staging_paths_are_left_empty_not_invented():
         resolver_for(store),
     )[0]
     assert row[5] == ""
+    assert row[6] == ""                                  # no path -> no detail line either
 
 
 def test_unknown_drive_letter_keeps_the_volume_relative_path():
@@ -247,21 +256,6 @@ def test_order_restarts_per_conversation_without_gaps_or_duplicates():
     for row in rows:
         by_conv.setdefault(row[2], []).append(int(row[6]))
     assert by_conv == {"ca": [1, 2, 3], "cb": [1, 2]}
-
-
-def test_recovery_status_measures_completeness():
-    assert recovery_status(message("m1", ROOT)) == RECOVERY_COMPLETE
-    assert recovery_status(message("m1", ROOT, content="  ")) == RECOVERY_PARTIAL
-    assert recovery_status(message("", ROOT)) == RECOVERY_PARTIAL
-    assert recovery_status(message("m1", ROOT, role="unknown")) == RECOVERY_PARTIAL
-    assert recovery_status(message("m1", ROOT, conv="")) == RECOVERY_PARTIAL
-    truncated = message("m1", ROOT)
-    truncated.attributes["truncated"] = True
-    assert recovery_status(truncated) == RECOVERY_PARTIAL
-    # Being found in Cache (a historical record) does not make it "deleted".
-    historical = message("m1", ROOT)
-    historical.record_state = "HISTORICAL_OR_DELETED"
-    assert recovery_status(historical) == RECOVERY_COMPLETE
 
 
 def test_conversation_evidence_paths_and_dropped_fields(tmp_path):
@@ -387,39 +381,44 @@ ACCOUNT_UUID = "f218da89-507d-4665-94b2-887aff8214f8"
 CONV_UUID = "3bb411fb-2909-477e-8696-0295a669c024"
 
 
+UUID_RECORDS = [
+    record(FAMILY_CACHE, "u1", artifact_path=f"{PROFILE}/Cache/Cache_Data/data_1"),
+    record("local_storage", "u2", artifact_path=f"{PROFILE}/Local Storage/leveldb/000005.ldb"),
+    record("zone_identifier", "u3", artifact_path="/Users/u/Downloads/a.png:Zone.Identifier"),
+]
+
+
 def uuid_event() -> FinalEvent:
-    """An event whose internal fields and details are full of real UUIDs."""
+    """An event whose internal fields and detail lines are full of real UUIDs."""
+    lines = [
+        f"[Cache] 유형=conversation_api, 대화 제목=파이썬 리스트 정렬 방법, "
+        f"대화 UUID={CONV_UUID}, 임시 대화=False",
+        f'[Local Storage] key=static-composer-draft-data, 내용={{"accountUuid":"{ACCOUNT_UUID}"}}',
+        f"[Zone.Identifier] ZoneId=3, HostUrl=https://claude.ai/api/organizations/"
+        f"{ACCOUNT_UUID}/conversations/{CONV_UUID}/wiggle/download-file, MIME=image/png",
+    ]
     return FinalEvent(
         action_id=f"ACT-{CONV_UUID}", timestamp=T, action_code="E03-01",
         action_label=label_for("E03-01"), verdict=VERDICT_CONFIRMED,
-        account_uuid=ACCOUNT_UUID, target="t", evidence_artifacts=["Cache"],
-        detail_refs=[], action_detail=f"대화 생성 기록_회의록 {CONV_UUID} 정리",
-        conversation_uuid=CONV_UUID,
-        artifact_details=[
-            f"[Cache] 유형=conversation_api, 대화 제목=파이썬 리스트 정렬 방법, "
-            f"대화 UUID={CONV_UUID}, 임시 대화=False",
-            f'[Local Storage] key=static-composer-draft-data, 내용={{"accountUuid":"{ACCOUNT_UUID}"}}',
-            f"[Zone.Identifier] ZoneId=3, HostUrl=https://claude.ai/api/organizations/"
-            f"{ACCOUNT_UUID}/conversations/{CONV_UUID}/wiggle/download-file, MIME=image/png",
-        ],
+        action_detail=f"대화 생성 기록_회의록 {CONV_UUID} 정리", conversation_uuid=CONV_UUID,
+        evidence=[(r.evidence_id, line) for r, line in zip(UUID_RECORDS, lines)],
     )
 
 
 def test_timeline_csv_contains_no_real_uuid(tmp_path):
     event = uuid_event()
-    rows = build_timeline_rows([event], resolver_for(make_store()))
+    rows = build_timeline_rows([event], resolver_for(make_store(*UUID_RECORDS)))
     write_results(tmp_path, rows, [])
     text = (tmp_path / TIMELINE_FILE).read_text(encoding="utf-8-sig")
     assert not REAL_UUID.search(text), REAL_UUID.search(text).group(0)
     # The event object itself still carries every UUID for analysis.
-    assert event.account_uuid == ACCOUNT_UUID
     assert event.conversation_uuid == CONV_UUID
     assert CONV_UUID in event.action_detail
-    assert any(CONV_UUID in d for d in event.artifact_details)
+    assert any(CONV_UUID in line for _, line in event.evidence)
 
 
 def test_uuid_removal_keeps_every_other_detail():
-    row = build_timeline_rows([uuid_event()], resolver_for(make_store()))[0]
+    row = build_timeline_rows([uuid_event()], resolver_for(make_store(*UUID_RECORDS)))[0]
     details = row[TIMELINE_COLUMNS.index("Artifact_details ")]
     for kept in ("[Cache]", "유형=conversation_api", "대화 제목=파이썬 리스트 정렬 방법",
                  "임시 대화=False", "[Local Storage]", "key=static-composer-draft-data",
@@ -461,8 +460,3 @@ def test_conversations_csv_keeps_its_uuids(tmp_path):
     assert row["content"] == "원문, 그대로\n유지"
 
 
-def test_recovery_status_is_still_computed_though_unexported():
-    """The column is gone; the function and its constants are not."""
-    assert recovery_status(message("m1", ROOT)) == RECOVERY_COMPLETE
-    assert recovery_status(message("", ROOT)) == RECOVERY_PARTIAL
-    assert CONVERSATION_COLUMNS.count("복구상태") == 0

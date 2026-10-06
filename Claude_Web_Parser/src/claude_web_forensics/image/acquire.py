@@ -1,42 +1,18 @@
-"""Artifact acquisition into an isolated staging workspace.
-
-The image is opened read-only and never auto-mounted. Every artifact is copied
-once, with its original relative path structure preserved, and provenance
-(source path, volume, MFT reference, named stream) recorded in an extraction
-manifest. Later phases read the staged copies -- the image is never re-scanned
-per feature.
-"""
+"""Artifact acquisition into an isolated staging workspace."""
 from __future__ import annotations
-
 
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..discovery.environment import (
-    ARTIFACT_PLAN,
-    EXCLUDED_FILES,
-    ChromeProfile,
-    fallback_cookie_paths,
-)
-from ..model.entities import (
-    ST_FOUND,
-    ST_NOT_FOUND,
-    ST_PARTIAL,
-    ST_SKIPPED,
-    ParseStatus,
-)
+from ..discovery.environment import (ARTIFACT_PLAN, EXCLUDED_FILES, ChromeProfile, fallback_cookie_paths,)
+from ..model.entities import ST_FOUND, ST_NOT_FOUND, ParseStatus
 from ..image.volumes import NtfsVolume
 
-# Guard against runaway reads on a corrupt image.
 MAX_SINGLE_FILE = 512 * 1024 * 1024
-
 
 @dataclass
 class StagedFile:
-    """One extracted file plus the provenance needed to re-locate the original."""
-
-    staged_path: str
     source_path: str
     volume_id: str
     size: int
@@ -58,7 +34,6 @@ class StagedFile:
             parts.append(f"ads={self.stream_name}")
         return ";".join(parts)
 
-
 @dataclass
 class StagedArtifact:
     artifact: str
@@ -73,7 +48,6 @@ class StagedArtifact:
     def file_count(self) -> int:
         return len(self.files)
 
-
 @dataclass
 class ProfileStaging:
     profile: ChromeProfile
@@ -87,15 +61,12 @@ class ProfileStaging:
         path = Path(entry.staged_root)
         return path if path.exists() else None
 
-
 def _safe_component(name: str) -> str:
-    """Neutralise traversal and drive prefixes when mapping image paths to disk."""
     cleaned = name.replace("\x00", "").strip()
     cleaned = cleaned.replace(":", "_")
     if cleaned in ("", ".", ".."):
         return "_"
     return cleaned
-
 
 def _record_ids(record: Any) -> tuple[int | None, int | None]:
     segment = getattr(record, "segment", None)
@@ -110,42 +81,27 @@ def _record_ids(record: Any) -> tuple[int | None, int | None]:
         segment = None
     return segment, sequence
 
-
 class Stager:
-    """Copies artifacts out of the image into `<output>/_staging`."""
-
     def __init__(self, staging_root: Path) -> None:
         self.root = Path(staging_root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.entries: list[StagedFile] = []
         self.warnings: list[str] = []
 
-    # -- low-level -------------------------------------------------------
     def copy_record(
-        self,
-        volume: NtfsVolume,
-        source_path: str,
-        record: Any,
-        dest: Path,
-        *,
-        artifact: str = "",
-        family: str = "",
-        stream_name: str = "",
+        self, volume: NtfsVolume, source_path: str, record: Any, dest: Path, *, artifact: str = "",
+        family: str = "", stream_name: str = "",
     ) -> StagedFile | None:
         fh = volume.open_record(record, stream_name or None)
         if fh is None:
             self.warnings.append(f"cannot open {source_path}{':' + stream_name if stream_name else ''}")
             return None
         try:
-            data = fh.read(MAX_SINGLE_FILE + 1)
+            with fh:
+                data = fh.read(MAX_SINGLE_FILE + 1)
         except Exception as exc:
             self.warnings.append(f"read failed {source_path}: {type(exc).__name__}: {exc}")
             return None
-        finally:
-            try:
-                fh.close()
-            except Exception:
-                pass
 
         note = ""
         if len(data) > MAX_SINGLE_FILE:
@@ -157,46 +113,26 @@ class Stager:
         dest.write_bytes(data)
         segment, sequence = _record_ids(record)
         staged = StagedFile(
-            staged_path=str(dest),
-            source_path=source_path,
-            volume_id=volume.info.identifier,
-            size=len(data),
-            mft_segment=segment,
-            mft_sequence=sequence,
-            stream_name=stream_name,
-            artifact=artifact,
-            family=family,
-            note=note,
+            source_path=source_path, volume_id=volume.info.identifier, size=len(data),
+            mft_segment=segment, mft_sequence=sequence, stream_name=stream_name, artifact=artifact,
+            family=family, note=note,
         )
         self.entries.append(staged)
         return staged
 
     def copy_path(
-        self,
-        volume: NtfsVolume,
-        source_path: str,
-        dest: Path,
-        *,
-        artifact: str = "",
-        family: str = "",
+        self, volume: NtfsVolume, source_path: str, dest: Path, *, artifact: str = "", family: str = "",
         stream_name: str = "",
     ) -> StagedFile | None:
         record = volume.get(source_path)
         if record is None:
             return None
         return self.copy_record(
-            volume, source_path, record, dest,
-            artifact=artifact, family=family, stream_name=stream_name,
+            volume, source_path, record, dest, artifact=artifact, family=family, stream_name=stream_name,
         )
 
     def copy_tree(
-        self,
-        volume: NtfsVolume,
-        source_dir: str,
-        dest_dir: Path,
-        *,
-        artifact: str,
-        family: str,
+        self, volume: NtfsVolume, source_dir: str, dest_dir: Path, *, artifact: str, family: str,
         max_depth: int = 6,
     ) -> list[StagedFile]:
         out: list[StagedFile] = []
@@ -217,43 +153,32 @@ class Stager:
                 if is_dir:
                     stack.append((child_src, child_dst, depth + 1))
                     continue
-                staged = self.copy_record(
-                    volume, child_src, record, child_dst, artifact=artifact, family=family
-                )
+                staged = self.copy_record(volume, child_src, record, child_dst, artifact=artifact, family=family)
                 if staged is not None:
                     out.append(staged)
         return out
 
-    # -- artifact plan ---------------------------------------------------
     def stage_profile(self, volume: NtfsVolume, profile: ChromeProfile) -> ProfileStaging:
-        base = self.root / _safe_component(volume.info.identifier) / _safe_component(
-            profile.windows_user
-        ) / _safe_component(profile.profile_name)
+        base = self.root / _safe_component(volume.info.identifier) / _safe_component(profile.windows_user
+            ) / _safe_component(profile.profile_name)
         staging = ProfileStaging(profile=profile, root=str(base))
 
         for entry in ARTIFACT_PLAN:
             src = f"{profile.source_path}/{entry.source}"
             dest = base / Path(entry.source)
             artifact = StagedArtifact(
-                artifact=entry.artifact,
-                family=entry.family,
-                status=ST_NOT_FOUND,
-                source_path=src,
+                artifact=entry.artifact, family=entry.family, status=ST_NOT_FOUND, source_path=src,
                 staged_root=str(dest),
             )
 
             if entry.kind == "file":
-                staged = self.copy_path(
-                    volume, src, dest, artifact=entry.artifact, family=entry.family
-                )
+                staged = self.copy_path(volume, src, dest, artifact=entry.artifact, family=entry.family)
                 if staged is None and entry.artifact == "Cookies":
-                    # Older Chrome layout: Cookies directly under the profile.
                     for candidate in fallback_cookie_paths():
                         alt_src = f"{profile.source_path}/{candidate}"
                         alt_dest = base / candidate
                         alt = self.copy_path(
-                            volume, alt_src, alt_dest,
-                            artifact=entry.artifact, family=entry.family,
+                            volume, alt_src, alt_dest, artifact=entry.artifact, family=entry.family,
                         )
                         if alt is not None:
                             artifact.files.append(alt)
@@ -269,18 +194,13 @@ class Stager:
 
                 for companion in entry.companions:
                     comp = self.copy_path(
-                        volume,
-                        f"{profile.source_path}/{companion}",
-                        base / Path(companion),
-                        artifact=entry.artifact,
-                        family=entry.family,
+                        volume, f"{profile.source_path}/{companion}", base / Path(companion),
+                        artifact=entry.artifact, family=entry.family,
                     )
                     if comp is not None:
                         artifact.files.append(comp)
             else:
-                files = self.copy_tree(
-                    volume, src, dest, artifact=entry.artifact, family=entry.family
-                )
+                files = self.copy_tree(volume, src, dest, artifact=entry.artifact, family=entry.family)
                 artifact.files.extend(files)
                 if files:
                     artifact.status = ST_FOUND
@@ -289,17 +209,12 @@ class Stager:
                 artifact.message = artifact.message or "artifact path not present in image"
             staging.artifacts[entry.artifact] = artifact
 
-        # Local State is a support file: acquired for consistency, not an artifact.
         self.copy_path(
-            volume,
-            f"{profile.user_data_path}/Local State",
-            base / "Local State",
-            artifact="(support)",
+            volume, f"{profile.user_data_path}/Local State", base / "Local State", artifact="(support)",
             family="",
         )
         return staging
 
-    # -- parse status ----------------------------------------------------
     def parse_statuses(self, stagings: Iterable[ProfileStaging]) -> list[ParseStatus]:
         out: list[ParseStatus] = []
         for staging in stagings:
@@ -307,23 +222,10 @@ class Stager:
             for artifact in staging.artifacts.values():
                 out.append(
                     ParseStatus(
-                        artifact=f"acquire:{artifact.artifact} [{label}]",
-                        family=artifact.family,
-                        status=artifact.status if artifact.status != ST_FOUND else ST_FOUND,
-                        source_path=artifact.source_path,
-                        record_count=artifact.file_count,
+                        artifact=f"acquire:{artifact.artifact} [{label}]", family=artifact.family,
+                        status=artifact.status,
+                        source_path=artifact.source_path, record_count=artifact.file_count,
                         message=artifact.message,
-                        impact="" if artifact.status == ST_FOUND else "artifact unavailable for parsing",
                     )
                 )
         return out
-
-
-__all__ = [
-    "Stager",
-    "StagedFile",
-    "StagedArtifact",
-    "ProfileStaging",
-    "ST_PARTIAL",
-    "ST_SKIPPED",
-]

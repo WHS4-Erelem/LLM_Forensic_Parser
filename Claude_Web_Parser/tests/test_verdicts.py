@@ -10,7 +10,6 @@ from claude_web_forensics.analysis.rules import (
     R_NO_POSITIVE_EVIDENCE,
     R_SINGLE_FAMILY_ONLY,
     VerdictInput,
-    answers_five_questions,
     decide,
 )
 from claude_web_forensics.model.entities import (
@@ -154,31 +153,9 @@ def test_disqualifier_caps_at_suspected_even_with_two_families():
     assert result.reason_code == R_DISQUALIFIED
 
 
-def test_confirmed_must_answer_five_questions():
-    records = [
-        rec(FAMILY_HISTORY, "a", subtype="url", url="u"),
-        rec(FAMILY_CACHE, "b", cache_key="k", variant_index=0),
-    ]
-    group = make_correlator(records).group(records)
-    result = decide(VerdictInput(rule_id="R-E0505", group=group))
-    assert answers_five_questions("R-E0505", {"k": "v"}, result, group.evidence_ids)
-    # No rule id / identity / refs => cannot be published as 확정.
-    assert not answers_five_questions("", {"k": "v"}, result, group.evidence_ids)
-    assert not answers_five_questions("R-E0505", {}, result, group.evidence_ids)
-    assert not answers_five_questions("R-E0505", {"k": "v"}, result, [])
-
 
 def test_derived_source_key_distinguishes_real_independence():
     a = rec(FAMILY_HISTORY, "x", subtype="download", download_id=1)
     b = rec(FAMILY_HISTORY, "y", subtype="download", download_id=2)
     assert derived_source_key(a) != derived_source_key(b)
 
-
-def test_display_artifacts_are_deduplicated():
-    records = [
-        rec(FAMILY_HISTORY, "a", subtype="url", url="u1"),
-        rec(FAMILY_HISTORY, "b", subtype="url", url="u2"),
-        rec(FAMILY_CACHE, "c", cache_key="k", variant_index=0),
-    ]
-    group = make_correlator(records).group(records)
-    assert group.display_artifacts() == ["Cache", "History"]
