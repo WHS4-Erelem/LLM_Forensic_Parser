@@ -110,10 +110,15 @@ def _message(obj: dict[str, Any], conversation_uuid: str, model: str) -> Convers
             "attachments": obj.get("attachments") or [],
             "files": obj.get("files") or obj.get("files_v2") or [],
             "previous_model": obj.get("previous_model"),
+            "server_record": "updated_at" in obj,
         },
     )
 
 def _merge(existing: ConversationMessage, incoming: ConversationMessage) -> None:
+    # The page first stores its own copy of a message (no updated_at) stamped with the client submit time; the
+    # server record that replaces it carries the real created_at. Only that step overrides an earlier value.
+    if incoming.timestamp and incoming.attributes["server_record"] and not existing.attributes["server_record"]:
+        existing.timestamp = incoming.timestamp
     for name in ("content", "timestamp", "parent_message_uuid", "model", "input_mode"):
         if not getattr(existing, name) and getattr(incoming, name):
             setattr(existing, name, getattr(incoming, name))
@@ -124,7 +129,8 @@ def _merge(existing: ConversationMessage, incoming: ConversationMessage) -> None
     if order[incoming.record_state] > order[existing.record_state]:
         existing.record_state = incoming.record_state
     for key, value in incoming.attributes.items():
-        existing.attributes.setdefault(key, value)
+        if value and not existing.attributes.get(key):
+            existing.attributes[key] = value
 
 class ConversationBuilder:
     def __init__(self) -> None:

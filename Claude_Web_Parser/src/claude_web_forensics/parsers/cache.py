@@ -84,7 +84,7 @@ def parse_cache(
     except Exception as exc:
         return records, ParseStatus(
             artifact="Cache", family=FAMILY_CACHE, status=ST_FAILED, source_path=source_path,
-            error_code=type(exc).__name__, message=str(exc),
+            message=str(exc),
         )
 
     errors: list[str] = []
@@ -162,7 +162,7 @@ def parse_cache(
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
         artifact="Cache", family=FAMILY_CACHE, status=status, source_path=source_path,
-        record_count=len(records), error_count=len(errors), message="; ".join(errors[:5])
+        record_count=len(records), message="; ".join(errors[:5])
         or f"keys={total_keys} claude={len(records)} hydrated={hydrated}", details=details,
     )
 

@@ -13,7 +13,6 @@ MAX_SINGLE_FILE = 512 * 1024 * 1024
 
 @dataclass
 class StagedFile:
-    staged_path: str
     source_path: str
     volume_id: str
     size: int
@@ -98,15 +97,11 @@ class Stager:
             self.warnings.append(f"cannot open {source_path}{':' + stream_name if stream_name else ''}")
             return None
         try:
-            data = fh.read(MAX_SINGLE_FILE + 1)
+            with fh:
+                data = fh.read(MAX_SINGLE_FILE + 1)
         except Exception as exc:
             self.warnings.append(f"read failed {source_path}: {type(exc).__name__}: {exc}")
             return None
-        finally:
-            try:
-                fh.close()
-            except Exception:
-                pass
 
         note = ""
         if len(data) > MAX_SINGLE_FILE:
@@ -118,7 +113,7 @@ class Stager:
         dest.write_bytes(data)
         segment, sequence = _record_ids(record)
         staged = StagedFile(
-            staged_path=str(dest), source_path=source_path, volume_id=volume.info.identifier, size=len(data),
+            source_path=source_path, volume_id=volume.info.identifier, size=len(data),
             mft_segment=segment, mft_sequence=sequence, stream_name=stream_name, artifact=artifact,
             family=family, note=note,
         )
@@ -228,10 +223,9 @@ class Stager:
                 out.append(
                     ParseStatus(
                         artifact=f"acquire:{artifact.artifact} [{label}]", family=artifact.family,
-                        status=artifact.status if artifact.status != ST_FOUND else ST_FOUND,
+                        status=artifact.status,
                         source_path=artifact.source_path, record_count=artifact.file_count,
                         message=artifact.message,
-                        impact="" if artifact.status == ST_FOUND else "artifact unavailable for parsing",
                     )
                 )
         return out

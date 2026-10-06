@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -94,8 +95,8 @@ class EwfImage:
             raise ImageOpenError(f"image not found: {self.path}")
 
         try:
-            from dissect.evidence import EWF  # noqa: PLC0415 - adapter-local import
-        except ImportError as exc:  # pragma: no cover - dependency guard
+            from dissect.evidence import EWF
+        except ImportError as exc:
             raise ImageOpenError(
                 "dissect.evidence is required for E01/EWF input (pip install -r requirements.lock)"
             ) from exc
@@ -126,7 +127,7 @@ class EwfImage:
         for fh in self._handles:
             try:
                 fh.close()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:
                 pass
         self._handles = []
 
@@ -185,7 +186,7 @@ class _ConcatStream(io.RawIOBase):
             self._pos += offset
         elif whence == io.SEEK_END:
             self._pos = self.size + offset
-        else:  # pragma: no cover - defensive
+        else:
             raise ValueError(f"invalid whence: {whence}")
         self._pos = max(0, self._pos)
         return self._pos
@@ -223,13 +224,39 @@ class _ConcatStream(io.RawIOBase):
         for fh in self._files:
             try:
                 fh.close()
-            except Exception:  # pragma: no cover
+            except Exception:
                 pass
         super().close()
+
+def is_device_path(path: Path | str) -> bool:
+    return str(path).startswith(("\\\\.\\", "\\\\?\\"))
+
+def _open_device(path: Path) -> BinaryIO:
+    """Raw NTFS volume (``\\\\.\\C:`` or a VSS shadow device): sector-aligned reads, size from the boot sector."""
+    try:
+        from dissect.util.stream import BufferedStream
+
+        fh = open(str(path), "rb", buffering=0)
+        boot = fh.read(512)
+        bytes_per_sector, total_sectors = struct.unpack_from("<H", boot, 11)[0], struct.unpack_from("<Q", boot, 40)[0]
+        if boot[3:11] != b"NTFS    " or not bytes_per_sector or not total_sectors:
+            raise ImageOpenError("device is not an NTFS volume (give a volume such as \\\\.\\C:, not a physical disk)")
+        return BufferedStream(fh, size=(total_sectors + 1) * bytes_per_sector, align=4096)
+    except PermissionError as exc:
+        raise ImageOpenError(f"cannot open {path}: administrator rights required (run from an elevated terminal or use --elevate)") from exc
+    except OSError as exc:
+        raise ImageOpenError(f"cannot open device {path}: {type(exc).__name__}: {exc}") from exc
 
 class RawImage:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        if is_device_path(self.path):
+            self._stream = _open_device(self.path)
+            self.info = ImageInfo(
+                path=str(self.path), image_type="live-volume", logical_size=self._stream.size,
+                container_size=self._stream.size, attributes={"reader": "builtin-device", "segment_count": 1},
+            )
+            return
         if not self.path.exists():
             raise ImageOpenError(f"image not found: {self.path}")
 
@@ -247,10 +274,10 @@ class RawImage:
         )
 
     def stream(self) -> BinaryIO:
-        return self._stream  # type: ignore[return-value]
+        return self._stream
 
     def close(self) -> None:
         try:
             self._stream.close()
-        except Exception:  # pragma: no cover
+        except Exception:
             pass

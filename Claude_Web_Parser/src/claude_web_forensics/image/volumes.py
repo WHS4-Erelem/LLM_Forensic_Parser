@@ -15,13 +15,11 @@ class VolumeInfo:
     index: int
     offset: int
     size: int
-    partition_type: str = ""
     name: str = ""
     filesystem: str = ""
     encryption: str = ""
     encryption_status: str = ""
     unlock_method: str = ""
-    volume_serial: str = ""
     cluster_size: int | None = None
     sector_size: int | None = None
     message: str = ""
@@ -157,7 +155,7 @@ def _probe_filesystem(stream: BinaryIO, offset: int) -> tuple[str, str]:
 def discover_volumes(stream: BinaryIO, image_size: int) -> list[VolumeInfo]:
     volumes: list[VolumeInfo] = []
     try:
-        from dissect.volume.disk.disk import Disk  # noqa: PLC0415 - adapter-local
+        from dissect.volume.disk.disk import Disk
 
         disk = Disk(stream)
         partitions = list(disk.partitions)
@@ -171,7 +169,7 @@ def discover_volumes(stream: BinaryIO, image_size: int) -> list[VolumeInfo]:
             fs, enc = _probe_filesystem(stream, offset)
             volumes.append(
                 VolumeInfo(
-                    index=i, offset=offset, size=size, partition_type=str(getattr(part, "type", "") or ""),
+                    index=i, offset=offset, size=size,
                     name=str(getattr(part, "name", "") or ""), filesystem=fs, encryption=enc,
                     attributes={"scheme": type(getattr(disk, "scheme", disk)).__name__},
                 )
@@ -181,58 +179,22 @@ def discover_volumes(stream: BinaryIO, image_size: int) -> list[VolumeInfo]:
     fs, enc = _probe_filesystem(stream, 0)
     volumes.append(
         VolumeInfo(
-            index=0, offset=0, size=image_size, partition_type="none", name="whole-image", filesystem=fs,
+            index=0, offset=0, size=image_size, name="whole-image", filesystem=fs,
             encryption=enc, attributes={"scheme": "none"},
         )
     )
     return volumes
 
 def _partition_stream(stream: BinaryIO, volume: VolumeInfo) -> BinaryIO:
-    try:
-        from dissect.util.stream import RelativeStream  # noqa: PLC0415
+    from dissect.util.stream import RelativeStream
 
-        return RelativeStream(stream, volume.offset, volume.size)
-    except Exception:  # pragma: no cover - fallback for older dissect.util
-        import io
-
-        class _Window(io.RawIOBase):
-            def __init__(self) -> None:
-                self._pos = 0
-
-            def readable(self) -> bool:
-                return True
-
-            def seekable(self) -> bool:
-                return True
-
-            def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-                if whence == io.SEEK_SET:
-                    self._pos = offset
-                elif whence == io.SEEK_CUR:
-                    self._pos += offset
-                else:
-                    self._pos = volume.size + offset
-                return self._pos
-
-            def tell(self) -> int:
-                return self._pos
-
-            def read(self, n: int = -1) -> bytes:
-                if n is None or n < 0:
-                    n = volume.size - self._pos
-                n = min(n, max(0, volume.size - self._pos))
-                stream.seek(volume.offset + self._pos)
-                data = stream.read(n)
-                self._pos += len(data)
-                return data
-
-        return _Window()  # type: ignore[return-value]
+    return RelativeStream(stream, volume.offset, volume.size)
 
 def _unlock_bitlocker(
     part_stream: BinaryIO, volume: VolumeInfo, key_material: KeyMaterial | None
 ) -> BinaryIO | None:
     try:
-        from dissect.fve.bde import BDE  # noqa: PLC0415 - adapter-local
+        from dissect.fve.bde import BDE
     except ImportError:
         volume.encryption_status = ST_ENCRYPTED_UNSUPPORTED
         volume.message = "dissect.fve not installed; BitLocker volume cannot be read"
@@ -308,8 +270,8 @@ def open_ntfs_volumes(
     stream: BinaryIO, volumes: list[VolumeInfo], key_material: KeyMaterial | None = None,
 ) -> list[NtfsVolume]:
     try:
-        from dissect.ntfs import NTFS  # noqa: PLC0415 - adapter-local
-    except ImportError as exc:  # pragma: no cover - dependency guard
+        from dissect.ntfs import NTFS
+    except ImportError as exc:
         raise ImageOpenError("dissect.ntfs is required (pip install -r requirements.lock)") from exc
 
     opened: list[NtfsVolume] = []
@@ -330,9 +292,52 @@ def open_ntfs_volumes(
             continue
 
         volume.filesystem = "ntfs"
-        volume.volume_serial = f"{getattr(fs, 'serial', 0):x}"
         volume.cluster_size = getattr(fs, "cluster_size", None)
         volume.sector_size = getattr(fs, "sector_size", None)
         opened.append(NtfsVolume(volume, fs))
 
     return opened
+
+class _DirRecord:
+    """Host file standing in for an MFT record: no segment/header/attributes, so MFT-derived fields stay empty."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def is_dir(self) -> bool:
+        return self.path.is_dir()
+
+    def size(self) -> int:
+        return self.path.stat().st_size
+
+    def open(self, name: str | None = None) -> BinaryIO:
+        return open(f"{self.path}:{name}" if name else self.path, "rb")
+
+class DirectoryVolume(NtfsVolume):
+    """A copied/mounted volume tree (``<root>/Users/...``) exposed through the NtfsVolume interface."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        super().__init__(
+            VolumeInfo(index=0, offset=0, size=0, name=str(self.root),
+                       filesystem="directory"), fs=None,
+        )
+
+    def get(self, path: str) -> _DirRecord | None:
+        host = self.root.joinpath(*path.strip("/").split("/")) if path.strip("/") else self.root
+        return _DirRecord(host) if host.exists() else None
+
+    def listdir(self, path: str) -> dict[str, Any]:
+        record = self.get(path)
+        try:
+            return {p.name: _DirRecord(p) for p in record.path.iterdir()} if record else {}
+        except OSError:
+            return {}
+
+    @staticmethod
+    def data_streams(record: Any) -> list[str]:
+        try:  # ponytail: only Zone.Identifier is ever consulted; enumerate all ADS via FindFirstStreamW if needed
+            with record.open("Zone.Identifier"):
+                return ["Zone.Identifier"]
+        except OSError:
+            return []

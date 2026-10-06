@@ -12,7 +12,7 @@ from typing import Any, BinaryIO
 def safe_str(value: Any) -> str:
     try:
         return str(value)
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         return f"<{type(value).__name__} str-error: {exc}>"
 
 def to_jsonable(value: Any, _depth: int = 0, _seen: set[int] | None = None) -> Any:

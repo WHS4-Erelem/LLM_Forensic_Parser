@@ -147,7 +147,7 @@ def parse_indexeddb(
         )
     return records, ParseStatus(
         artifact="IndexedDB", family=FAMILY_INDEXEDDB, status=status, source_path=source_path,
-        record_count=len(records), error_count=len(errors) + counts["bad_deserialization"],
+        record_count=len(records),
         message="; ".join(errors[:5]) or note, details=details,
     )
 
@@ -325,7 +325,7 @@ def parse_local_storage(
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
         artifact="Local Storage", family=FAMILY_LOCAL_STORAGE, status=status,
-        source_path=source_path, record_count=len(records), error_count=len(errors),
+        source_path=source_path, record_count=len(records),
         message="; ".join(errors[:5]), details=details,
     )
 
@@ -386,7 +386,7 @@ def parse_sessions(
     return records, ParseStatus(
         artifact="Sessions/Tabs", family=FAMILY_SESSIONS,
         status=ST_PARTIAL if records or not errors else ST_FAILED,
-        source_path=source_path, record_count=len(records), error_count=len(errors),
+        source_path=source_path, record_count=len(records),
         message="; ".join(errors[:5])
         or f"CCL SNSS support is partial; NavigationEntry parsed, "
            f"{unprocessed} non-navigation command(s) retained as locators only",

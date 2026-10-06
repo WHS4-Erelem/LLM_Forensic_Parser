@@ -61,6 +61,9 @@ def iter_usn_records(fh: BinaryIO) -> Iterator[tuple[UsnRecord | None, dict[str,
         chunk = fh.read(CHUNK)
         if not chunk:
             break
+        if not carry and len(chunk) % 8 == 0 and chunk.count(0) == len(chunk):
+            base_offset += len(chunk)  # sparse run ($J of a long-lived volume is GBs of zeros): nothing to parse
+            continue
         buf = carry + chunk
         pos = 0
         while pos + 8 <= len(buf):
@@ -127,7 +130,6 @@ class RenamePair:
     new_path: str = ""
     timestamp: dt.datetime | None = None
     resolved: bool = False
-    partial: bool = False
     note: str = ""
     evidence_ids: list[str] = field(default_factory=list)
     volume_id: str = ""
@@ -170,7 +172,7 @@ def build_rename_pairs(records: list[UsnRecord], max_gap_seconds: float = 5.0) -
                     RenamePair(
                         file_reference=record.file_reference, old_name="", new_name=record.file_name,
                         old_parent="", new_parent=record.parent_reference, timestamp=record.timestamp,
-                        resolved=False, partial=True,
+                        resolved=False,
                         note="RENAME_OLD_NAME not present (journal gap or wrap)",
                     )
                 )
@@ -183,7 +185,7 @@ def build_rename_pairs(records: list[UsnRecord], max_gap_seconds: float = 5.0) -
                             file_reference=record.file_reference, old_name=old.file_name,
                             new_name=record.file_name, old_parent=old.parent_reference,
                             new_parent=record.parent_reference, timestamp=record.timestamp, resolved=False,
-                            partial=True, note=f"old/new name records {delta:.1f}s apart; pairing uncertain",
+                            note=f"old/new name records {delta:.1f}s apart; pairing uncertain",
                         )
                     )
                     continue
@@ -208,7 +210,7 @@ def resolve_parent_path(volume: NtfsVolume, parent_reference: str) -> str:
     except (ValueError, IndexError):
         return ""
     try:
-        record = volume._fs.mft.get(segment)  # noqa: SLF001 - adapter-local access
+        record = volume._fs.mft.get(segment)
         paths = record.full_paths()
         if paths:
             return "/" + str(paths[0]).replace("\\", "/").lstrip("/")
@@ -230,7 +232,6 @@ def parse_usn(
             records, kept, [], ParseStatus(
                 artifact="$UsnJrnl:$J", family=FAMILY_USN, status=ST_NOT_FOUND, source_path=source_path,
                 message="$UsnJrnl not present on this volume",
-                impact="rename/move/delete history unavailable (normal partial condition)",
             ),
         )
 
@@ -298,7 +299,6 @@ def parse_usn(
         if pair.new_path and pair.new_name:
             pair.new_path = f"{pair.new_path.rstrip('/')}/{pair.new_name}"
         if not (pair.old_path and pair.new_path):
-            pair.partial = True
             if not pair.note:
                 pair.note = "parent path unresolved on one or both sides"
 
@@ -333,10 +333,7 @@ def parse_usn(
     return (
         records, kept, pairs, ParseStatus(
             artifact="$UsnJrnl:$J", family=FAMILY_USN, status=status, source_path=source_path,
-            record_count=len(records), error_count=sum(skipped.values()), message=message,
-            impact="unsupported USN record versions skipped (offsets recorded)"
-            if "unsupported_version" in skipped
-            else "",
+            record_count=len(records), message=message,
         ),
     )
 
@@ -398,7 +395,6 @@ def discover_recycle_bin(
             entries, ParseStatus(
                 artifact="$Recycle.Bin", family=FAMILY_RECYCLE_BIN, status=ST_NOT_FOUND,
                 source_path=RECYCLE_ROOT, message="$Recycle.Bin not present on this volume",
-                impact="deletion metadata / recoverable bytes unavailable",
             ),
         )
 
@@ -429,13 +425,8 @@ def discover_recycle_bin(
             if fh is None:
                 errors.append(f"{entry.i_path}: cannot read $I")
                 continue
-            try:
+            with fh:
                 i_data = fh.read(4096)
-            finally:
-                try:
-                    fh.close()
-                except Exception:
-                    pass
 
             version, size, deleted, original = parse_i_file(i_data)
             entry.format_version = version
@@ -460,13 +451,8 @@ def discover_recycle_bin(
                 if zone_parser.ADS_NAME in volume.data_streams(r_record):
                     zfh = volume.open_record(r_record, zone_parser.ADS_NAME)
                     if zfh is not None:
-                        try:
+                        with zfh:
                             entry.zone = zone_parser.parse_zone_bytes(zfh.read(65536))
-                        finally:
-                            try:
-                                zfh.close()
-                            except Exception:
-                                pass
             else:
                 orphan_i += 1
             entries.append(entry)
@@ -485,7 +471,7 @@ def discover_recycle_bin(
     return (
         entries, ParseStatus(
             artifact="$Recycle.Bin", family=FAMILY_RECYCLE_BIN, status=status, source_path=RECYCLE_ROOT,
-            record_count=len(entries), error_count=len(errors) + unknown_versions,
+            record_count=len(entries),
             message="; ".join(errors[:5]) or note,
         ),
     )

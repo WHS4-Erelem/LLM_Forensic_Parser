@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
+import os
 import platform
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from . import __version__
 from .pipeline import AnalysisOptions, run_analysis
-from .image.adapters import ImageOpenError
+from .image.adapters import ImageOpenError, is_device_path
 from .image.volumes import KeyMaterial
 
 EXIT_OK = 0
@@ -21,15 +25,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-web-forensics", description=(
             "Single-snapshot forensic parser for Claude Web traces in Google Chrome "
-            "on Windows. Input is an E01-family or raw/dd disk image. Writes exactly "
+            "on Windows. Input is an E01-family or raw/dd disk image, a live NTFS volume "
+            "(\\\\.\\C:, administrator) or a copied volume tree (--dir). Writes exactly "
             "two files to --output: timeline.csv and recovered_conversations.csv "
             "(UTF-8 with BOM). Progress is logged to the console only."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    analyze = sub.add_parser("analyze", help="analyse a disk image")
-    analyze.add_argument("--image", required=True, type=Path, help="E01 or raw/dd image path")
+    analyze = sub.add_parser("analyze", help="analyse a disk image, live volume or folder")
+    source = analyze.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path, help="E01 or raw/dd image path, or a live volume such as \\\\.\\C:")
+    source.add_argument(
+        "--dir", type=Path, help="copied volume tree: a folder that contains Users\\<user>\\... (no $MFT / $UsnJrnl)",
+    )
+    analyze.add_argument(
+        "--elevate", action="store_true",
+        help="if --image is a live volume and this process is not elevated, re-run itself through UAC and wait",
+    )
+    analyze.add_argument("--log-file", type=Path, default=None, help=argparse.SUPPRESS)
     analyze.add_argument(
         "--output", required=True, type=Path,
         help="output directory for timeline.csv and recovered_conversations.csv",
@@ -89,23 +103,53 @@ def parse_key_material(spec: str) -> KeyMaterial:
         raise SystemExit("--key-material must start with recovery:, bek:, fvek: or passphrase:")
     return material
 
-def setup_logging(level: str) -> logging.Logger:
+def setup_logging(level: str, log_file: Path | None = None) -> logging.Logger:
     logger = logging.getLogger("claude_web_forensics")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     logger.propagate = False
 
-    console = logging.StreamHandler(sys.stderr)
-    console.setLevel(getattr(logging, level))
-    console.setFormatter(logging.Formatter("%(levelname)-8s %(message)s"))
-    logger.addHandler(console)
+    handlers = [logging.StreamHandler(sys.stderr)]
+    if log_file:  # only used by --elevate: the elevated child has its own console, so it mirrors the log to a file
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    for handler in handlers:
+        handler.setLevel(getattr(logging, level))
+        handler.setFormatter(logging.Formatter("%(levelname)-8s %(message)s"))
+        logger.addHandler(handler)
     return logger
 
-def _validate_output(image: Path, output: Path) -> None:
-    image = image.resolve()
+def _validate_output(evidence_root: Path, output: Path) -> None:
+    """--dir only: results written inside the analysed tree would be read back as evidence on the next run.
+    An image file needs no such rule (only the two CSVs are ever written, never over an existing file)."""
+    root = evidence_root.resolve()
     output = output.resolve()
-    if output == image.parent or image.parent in output.parents or output in image.parents:
+    if output == root or root in output.parents or output in root.parents:
         raise SystemExit(f"refusing to write output inside the evidence directory: {output}")
+
+def _is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def _elevate(argv: list[str]) -> int:
+    """Re-run this CLI through UAC (PowerShell Start-Process -Verb RunAs), wait, replay its log, return its exit code."""
+    log_file = Path(tempfile.gettempdir()) / f"cwf_elevated_{int(time.time())}.log"
+    src = Path(__file__).resolve().parents[1]
+    args = ["-c", f"import sys; sys.path.insert(0, {str(src)!r}); "
+            "from claude_web_forensics.cli import main; sys.exit(main(sys.argv[1:]))",
+            *argv, "--log-file", str(log_file)]
+    # Start-Process joins -ArgumentList with spaces verbatim, so each argument is Windows-quoted first
+    quoted = ",".join("'" + subprocess.list2cmdline([a]).replace("'", "''") + "'" for a in args)
+    cmd = (f"$p = Start-Process -FilePath '{sys.executable}' -WorkingDirectory '{os.getcwd()}' "
+           f"-ArgumentList @({quoted}) -Verb RunAs -Wait -PassThru; exit $p.ExitCode")
+    code = subprocess.run(["powershell", "-NoProfile", "-Command", cmd]).returncode
+    try:
+        sys.stderr.write(log_file.read_text(encoding="utf-8"))
+        log_file.unlink()
+    except OSError:
+        sys.stderr.write(f"elevated run finished with exit code {code} (no log returned; UAC declined?)\n")
+    return code
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -120,13 +164,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ccl_chromium_reader {provenance['version']} @ {provenance['commit']}")
         return EXIT_OK
 
-    image = Path(args.image)
+    image = Path(args.dir or args.image)
     output = Path(args.output)
-    if not image.exists():
-        print(f"image not found: {image}", file=sys.stderr)
+    device = is_device_path(image)
+    if device and not _is_admin():
+        if args.elevate:
+            return _elevate(sys.argv[1:] if argv is None else list(argv))
+        print(f"{image} is a live volume: run from an administrator terminal or add --elevate", file=sys.stderr)
+        return EXIT_USAGE
+    if args.dir and not image.is_dir() or not device and not image.exists():
+        print(f"{'folder' if args.dir else 'image'} not found: {image}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        _validate_output(image, output)
+        if args.dir:
+            _validate_output(image, output)
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
@@ -139,7 +190,9 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
 
-    logger = setup_logging(args.log_level)
+    logger = setup_logging(args.log_level, args.log_file)
+    if args.dir and (args.partition_index is not None or args.partition_offset is not None or args.key_material):
+        logger.warning("--dir input: --partition-* and --key-material are ignored")
     if others:
         logger.info("output folder also contains %s (left untouched)", ", ".join(others[:10]))
 
@@ -162,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImageOpenError as exc:
         logger.error("fatal: %s", exc)
         return EXIT_FATAL
-    except Exception as exc:  # pragma: no cover - last-resort guard
+    except Exception as exc:
         logger.exception("fatal: unexpected error: %s", exc)
         return EXIT_FATAL
 

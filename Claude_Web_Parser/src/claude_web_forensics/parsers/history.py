@@ -23,7 +23,7 @@ def parse_history(
     if not db_path.exists():
         return records, ParseStatus(
             artifact="History", family=FAMILY_HISTORY, status=ST_NOT_FOUND, source_path=source_path,
-            message="History database not staged", impact="URL/visit/download evidence unavailable",
+            message="History database not staged",
         )
 
     try:
@@ -31,7 +31,7 @@ def parse_history(
     except Exception as exc:
         return records, ParseStatus(
             artifact="History", family=FAMILY_HISTORY, status=ST_FAILED, source_path=source_path,
-            error_code=type(exc).__name__, message=str(exc), impact="URL/visit/download evidence unavailable",
+            message=str(exc),
         )
 
     try:
@@ -190,6 +190,5 @@ def parse_history(
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
         artifact="History", family=FAMILY_HISTORY, status=status, source_path=source_path,
-        record_count=len(records), error_count=len(errors), message="; ".join(errors[:5]),
-        impact="partial URL/download evidence" if errors else "",
+        record_count=len(records), message="; ".join(errors[:5]),
     )

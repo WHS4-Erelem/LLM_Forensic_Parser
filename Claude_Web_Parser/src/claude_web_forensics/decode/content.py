@@ -11,17 +11,17 @@ from typing import Any
 
 try:
     import brotli as _brotli
-except Exception:  # pragma: no cover - optional
+except Exception:
     _brotli = None
 
 try:
-    from compression import zstd as _stdlib_zstd  # type: ignore
-except Exception:  # pragma: no cover
+    from compression import zstd as _stdlib_zstd
+except Exception:
     _stdlib_zstd = None
 
 try:
     import zstandard as _zstandard
-except Exception:  # pragma: no cover - optional
+except Exception:
     _zstandard = None
 
 NOT_ENCODED = "NOT_ENCODED"
@@ -41,10 +41,7 @@ class DecodeResult:
     data: bytes
     status: str
     content_encoding: str | None = None
-    applied_decoders: list[str] = field(default_factory=list)
     error: str = ""
-    unsupported_encoding: str = ""
-    missing_decoder: str = ""
     attributes: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -84,7 +81,6 @@ def decompress_http_body(data: bytes, content_encoding: str | None) -> DecodeRes
         return DecodeResult(data=data, status=NOT_ENCODED, content_encoding=content_encoding)
 
     decoded = data
-    applied: list[str] = []
     try:
         for enc in reversed(encodings):
             if enc in ("identity", ""):
@@ -100,37 +96,33 @@ def decompress_http_body(data: bytes, content_encoding: str | None) -> DecodeRes
                 if _brotli is None:
                     return DecodeResult(
                         data=data, status=DECODER_UNAVAILABLE, content_encoding=content_encoding,
-                        applied_decoders=applied, missing_decoder="brotli",
                     )
                 decoded = _brotli.decompress(decoded)
             elif enc in ("zstd", "zstandard"):
                 if _stdlib_zstd is None and _zstandard is None:
                     return DecodeResult(
                         data=data, status=DECODER_UNAVAILABLE, content_encoding=content_encoding,
-                        applied_decoders=applied, missing_decoder="zstd",
                     )
                 decoded = zstd_decompress(decoded)
             else:
                 return DecodeResult(
                     data=data, status=UNSUPPORTED_ENCODING, content_encoding=content_encoding,
-                    applied_decoders=applied, unsupported_encoding=enc,
                 )
-            applied.append(enc)
 
             if _check_bomb(len(data), len(decoded)):
                 return DecodeResult(
                     data=data, status=DECODE_LIMITED, content_encoding=content_encoding,
-                    applied_decoders=applied, error=f"decoded size {len(decoded)} exceeds limit",
+                    error=f"decoded size {len(decoded)} exceeds limit",
                     attributes={"decoded_size": len(decoded)},
                 )
     except Exception as exc:
         return DecodeResult(
             data=data, status=DECOMPRESSION_ERROR, content_encoding=content_encoding,
-            applied_decoders=applied, error=f"{type(exc).__name__}: {exc}",
+            error=f"{type(exc).__name__}: {exc}",
         )
 
     return DecodeResult(
-        data=decoded, status=DECOMPRESSED, content_encoding=content_encoding, applied_decoders=applied,
+        data=decoded, status=DECOMPRESSED, content_encoding=content_encoding,
     )
 
 def sniff_and_decompress(data: bytes, content_encoding: str | None) -> DecodeResult:

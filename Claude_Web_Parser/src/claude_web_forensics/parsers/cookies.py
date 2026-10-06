@@ -24,7 +24,7 @@ def parse_cookies(
     if not db_path.exists():
         return records, ParseStatus(
             artifact="Cookies", family=FAMILY_COOKIES, status=ST_NOT_FOUND, source_path=source_path,
-            message="Cookies database not staged", impact="cookie metadata unavailable",
+            message="Cookies database not staged",
         )
 
     try:
@@ -32,7 +32,7 @@ def parse_cookies(
     except Exception as exc:
         return records, ParseStatus(
             artifact="Cookies", family=FAMILY_COOKIES, status=ST_FAILED, source_path=source_path,
-            error_code=type(exc).__name__, message=str(exc), impact="cookie metadata unavailable",
+            message=str(exc),
         )
 
     try:
@@ -110,5 +110,5 @@ def parse_cookies(
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
         artifact="Cookies", family=FAMILY_COOKIES, status=status, source_path=source_path,
-        record_count=len(records), error_count=len(errors), message="; ".join(errors[:5]),
+        record_count=len(records), message="; ".join(errors[:5]),
     )
