@@ -2794,6 +2794,11 @@ def detect_application(ctx: AnalysisContext, runtime: RuntimeObservations, logs:
                 candidate.decision_reason += "; 직접 실행 시각 미확인; runtime filesystem mtime을 발생 시각 fallback으로 사용"
 
 
+def is_runtime_ui_state_file(path: str) -> bool:
+    name = basename(path).lower()
+    return name in {"global.json", "server-logs-state.json"} or re.fullmatch(r"window-\d+\.json", name) is not None
+
+
 def detect_runtime_exit(ctx: AnalysisContext, runtime: RuntimeObservations, logs: list[ObservedFact]) -> None:
     cleanup = [
         f for f in ctx.facts
@@ -2804,7 +2809,7 @@ def detect_runtime_exit(ctx: AnalysisContext, runtime: RuntimeObservations, logs
         facts = runtime.ui_flush + cleanup + normal_logs
         add_candidate(ctx, "application_normal_exit", facts, ["positive state flush", "runtime cleanup/log"], "LM Studio 정상 종료 흔적_state flush 및 runtime 정리 근거")
     elif cleanup:
-        modified_ui = [f for f in ctx.facts if f.fact_type == "history_modify" and basename(f.target_path).lower() in {"global.json", "window-1.json", "server-logs-state.json"}]
+        modified_ui = [f for f in ctx.facts if f.fact_type == "history_modify" and is_runtime_ui_state_file(f.target_path)]
         if modified_ui:
             add_candidate(ctx, "application_normal_exit", cleanup + modified_ui, ["runtime cleanup", "state artifact update"], "LM Studio 정상 종료 흔적_state update 및 runtime 정리 근거", forced="suspected")
     forced_logs = [f for f in logs if f.fact_type == "forced_exit_log"]
@@ -3638,9 +3643,6 @@ def research_evidence_root(path: Path) -> Path | None:
 
 
 def validate_paths(input_path: Path, output_path: Path) -> str:
-    for protected in (Path(r"C:\WHS\DiskImages"), Path(r"C:\WHS\LMStudio_Research_Evidence")):
-        if is_inside(output_path, protected):
-            return "출력 경로는 보존 Evidence 내부일 수 없습니다."
     if not input_path.exists():
         return "입력 경로가 존재하지 않습니다."
     segment_number = split_raw_segment_number(input_path) if input_path.is_file() else None
@@ -3665,7 +3667,7 @@ def validate_paths(input_path: Path, output_path: Path) -> str:
 
 
 def validate_live_output(ctx: AnalysisContext, output: Path) -> str:
-    for protected in (Path(r"C:\WHS\DiskImages"), Path(r"C:\WHS\LMStudio_Research_Evidence"), *ctx.evidence_roots):
+    for protected in ctx.evidence_roots:
         if is_inside(output, protected) or is_inside(protected, output):
             return "Live 출력 경로가 수집 대상 directory와 겹칩니다. 별도 output directory를 지정하십시오."
     return ""
@@ -5351,8 +5353,15 @@ class FinalContractTests(FixtureCase):
         self.assertEqual('preserve', (ctx.input_path / 'recovered_conversations.csv').read_text())
 
     def test_protected_directories_reject_output_for_other_input(self):
-        for root in (r'C:\WHS\DiskImages', r'C:\WHS\LMStudio_Research_Evidence'):
-            self.assertTrue(parser.validate_paths(Path(parser.__file__), Path(root) / 'output'))
+        temporary = tempfile.TemporaryDirectory(prefix="SYNTHETIC_RESEARCH_PATH_")
+        self.addCleanup(temporary.cleanup)
+        research_root = Path(temporary.name) / "LMStudio_Research_Evidence"
+        for name in ("snapshot_a", "snapshot_b"):
+            input_path = research_root / name / "input.dd"
+            input_path.parent.mkdir(parents=True)
+            input_path.write_bytes(b"SYNTHETIC_EVIDENCE")
+            self.assertEqual(research_root, parser.research_evidence_root(input_path))
+            self.assertTrue(parser.validate_paths(input_path, research_root / "output"))
 
     def test_cli_progress_diagnostics_without_raw_prompt_or_secret(self):
         from contextlib import redirect_stdout, redirect_stderr
@@ -6559,6 +6568,119 @@ class BitLockerClearKeyRegressionTests(unittest.TestCase):
         vmk.clear_key.assert_called_once_with()
         vmk.decrypt.assert_called_once_with(clear_key)
         backend.unlock.assert_called_once_with(master_key)
+
+
+class DynamicOutputPathTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="SYNTHETIC_DYNAMIC_PATH_")
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.evidence = self.base / "evidence"
+        self.evidence.mkdir()
+        self.output = self.base / "output"
+        self.ctx = parser.AnalysisContext(self.evidence, live=True, evidence_roots=[self.evidence])
+
+    def test_offline_protection_uses_actual_input_only(self):
+        with patch.object(parser, "is_inside", wraps=parser.is_inside) as inside:
+            self.assertEqual("", parser.validate_paths(self.evidence, self.output))
+        self.assertEqual([(self.output, self.evidence)], [call.args for call in inside.call_args_list])
+
+    def test_offline_output_inside_input_is_rejected(self):
+        self.assertEqual("출력 경로는 Evidence directory 내부일 수 없습니다.",
+                         parser.validate_paths(self.evidence, self.evidence / "output"))
+
+    def test_offline_unrelated_output_is_allowed(self):
+        self.assertEqual("", parser.validate_paths(self.evidence, self.output))
+
+    def test_live_output_inside_actual_collection_root_is_rejected(self):
+        self.assertEqual("Live 출력 경로가 수집 대상 directory와 겹칩니다. 별도 output directory를 지정하십시오.",
+                         parser.validate_live_output(self.ctx, self.evidence / "output"))
+
+    def test_live_unrelated_output_is_allowed_without_fixed_roots(self):
+        with patch.object(parser, "is_inside", wraps=parser.is_inside) as inside:
+            self.assertEqual("", parser.validate_live_output(self.ctx, self.output))
+        self.assertEqual([(self.output, self.evidence), (self.evidence, self.output)],
+                         [call.args for call in inside.call_args_list])
+
+    def test_live_output_equal_to_or_parent_of_collection_root_is_rejected(self):
+        for output in (self.evidence, self.base):
+            with self.subTest(output=output):
+                self.assertTrue(parser.validate_live_output(self.ctx, output))
+
+    def test_research_evidence_parent_remains_protected(self):
+        research = self.base / "LMStudio_Research_Evidence"
+        snapshot = research / "snapshot"
+        snapshot.mkdir(parents=True)
+        self.assertEqual("출력 경로는 Research Evidence 내부일 수 없습니다.",
+                         parser.validate_paths(snapshot, research / "output"))
+        self.assertEqual("", parser.validate_paths(snapshot, self.output))
+
+    def test_output_cannot_replace_evidence_file(self):
+        evidence = self.evidence / "input.dd"
+        evidence.write_bytes(b"SYNTHETIC_EVIDENCE")
+        before = (evidence.read_bytes(), evidence.stat().st_mtime_ns)
+        self.assertEqual("출력 경로는 Evidence file과 같을 수 없습니다.",
+                         parser.validate_paths(evidence, evidence))
+        self.assertEqual(before, (evidence.read_bytes(), evidence.stat().st_mtime_ns))
+
+
+class RuntimeUiStateFileTests(FixtureCase):
+    def test_global_json_is_ui_state(self):
+        self.assertTrue(parser.is_runtime_ui_state_file("global.json"))
+
+    def test_server_logs_state_json_is_ui_state(self):
+        self.assertTrue(parser.is_runtime_ui_state_file("server-logs-state.json"))
+
+    def test_window_1_json_is_ui_state(self):
+        self.assertTrue(parser.is_runtime_ui_state_file("window-1.json"))
+
+    def test_window_2_json_is_ui_state(self):
+        self.assertTrue(parser.is_runtime_ui_state_file("window-2.json"))
+
+    def test_numeric_windows_and_case_insensitive_paths_are_ui_state(self):
+        for path in ("window-25.json", "window-999.json", r"profile\WINDOW-10.JSON"):
+            with self.subTest(path=path):
+                self.assertTrue(parser.is_runtime_ui_state_file(path))
+
+    def test_window_without_number_is_not_ui_state(self):
+        self.assertFalse(parser.is_runtime_ui_state_file("window.json"))
+
+    def test_window_with_empty_number_is_not_ui_state(self):
+        self.assertFalse(parser.is_runtime_ui_state_file("window-.json"))
+
+    def test_window_with_text_number_is_not_ui_state(self):
+        self.assertFalse(parser.is_runtime_ui_state_file("window-test.json"))
+
+    def test_window_with_wrong_extension_is_not_ui_state(self):
+        self.assertFalse(parser.is_runtime_ui_state_file("window-1.txt"))
+
+    def test_window_with_extra_prefix_is_not_ui_state(self):
+        self.assertFalse(parser.is_runtime_ui_state_file("my-window-1.json"))
+
+    def test_window_2_history_update_supports_suspected_normal_exit(self):
+        ctx = self.analyze_files({"history.csv": history(
+            ("$ROOT\\http-server.json", "File_Deleted"),
+            ("$ROOT\\window-2.json", "Data_Overwrite"),
+        )})
+        candidates = self.candidates(ctx, "application_normal_exit")
+        self.assertEqual(1, len(candidates))
+        candidate = candidates[0]
+        self.assertEqual("suspected", candidate.decision_status)
+        self.assertEqual(["history_delete", "history_modify"], [fact.fact_type for fact in candidate.facts])
+        self.assertEqual(["http-server.json", "window-2.json"],
+                         [parser.basename(fact.target_path) for fact in candidate.facts])
+        self.assertEqual("LM Studio 정상 종료 흔적_state update 및 runtime 정리 근거", candidate.decision_reason)
+        self.assertEqual("2026-09-16 03:51:56.973000 KST", parser.format_timestamp_kst(candidate.timestamp))
+        self.assertEqual("의심", parser.timeline_rows(ctx)[0][4])
+
+    def test_invalid_window_history_updates_do_not_support_normal_exit(self):
+        for name in ("window.json", "window-.json", "window-test.json", "window-1.txt", "my-window-1.json"):
+            with self.subTest(name=name):
+                ctx = self.analyze_files({"history.csv": history(
+                    ("$ROOT\\http-server.json", "File_Deleted"),
+                    ("$ROOT\\" + name, "Data_Overwrite"),
+                )})
+                self.assertEqual([], self.candidates(ctx, "application_normal_exit"))
 
 
 def run_self_tests() -> int:
