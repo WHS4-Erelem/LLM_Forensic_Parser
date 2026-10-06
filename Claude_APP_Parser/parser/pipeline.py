@@ -12,7 +12,7 @@ from .errors import ArtifactNotFoundError, ClError
 from .image import open_image
 from . import model
 from .model import RecordBuilder
-from .vfs import DirectoryVfs, TskImageVfs
+from .vfs import DirectoryVfs, LiveVfs, TskImageVfs
 
 PARSERS = {
     "idb_leveldb": idb_art.parse,
@@ -254,7 +254,7 @@ def _near_dup(flat, already, matcher):
 
 def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         max_file_bytes=64 * 1024 * 1024, usn=True, usn_max_bytes=None,
-        verbose=False):
+        verbose=False, key_material=None):
     started = time.time()
     warnings, errors = [], []
 
@@ -264,7 +264,13 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             print("  %s" % msg, flush=True)
 
     # --- 1. 입력 열기 -------------------------------------------------
-    if input_type == "dir" or (input_type == "auto" and os.path.isdir(input_path)):
+    if input_type == "live":
+        # 자동 선택되지 않는다. 폴더를 주면 추출 트리(dir)로 보고, live 는 명시해야 한다.
+        vfs = LiveVfs(input_path)
+        image_desc = vfs.describe_input()
+        say("라이브 분석 — %s (관리자 권한 %s)" % (vfs.root, image_desc["elevated"]))
+        img = None
+    elif input_type == "dir" or (input_type == "auto" and os.path.isdir(input_path)):
         vfs = DirectoryVfs(input_path)
         image_desc = {"image_id": os.path.abspath(input_path), "image_type": "dir",
                       "file_name": os.path.basename(os.path.abspath(input_path)),
@@ -278,7 +284,17 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             % (image_desc["image_type"], len(image_desc["segments"]),
                image_desc["file_name"]))
         warnings.extend(image_desc.pop("warnings"))
-        vfs = TskImageVfs(img)
+        try:
+            vfs = TskImageVfs(img, key_material=key_material)
+        except ClError:
+            img.close()
+            raise
+        for vd, _fs in vfs.volumes:
+            if vd.get("encryption"):
+                say("BitLocker 볼륨 해제 — 파티션 %d (%s)" % (vd["index"], vd["unlock_method"]))
+        for lk in vfs.locked:
+            warnings.append("BitLocker 볼륨을 풀지 못해 건너뛰었습니다 — 파티션 %d: %s"
+                            % (lk["index"], lk["reason"]))
     fs_desc = vfs.describe()
     say("NTFS 볼륨 %d개 — 대상 경로 훑는 중…"
         % len(getattr(vfs, "volumes", []) or [1]))
@@ -303,10 +319,14 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             targets.append((kind, vfile, meta))
 
     if not inventory:
+        if img is not None:
+            img.close()
         raise ArtifactNotFoundError(
-            "이미지에서 Claude Desktop 아티팩트 경로를 하나도 찾지 못했습니다",
+            "%s에서 Claude Desktop 아티팩트 경로를 하나도 찾지 못했습니다"
+            % ("이 PC" if input_type == "live" else "이미지"),
             scanned_files=scanned,
-            searched_patterns=[p[0] for p in locate._PATTERNS])
+            searched_patterns=[p[0] for p in locate._PATTERNS],
+            **({"denied": getattr(vfs, "denied", [])} if input_type == "live" else {}))
     if other:
         warnings.append("이름만 겹치는 다른 제품의 경로는 제외했습니다: "
                         + ", ".join("%s %d건" % (k, v) for k, v in other.items()))
@@ -361,9 +381,24 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                 by_kind[kind] = by_kind.get(kind, 0) + len(recs)
         except ClError as exc:
             errors.append({"path": vfile.path, **exc.to_dict()})
+        except OSError as exc:
+            # 파일 내용을 읽지 못함 — 이미지의 손상 클러스터, 라이브의 잠긴 파일·권한 부족
+            errors.append({"path": vfile.path, "code": "FILE_READ_FAILED",
+                           "message": "%s: %s" % (type(exc).__name__, exc)})
         except Exception as exc:  # noqa: BLE001
             errors.append({"path": vfile.path, "code": "UNEXPECTED",
                            "message": "%s: %s" % (type(exc).__name__, exc)})
+
+    if getattr(vfs, "denied", None):
+        warnings.append("권한이 없어 열지 못한 폴더 %d건 — 관리자 권한으로 실행하면 더 볼 수 "
+                        "있습니다 (filesystem.denied)" % len(vfs.denied))
+    if getattr(vfs, "read_failures", None):
+        locked = sum(1 for f in vfs.read_failures if f.get("locked"))
+        warnings.append("열거는 됐지만 읽지 못한 파일 %d건%s (filesystem.read_failures)"
+                        % (len(vfs.read_failures),
+                           " — 그중 %d건은 실행 중인 Claude 앱이 잠근 파일이라 앱을 종료한 뒤 "
+                           "다시 실행하면 읽을 수 있습니다" % locked if locked else
+                           " — 권한이 없습니다"))
 
     for k, n in sorted(by_kind.items(), key=lambda x: -x[1]):
         say("[%s] 레코드 %d건" % (k, n))
@@ -394,6 +429,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     merged = _merge_snapshots(records)
     if merged:
         say("같은 공유 스냅샷 %d건을 하나로 합침" % merged)
+
 
     _drop_undefined(records)
 

@@ -10,3 +10,8 @@ ccl-chromium-reader==0.3.18
 # HTTP 캐시 응답은 대부분 zstd 로 눌려 있다. 없으면 평문만 훑게 되어
 # 공유 스냅샷 같은 압축 구간 안의 근거를 놓친다 (파서는 멈추지 않는다).
 zstandard==0.25.0
+
+# BitLocker 볼륨 해제 (이미지 입력). 팀 Claude Web · ChatGPT 파서와 같은 버전.
+# pycryptodome 이 함께 설치되어 AES-XTS 를 빠르게 푼다. 없으면 BitLocker
+# 파티션만 VOLUME_LOCKED 로 멈추고 일반 이미지·라이브 입력은 그대로 동작한다.
+dissect.fve==4.6
