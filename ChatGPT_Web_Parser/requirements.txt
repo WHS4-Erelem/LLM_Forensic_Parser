@@ -8,6 +8,8 @@ cramjam==2.12.1       # LevelDB .ldb(SSTable) raw Snappy 해제. Local Storage .
 dissect.fve==4.6      # BitLocker 볼륨 해제 (--image). 팀 기존 구현과 같은 버전 — 없으면 BitLocker 파티션만
                       # IMAGE_BITLOCKER_LOCKED 로 남기고 나머지 파티션·입력은 그대로 동작한다.
                       # pycryptodome 은 선택 가속 경로라 필수 의존성으로 두지 않는다 (팀 구현과 동일).
+dissect.ntfs==3.16    # BitLocker 복호화 볼륨의 NTFS 접근 (--image). 팀 Claude Web 파서와 같은 버전.
+                      # 복호화 볼륨에만 쓰인다 — 비암호화 NTFS 는 pytsk3 경로를 그대로 쓴다.
 
 # E01/EWF 입력 전용 — Python 3.12 에서만 설치된다 (cp313 wheel 없음, LGPLv3+).
 # Python 3.13 에서 E01 을 주면 E01_INPUT_REQUIRES_PYEWF 로 거부하고 DD/RAW 는 정상 동작한다.

@@ -37,6 +37,9 @@ from .source import Source, normalize_source_path
 #     Adapter 로 연결한다. 전체를 RAW 로 변환하지 않고 요청한 offset/size 만 읽는다. split segment 는 pyewf.glob 이 모은다.
 #     pyewf 가 없는 환경에서는 E01 입력만 E01_INPUT_REQUIRES_PYEWF 오류로 거부하고 DD/RAW 는 그대로 동작한다.
 #     주의: pytsk3 의 형식 자동 판별(TSK_IMG_TYPE_DETECT)은 E01 을 RAW 로 잘못 열기 때문에 쓰지 않는다 (2026-09-17 실측).
+#   - BitLocker 파티션 (2026-10-07): bitlocker.open_volume() 이 clear key 로 푼 복호화 스트림을
+#     dissect.ntfs 의 NTFS 로 직접 연다 (DissectNtfsFilesystem). 복호화 볼륨에는 pytsk3 를 쓰지 않는다.
+#     비암호화 파티션은 위의 pytsk3 경로 그대로다 — 두 경로가 ImageSource 에 같은 계약을 준다.
 
 try:  # 선택 의존성
     import pytsk3  # type: ignore[import-not-found]
@@ -153,6 +156,71 @@ class TskFilesystem:
         return self._open(path).read_random(offset, size)
 
 
+class DissectNtfsFilesystem:
+    """dissect.ntfs 의 NTFS 위의 최소 파일 접근. TskFilesystem 과 **같은 계약**이다
+    (stat / listdir / read 3개만 제공하고 경로는 'Users/...' 형태를 받는다).
+
+    BitLocker 복호화 볼륨 전용이다 — 비암호화 NTFS 는 기존 TskFilesystem(pytsk3) 을 그대로 쓴다.
+    8.3 단축 이름은 listdir(ignore_dos=True) 로 걸러 같은 폴더를 두 번 돌지 않게 한다.
+    """
+
+    def __init__(self, fs: Any) -> None:
+        self._fs = fs
+        self._last: tuple[str, Any] | None = None      # MFT 경로 조회를 매 chunk 마다 반복하지 않는다
+
+    def _record(self, path: str) -> Any:
+        if self._last is not None and self._last[0] == path:
+            return self._last[1]
+        try:
+            record = self._fs.mft.get(path)
+        except Exception:          # noqa: BLE001 - 없는 경로·깨진 레코드는 "없음" 으로만 쓴다
+            return None
+        self._last = (path, record)
+        return record
+
+    def stat(self, path: str) -> tuple[str, int, int] | None:
+        """(kind: dir / file / other, size, MFT segment) 또는 없으면 None."""
+        record = self._record(path)
+        if record is None:
+            return None
+        try:
+            is_dir = bool(record.is_dir())
+            size = 0 if is_dir else int(record.size())
+        except Exception:          # noqa: BLE001
+            return None
+        return ("dir" if is_dir else "file", size, int(getattr(record, "segment", 0) or 0))
+
+    def listdir(self, path: str) -> list[str]:
+        record = self._record(path)
+        if record is None:
+            return []
+        try:
+            entries = record.listdir(ignore_dos=True)
+        except Exception:          # noqa: BLE001
+            return []
+        return sorted(name for name in entries if name not in (".", ".."))
+
+    def read(self, path: str, offset: int, size: int) -> bytes:
+        record = self._record(path)
+        if record is None:
+            raise OSError(f"image file not found: {path}")
+        with record.open() as handle:
+            handle.seek(offset)
+            return handle.read(size)
+
+
+def _open_dissect_ntfs(stream: Any) -> Any:
+    """복호화 볼륨 스트림 → dissect.ntfs NTFS. 열리지 않으면 None (해당 파티션만 건너뛴다)."""
+    try:
+        from dissect.ntfs import NTFS
+    except ImportError:            # pragma: no cover - 설치되지 않은 환경
+        raise ImageOpenError("dissect.ntfs is not installed (ChatGPT_Web_Parser/requirements.txt)") from None
+    try:
+        return NTFS(stream)
+    except Exception:              # noqa: BLE001 - NTFS 가 아니거나 깨진 볼륨
+        return None
+
+
 class ImageSource(Source):
     """
     이미지 안에서 선택한 파일시스템을 읽기 전용 Source 로 제공한다 (DirectorySource 와 같은 계약).
@@ -164,7 +232,7 @@ class ImageSource(Source):
 
     def __init__(self, filesystem: Any, *, image_path: str | os.PathLike[str], partition: str | None = None,
                  filesystem_name: str | None = "NTFS", warnings: list[str] | None = None, image: Any = None,
-                 kind: str = "dd") -> None:
+                 kind: str = "dd", keep_alive: list[Any] | None = None) -> None:
         self.kind = kind  # "dd" (DD/RAW) 또는 "e01" (EWF)
         self.filesystem = filesystem
         self.root = str(image_path)
@@ -172,6 +240,8 @@ class ImageSource(Source):
         self.filesystem_name = filesystem_name
         self.warnings = list(warnings or [])
         self._image = image
+        # BitLocker 복호화 스트림·NTFS 객체는 close() 전에 GC 되면 읽기가 죽는다 — 여기서 참조를 잡아 둔다.
+        self._keep_alive = list(keep_alive or [])
 
     def close(self) -> None:
         """이미지 핸들 해제. pytsk3 는 Img_Info.close() 후에도 관련 객체 참조가 모두 사라져야 파일을 놓는다 (2026-09-15 확인)."""
@@ -179,6 +249,7 @@ class ImageSource(Source):
             self._image.close()
         self._image = None
         self.filesystem = None
+        self._keep_alive = []        # 복호화 스트림·NTFS 참조도 여기서 함께 놓는다
         gc.collect()
 
     def _stat(self, path: str) -> tuple[str, int, int] | None:
@@ -319,31 +390,37 @@ def open_image_source(image_path: str | os.PathLike[str], key_material: str | No
     if not partitions:  # 파티션 표 없음 → NTFS 파티션 이미지일 수 있다
         partitions = [ImagePartition(index=None, description="whole image", start_sector=0, sector_count=None,
                                      block_size=None, byte_offset=0)]
-    candidates: list[tuple[ImagePartition, TskFilesystem, bool]] = []
+    candidates: list[tuple[ImagePartition, Any, bool]] = []
     fs_info = None
-    unlocked_images: list[Any] = []          # 복호화 볼륨은 ImageSource 가 닫힐 때까지 살아 있어야 한다
+    keep_alive: list[Any] = []               # 복호화 스트림·NTFS 는 ImageSource 가 닫힐 때까지 살아 있어야 한다
     for partition in partitions:
-        fs_image, fs_offset = image, partition.byte_offset
         if bitlocker.is_bitlocker(image, partition.byte_offset):
+            # BitLocker 볼륨: 복호화 스트림을 dissect.ntfs 로 직접 읽는다 (pytsk3 를 거치지 않는다).
             warnings.append(f"{IMAGE_BITLOCKER_DETECTED}:{partition.label}")
             size = (partition.sector_count or 0) * (partition.block_size or 0)
             try:
-                fs_image, method = bitlocker.open_volume(image, partition.byte_offset, size, key_material)
+                stream, method = bitlocker.open_volume(image, partition.byte_offset, size, key_material)
             except bitlocker.VolumeLockedError as exc:      # 키 없음·틀린 키·라이브러리 없음 — 값은 남기지 않는다
                 warnings.append(f"{IMAGE_BITLOCKER_LOCKED}:{partition.label}:{exc}")
                 continue
-            unlocked_images.append(fs_image)
-            fs_offset = 0                                   # 복호화 볼륨은 그 자체가 하나의 이미지다
             warnings.append(f"{IMAGE_BITLOCKER_UNLOCKED}:{partition.label}:{method}")
-        try:
-            fs_info = pytsk3.FS_Info(fs_image, offset=fs_offset)
-        except OSError:
-            warnings.append(f"{IMAGE_FILESYSTEM_OPEN_FAILED}:{partition.label}")
-            continue
-        if int(fs_info.info.ftype) != int(pytsk3.TSK_FS_TYPE_NTFS):
-            warnings.append(f"{IMAGE_PARTITION_NOT_NTFS}:{partition.label}")
-            continue
-        filesystem = TskFilesystem(fs_info)
+            ntfs = _open_dissect_ntfs(stream)
+            if ntfs is None:
+                warnings.append(f"{IMAGE_FILESYSTEM_OPEN_FAILED}:{partition.label}")
+                continue
+            keep_alive += [stream, ntfs]
+            filesystem: Any = DissectNtfsFilesystem(ntfs)
+        else:
+            # 비암호화 파티션: 기존 pytsk3 경로 그대로 (DD/RAW·E01·비암호화 NTFS 동작 불변).
+            try:
+                fs_info = pytsk3.FS_Info(image, offset=partition.byte_offset)
+            except OSError:
+                warnings.append(f"{IMAGE_FILESYSTEM_OPEN_FAILED}:{partition.label}")
+                continue
+            if int(fs_info.info.ftype) != int(pytsk3.TSK_FS_TYPE_NTFS):
+                warnings.append(f"{IMAGE_PARTITION_NOT_NTFS}:{partition.label}")
+                continue
+            filesystem = TskFilesystem(fs_info)
         users = filesystem.stat("Users")
         candidates.append((partition, filesystem, users is not None and users[0] == "dir"))
     if not candidates:
@@ -357,4 +434,4 @@ def open_image_source(image_path: str | os.PathLike[str], key_material: str | No
     reason = "first NTFS partition with a Users directory" if with_users else "first NTFS partition (no Users directory)"
     warnings += [f"{IMAGE_NTFS_CANDIDATES}:{len(candidates)}", f"{IMAGE_PARTITION_SELECTED}:{partition.label}:{reason}"]
     return ImageSource(filesystem, image_path=path, partition=partition.describe(), warnings=warnings, image=image,
-                       kind=kind)
+                       kind=kind, keep_alive=keep_alive)

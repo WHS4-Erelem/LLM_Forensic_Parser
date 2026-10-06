@@ -3,8 +3,9 @@
 구현 방식은 팀의 기존 구현을 그대로 따른다 — ChatGPT Desktop 파서 `cxparser/bitlocker.py`
 (Claude Web 파서 `image/volumes.py` 와 같은 키 규약). 새 방식·새 키 형식을 만들지 않는다.
   감지   파티션 선두의 '-FVE-FS-'
-  해제   dissect.fve 의 BDE (clear key · 복구 키 · 암호 · BEK · FVEK)
-  연결   복호화 스트림을 pytsk3.Img_Info 로 노출 → 기존 FS_Info / Discovery 경로를 그대로 쓴다
+  해제   dissect.fve 의 BDE (clear key 우선 · 복구 키 · 암호 · BEK · FVEK)
+  연결   복호화 스트림을 그대로 돌려준다 → image.py 가 dissect.ntfs 로 NTFS 를 연다
+         (복호화 볼륨에는 pytsk3 를 쓰지 않는다. 비암호화 NTFS 는 기존 pytsk3 경로를 그대로 쓴다.)
 
 키 형식 (팀 공통): recovery:<48자리> | passphrase:<암호> | bek:<.BEK 경로> | fvek:<hex>
 환경변수 ERELM_KEY_MATERIAL 로도 받는다 (명령행 기록에 남기지 않을 때).
@@ -18,11 +19,6 @@ from __future__ import annotations
 import io
 import os
 from typing import Any
-
-try:                      # 이미지 입력에서만 필요한 선택 의존성
-    import pytsk3
-except ImportError:       # pragma: no cover - 설치되지 않은 환경
-    pytsk3 = None         # type: ignore[assignment]
 
 SIGNATURE = b"-FVE-FS-"
 KEY_KINDS = ("recovery", "passphrase", "bek", "fvek")
@@ -90,38 +86,18 @@ class _PartitionFile:
         return data
 
 
-def _plain_img_info(stream: Any) -> Any:
-    """복호화 스트림을 TSK 이미지로 노출 (볼륨 하나 = offset 0 에서 시작하는 이미지)."""
-    if pytsk3 is None:                                      # pragma: no cover
-        raise VolumeLockedError("pytsk3 가 없어 복호화 볼륨을 열 수 없습니다")
-
-    class _PlainImgInfo(pytsk3.Img_Info):                   # pytsk3 가 있을 때만 정의된다
-        def __init__(self, decrypted: Any):
-            self._stream = decrypted
-            super().__init__(url="", type=pytsk3.TSK_IMG_TYPE_EXTERNAL)
-
-        def close(self) -> None:
-            pass
-
-        def read(self, offset: int, size: int) -> bytes:
-            self._stream.seek(offset)
-            return self._stream.read(size)
-
-        def get_size(self) -> int:
-            return self._stream.size
-
-    return _PlainImgInfo(stream)
-
-
 def _short(exc: BaseException) -> str:
     """예외 요약 한 줄. 키 값이 섞여 들어가지 않도록 길이를 제한한다."""
     return (f"{type(exc).__name__}: {exc}").splitlines()[0][:200]
 
 
 def open_volume(image: Any, offset: int, size: int, key_material: str | None = None) -> tuple[Any, str]:
-    """BitLocker 파티션 → (복호화된 TSK 이미지, 해제 방법 이름). 못 풀면 VolumeLockedError.
+    """BitLocker 파티션 → (복호화된 볼륨 스트림, 해제 방법 이름). 못 풀면 VolumeLockedError.
 
     해제 순서는 팀 구현과 같다: 이미 복호화된 상태 → clear key → 받은 키.
+    clear key 가 있으면 --key-material / 환경변수 없이도 이 경로로 열린다.
+    돌려주는 것은 dissect.fve 가 만든 복호화 스트림(seek/read 가능) 자체다 — 호출자가
+    dissect.ntfs 로 NTFS 를 연다. 스트림은 분석이 끝날 때까지 살아 있어야 한다.
     """
     try:
         from dissect.fve.bde import BDE
@@ -178,7 +154,8 @@ def open_volume(image: Any, offset: int, size: int, key_material: str | None = N
 
     stream = bde.open()
     _speed_up(stream)
-    return _plain_img_info(stream), method
+    stream._erelm_bde = bde          # BDE 가 먼저 GC 되면 복호화 스트림이 죽는다 — 수명을 묶어 둔다
+    return stream, method
 
 
 def _speed_up(stream: Any) -> None:

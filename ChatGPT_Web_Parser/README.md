@@ -15,7 +15,7 @@ WHS 대학 팀 프로젝트 *"LLM 대화 내용 추출 및 사용자 행위 분�
 |---|---|
 | Python | **3.12 / 3.13** (둘 다 전체 테스트 통과 확인) |
 | 필수 | 없음 — 표준 라이브러리만으로 폴더 입력 분석이 동작한다 |
-| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `dissect.fve==4.6`(BitLocker 볼륨) · `libewf-python`(E01) |
+| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `dissect.fve==4.6`+`dissect.ntfs==3.16`(BitLocker 볼륨) · `libewf-python`(E01) |
 
 ```
 pip install -r requirements.txt
@@ -96,9 +96,21 @@ History 파일 하나를 고르는 방식이 **아니다**. Chrome User Data 를
 ## 2-3. BitLocker 볼륨 (Image Mode)
 
 이미지 안의 파티션이 BitLocker 로 암호화돼 있으면 선두의 `-FVE-FS-` 로 알아보고, `dissect.fve` 로 풀어서
-복호화 스트림을 기존 이미지 분석 경로에 그대로 연결한다. **원본 이미지는 읽기만 하고 복호화본을 따로 저장하지 않는다.**
-clear key · 일시 중단(suspended) 상태의 볼륨은 키 없이 열린다. 키가 없거나 맞지 않으면 그 파티션만
-`IMAGE_BITLOCKER_LOCKED` 로 남기고 다른 파티션을 계속 확인한다 (무차별 대입·우회는 하지 않는다).
+그 **복호화 스트림을 `dissect.ntfs` 의 NTFS 로 직접 연다.** **원본 이미지는 읽기만 하고 복호화본을 따로 저장하지 않는다.**
+clear key · 일시 중단(suspended) 상태의 볼륨은 키 없이 열린다 (clear key 가 있으면 항상 clear key 가 먼저다).
+키가 없거나 맞지 않으면 그 파티션만 `IMAGE_BITLOCKER_LOCKED` 로 남기고 다른 파티션을 계속 확인한다
+(무차별 대입·우회는 하지 않는다).
+
+```
+BitLocker 파티션 → dissect.fve BDE → clear key 자동 해제 → bde.open()
+                 → dissect.ntfs NTFS(복호화 stream) → DissectNtfsFilesystem → ImageSource → 기존 분석 경로
+
+비암호화 NTFS    → pytsk3 Volume_Info / FS_Info → TskFilesystem → ImageSource → 기존 분석 경로
+```
+
+**복호화 볼륨에만 `dissect.ntfs` 를 쓴다** — DD/RAW·E01 의 비암호화 NTFS 는 기존 `pytsk3` 경로 그대로다.
+두 경로가 `ImageSource` 에 같은 계약(`stat` / `listdir` / `read`)을 주므로 Discovery·Reader·Rule 은 공통이다.
+복호화 스트림과 NTFS 객체는 `ImageSource.close()` 까지 참조가 유지된다 (중간에 GC 되면 읽기가 끊긴다).
 
 지원하는 키 형식:
 
@@ -123,8 +135,11 @@ fvek:<hex>
 > Parser 는 키 값을 stdout · stderr · warning · 예외 메시지 · `result.json` · CSV 어디에도 쓰지 않는다
 > (키 종류와 보호자 목록만 남긴다).
 
-검증 상태: BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출은 단위 테스트로 확인했다.
-**실제 암호화 이미지에 복구 키를 넣어 푸는 실증 검증은 테스트용 암호화 이미지가 있어야 하며 아직 수행하지 않았다.**
+검증 상태: BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출 · clear key 해제 후 복호화 스트림이
+`dissect.ntfs` 로 넘어가는 배선 · 복호화 볼륨이 `pytsk3` 를 거치지 않는 것 · 비암호화 NTFS 가 기존
+`pytsk3` 경로를 유지하는 것은 **단위 테스트로 확인했다.**
+**실제 암호화 이미지로 여는 실증(E2E) 검증은 테스트용 암호화 이미지가 있어야 하며 아직 수행하지 않았다
+(`NOT TESTED / BLOCKED_NO_ENCRYPTED_IMAGE`). 별도 환경에서 재검증이 필요하다.**
 
 ## 2-1. Python 통합 (팀 Controller 에서 호출)
 

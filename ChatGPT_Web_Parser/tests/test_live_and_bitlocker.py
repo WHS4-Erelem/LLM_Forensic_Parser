@@ -5,14 +5,18 @@
 """
 from __future__ import annotations
 
+import gc
+import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from chatgpt_parser import bitlocker, live                      # noqa: E402
+from chatgpt_parser import bitlocker, image, live                # noqa: E402
 from chatgpt_parser.artifacts.cache import CACHE_DIR_PARTS      # noqa: E402
 from chatgpt_parser.artifacts.local_storage import LOCAL_STORAGE_DIR_PARTS  # noqa: E402
 from chatgpt_parser.artifacts.session_storage import SESSION_STORAGE_DIR_PARTS  # noqa: E402
@@ -31,6 +35,9 @@ class FakeImage:
 
     def read(self, offset: int, size: int) -> bytes:
         return self.data[offset:offset + size]
+
+    def close(self) -> None:
+        """pytsk3.Img_Info 처럼 close() 를 받는다 (ImageSource.close 가 호출한다)."""
 
 
 def bitlocker_boot_sector() -> bytes:
@@ -127,6 +134,189 @@ class BitLockerLockedVolumeTest(unittest.TestCase):
             self._open("madeup:secret-value")
         except bitlocker.VolumeLockedError as exc:
             self.assertNotIn("secret-value", str(exc))
+
+
+class FakeDecryptedStream(io.BytesIO):
+    """BDE.open() 이 주는 복호화 스트림 자리 — seek/read 가 되는 객체면 된다."""
+
+    size = 0
+
+
+class FakeBde:
+    """dissect.fve 의 BDE 자리. 실제 암호화 이미지가 없으므로 보호자 조합만 흉내 낸다."""
+
+    instances: list["FakeBde"] = []
+
+    def __init__(self, stream, *, clear_key=True):
+        self.calls: list[str] = []
+        self.unlocked = False
+        self._clear_key = clear_key
+        self.stream = FakeDecryptedStream(b"\x00" * 1024)
+        FakeBde.instances.append(self)
+
+    def has_clear_key(self):
+        self.calls.append("has_clear_key")
+        return self._clear_key
+
+    def has_recovery_password(self):
+        return False
+
+    def has_passphrase(self):
+        return False
+
+    def has_bek(self):
+        return False
+
+    def unlock_with_clear_key(self):
+        self.calls.append("unlock_with_clear_key")
+        self.unlocked = True
+
+    def open(self):
+        self.calls.append("open")
+        return self.stream
+
+
+class FakeNtfs:
+    """dissect.ntfs.NTFS 자리. 생성에 쓰인 stream 을 기록해 배선을 검증한다."""
+
+    opened: list[object] = []
+
+    def __init__(self, fh):
+        self.fh = fh
+        self.mft = self
+        FakeNtfs.opened.append(fh)
+
+    def get(self, path):                      # fs.mft.get(path)
+        return FakeRecord(path)
+
+
+class FakeRecord:
+    """dissect.ntfs MftRecord 자리 (is_dir / size / open / listdir)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.segment = 42
+
+    def is_dir(self):
+        return not self.path.endswith(".log")
+
+    def size(self):
+        return 11
+
+    def open(self):
+        return io.BytesIO(b"hello-world")
+
+    def listdir(self, ignore_dos=False):
+        assert ignore_dos, "8.3 단축 이름을 걸러야 같은 폴더를 두 번 돌지 않는다"
+        return {"llmtest": FakeRecord("Users/llmtest"), ".": self, "..": self}
+
+
+class BitLockerClearKeyToDissectNtfsTest(unittest.TestCase):
+    """clear key 자동 해제 → dissect.ntfs 배선. 실제 암호화 이미지가 없어 더블로 seam 만 검증한다."""
+
+    def setUp(self):
+        FakeBde.instances = []
+        FakeNtfs.opened = []
+
+    def _unlock(self, key_material=None, clear_key=True):
+        img = FakeImage(bitlocker_boot_sector() + bytes(4096))
+        factory = lambda stream: FakeBde(stream, clear_key=clear_key)  # noqa: E731
+        with mock.patch("dissect.fve.bde.BDE", factory):
+            return bitlocker.open_volume(img, 0, 4096 + 512, key_material)
+
+    def test_clear_key_unlock_hands_the_decrypted_stream_to_dissect_ntfs(self):
+        """TEST 1 — has_clear_key → unlock_with_clear_key → bde.open() → NTFS(복호화 stream)."""
+        stream, method = self._unlock()
+        bde = FakeBde.instances[0]
+        self.assertEqual(method, "clear_key")
+        self.assertEqual(bde.calls, ["has_clear_key", "unlock_with_clear_key", "open"])
+        self.assertIs(stream, bde.stream)                 # pytsk3 Img_Info 로 감싸지 않는다
+        with mock.patch("dissect.ntfs.NTFS", FakeNtfs):
+            fs = image._open_dissect_ntfs(stream)
+        self.assertIsInstance(fs, FakeNtfs)
+        self.assertIs(FakeNtfs.opened[0], stream)         # NTFS 가 받은 것이 그 복호화 stream 이다
+
+    def test_clear_key_works_without_any_key_material(self):
+        """TEST 2 — ERELM_KEY_MATERIAL / --key-material 이 없어도 clear key 경로로 열린다."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(bitlocker.key_material_from_env(None))
+            stream, method = self._unlock(key_material=None)
+        self.assertEqual(method, "clear_key")
+        self.assertIsNotNone(stream)
+
+    def test_decrypted_volume_never_goes_through_pytsk3(self):
+        """TEST 3 — 복호화 볼륨에는 pytsk3.FS_Info 를 쓰지 않는다."""
+        self.assertFalse(hasattr(bitlocker, "pytsk3"))          # 모듈이 pytsk3 를 더 이상 참조하지 않는다
+        self.assertFalse(hasattr(bitlocker, "_plain_img_info"))  # pytsk3 Img_Info 브리지 제거
+        stream, _ = self._unlock()
+        mro_names = [cls.__name__ for cls in type(stream).__mro__]
+        self.assertNotIn("Img_Info", mro_names)                  # TSK 이미지로 감싸지 않은 raw stream 이다
+        self.assertTrue(hasattr(stream, "read") and hasattr(stream, "seek"))
+
+    def test_locked_volume_without_clear_key_keeps_the_locked_contract(self):
+        """TEST 5 — clear key 도 없고 받은 키도 없으면 기존 LOCKED 처리 그대로."""
+        with self.assertRaises(bitlocker.VolumeLockedError) as caught:
+            self._unlock(key_material=None, clear_key=False)
+        self.assertIn(bitlocker.BITLOCKER_LOCKED, str(caught.exception))
+
+    def test_bde_reference_is_kept_so_the_stream_stays_readable(self):
+        """스트림만 들고 있어도 BDE 가 GC 되어 읽기가 죽지 않아야 한다 (수명 관리)."""
+        stream, _ = self._unlock()
+        gc.collect()
+        stream.seek(0)
+        self.assertEqual(len(stream.read(16)), 16)
+
+
+class DissectNtfsFilesystemContractTest(unittest.TestCase):
+    """DissectNtfsFilesystem 이 TskFilesystem 과 같은 계약(stat/listdir/read)을 주는지."""
+
+    def setUp(self):
+        self.fs = image.DissectNtfsFilesystem(FakeNtfs(io.BytesIO(b"")))
+
+    def test_stat_reports_dir_file_and_size(self):
+        self.assertEqual(self.fs.stat("Users")[0], "dir")
+        kind, size, segment = self.fs.stat("Users/llmtest/x.log")
+        self.assertEqual((kind, size, segment), ("file", 11, 42))
+
+    def test_listdir_drops_dot_entries_and_short_names(self):
+        self.assertEqual(self.fs.listdir("Users"), ["llmtest"])
+
+    def test_read_returns_the_requested_slice(self):
+        self.assertEqual(self.fs.read("Users/llmtest/x.log", 0, 5), b"hello")
+        self.assertEqual(self.fs.read("Users/llmtest/x.log", 6, 5), b"world")
+
+    def test_missing_path_is_none_not_an_exception(self):
+        broken = image.DissectNtfsFilesystem(mock.Mock(mft=mock.Mock(get=mock.Mock(side_effect=KeyError))))
+        self.assertIsNone(broken.stat("Users"))
+        self.assertEqual(broken.listdir("Users"), [])
+
+
+class NonEncryptedImageKeepsPytsk3Test(unittest.TestCase):
+    """TEST 4 — 비암호화 NTFS 는 기존 pytsk3 경로를 그대로 쓴다 (dissect.ntfs 를 쓰지 않는다)."""
+
+    def test_plain_ntfs_partition_uses_tsk_filesystem(self):
+        FakeNtfs.opened = []
+        meta = mock.Mock(type=1, size=0, addr=5)
+        entry = mock.Mock(info=mock.Mock(meta=meta))
+        fs_info = mock.Mock(info=mock.Mock(ftype=7), open=mock.Mock(return_value=entry))
+        fake_tsk = mock.Mock(TSK_FS_TYPE_NTFS=7, TSK_FS_META_TYPE_DIR=1, TSK_FS_META_TYPE_REG=2,
+                             FS_Info=mock.Mock(return_value=fs_info),
+                             Img_Info=mock.Mock(return_value=FakeImage(ntfs_boot_sector())))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "plain.dd"
+            path.write_bytes(ntfs_boot_sector())
+            with mock.patch.object(image, "pytsk3", fake_tsk), \
+                 mock.patch.object(image, "list_image_partitions", return_value=([image.ImagePartition(
+                     index=1, description="Basic data partition", start_sector=0, sector_count=8,
+                     block_size=512, byte_offset=0)], [])), \
+                 mock.patch("dissect.ntfs.NTFS", FakeNtfs):
+                source = image.open_image_source(path)
+                try:
+                    self.assertIsInstance(source.filesystem, image.TskFilesystem)
+                    self.assertTrue(fake_tsk.FS_Info.called)      # 기존 pytsk3 경로가 쓰였다
+                    self.assertEqual(FakeNtfs.opened, [])         # dissect.ntfs 는 쓰이지 않았다
+                finally:
+                    source.close()
 
 
 class LiveArtifactListTest(unittest.TestCase):
