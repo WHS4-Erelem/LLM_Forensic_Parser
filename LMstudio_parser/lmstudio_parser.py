@@ -12,9 +12,11 @@ import argparse
 import base64
 import copy
 import csv
+import getpass
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -22,13 +24,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
+from contextlib import contextmanager
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence, TextIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlsplit
 
 
@@ -311,6 +315,9 @@ class AnalysisContext:
     issues: list[AnalysisIssue] = field(default_factory=list)
     parsed_json: dict[str, Any] = field(default_factory=dict)
     usn_stats: list[dict[str, Any]] = field(default_factory=list)
+    live: bool = False
+    evidence_roots: list[Path] = field(default_factory=list)
+    lmstudio_homes: list[str] = field(default_factory=list)
 
     def issue(self, code: str, path: str, limitation: str, fatal: bool = False) -> None:
         self.issues.append(AnalysisIssue(code, path, limitation, fatal))
@@ -564,20 +571,57 @@ def should_record_path(path: str) -> bool:
     )
 
 
+def local_access_issue(ctx: AnalysisContext, path: str, exc: OSError, fallback: str) -> None:
+    if not ctx.live:
+        ctx.issue(fallback, path, "artifact 접근 실패; 다른 artifact 분석은 계속됨")
+        return
+    if getattr(exc, "winerror", None) in {32, 33}:
+        code = "live_artifact_locked"
+    elif isinstance(exc, PermissionError):
+        code = "live_permission_denied"
+    elif isinstance(exc, FileNotFoundError):
+        code = "live_artifact_not_found"
+    else:
+        code = "live_artifact_read_failed"
+    ctx.issue(code, path, "로컬 artifact 접근 실패; 다른 artifact 분석은 계속됨")
+
+
+def lmstudio_log_path(ctx: AnalysisContext, path: str) -> bool:
+    low = lower_path(path)
+    return "\\.lmstudio\\server-logs\\" in low or any(
+        low.startswith(lower_path(home).rstrip("\\") + "\\server-logs\\")
+        for home in ctx.lmstudio_homes
+    )
+
+
 def add_local_file(ctx: AnalysisContext, path: Path, logical_path: str | None = None) -> None:
     try:
         st = path.stat()
-    except OSError:
-        ctx.issue("artifact_stat_failed", str(path), "artifact metadata 읽기 실패")
+    except OSError as exc:
+        local_access_issue(ctx, str(path), exc, "artifact_stat_failed")
         return
     original = logical_path or str(path.resolve())
     size = int(st.st_size)
     content = None
-    if should_read_content(original, size):
+    if should_read_content(original, size) or (lmstudio_log_path(ctx, original) and size <= MAX_LOG_BYTES):
         try:
-            content = path.read_bytes()
-        except OSError:
-            ctx.issue("artifact_read_failed", original, "artifact 내용 읽기 실패")
+            # Bound reads even when a live file grows after stat().
+            with path.open("rb") as fh:
+                content = fh.read(max(MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_EXPORT_BYTES) + 1)
+            if len(content) > max(MAX_JSON_BYTES, MAX_LOG_BYTES, MAX_EXPORT_BYTES):
+                content = None
+                ctx.issue("artifact_too_large", original, "artifact 읽기 크기 제한 초과")
+        except OSError as exc:
+            local_access_issue(ctx, original, exc, "artifact_read_failed")
+    if ctx.live:
+        try:
+            after = path.stat()
+            if (st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                content = None
+                ctx.issue("live_artifact_changed", original, "읽기 전후 metadata 변경; 불안정한 본문은 분석에서 제외됨")
+        except OSError as exc:
+            content = None
+            local_access_issue(ctx, original, exc, "artifact_stat_failed")
     birth = getattr(st, "st_birthtime", None)
     if birth is None and os.name == "nt":
         birth = st.st_ctime
@@ -609,12 +653,35 @@ def add_local_file(ctx: AnalysisContext, path: Path, logical_path: str | None = 
             pass
 
 
+def local_reparse_point(path: Path) -> bool:
+    st = path.lstat()
+    return path.is_symlink() or bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
 def walk_selected_local(ctx: AnalysisContext, root: Path, *, broad: bool = False) -> None:
     skip_names = {"$extend", "system volume information"}
-    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+    def onerror(exc: OSError) -> None:
+        local_access_issue(ctx, str(exc.filename or root), exc, "directory_read_failed")
+
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=onerror):
         dirs[:] = sorted(d for d in dirs if d.lower() not in skip_names)
+        if ctx.live:
+            for name in list(dirs):
+                try:
+                    if local_reparse_point(Path(current) / name):
+                        dirs.remove(name)
+                except OSError as exc:
+                    dirs.remove(name)
+                    local_access_issue(ctx, str(Path(current) / name), exc, "directory_read_failed")
         for name in sorted(files):
             path = Path(current) / name
+            if ctx.live:
+                try:
+                    if local_reparse_point(path):
+                        continue
+                except OSError as exc:
+                    local_access_issue(ctx, str(path), exc, "artifact_stat_failed")
+                    continue
             lp = lower_path(str(path))
             if name.lower().endswith((".csv", ".db")):
                 add_local_file(ctx, path)
@@ -626,24 +693,78 @@ def walk_selected_local(ctx: AnalysisContext, root: Path, *, broad: bool = False
                 add_local_file(ctx, path)
 
 
-def directory_roots(input_path: Path) -> list[tuple[Path, bool]]:
+PROFILE_TARGETS = (
+    "AppData/Local/Programs/LM Studio", "AppData/Local/lm-studio-updater",
+    "AppData/Roaming/Microsoft/Windows/Start Menu",
+    "AppData/Roaming/Microsoft/Windows/Recent", "Desktop", "Downloads", "Documents",
+)
+EXCLUDED_PROFILES = {"default", "default user", "public", "all users"}
+
+
+def decode_home_pointer(content: bytes) -> str:
+    # LM Studio writes a plain UTF-8 path, not a Dissect key or CLI syntax.
+    text = content.decode("utf-8-sig").strip()
+    if not text or "\x00" in text or "\n" in text or "\r" in text:
+        raise ValueError("invalid home pointer")
+    return text
+
+
+def profile_roots(profile: Path, ctx: AnalysisContext | None = None,
+                  evidence_root: Path | None = None) -> list[tuple[Path, bool]]:
+    homes = [profile / ".lmstudio"]
+    pointer = profile / ".lmstudio-home-pointer"
+    try:
+        with pointer.open("rb") as fh:
+            data = fh.read(4097)
+        if len(data) > 4096:
+            raise ValueError("oversized home pointer")
+        text = decode_home_pointer(data)
+        home = Path(text)
+        if PureWindowsPath(text).drive.startswith("\\\\"):
+            raise ValueError("network home pointer")
+        if not home.is_absolute():
+            home = profile / home
+        # Offline directories must never follow an evidence pointer into the host.
+        if evidence_root is None or is_inside(home, evidence_root):
+            homes.append(home)
+        elif ctx is not None:
+            ctx.issue("home_pointer_outside_evidence", str(pointer), "추출 directory 밖의 Home pointer는 따르지 않음")
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if ctx is not None:
+            local_access_issue(ctx, str(pointer), exc, "home_pointer_read_failed")
+    except (UnicodeError, ValueError):
+        if ctx is not None:
+            ctx.issue("home_pointer_invalid", str(pointer), "Home pointer 형식이 유효하지 않음")
+    roots = [(home, True) for home in homes]
+    roots.extend((profile / relative, False) for relative in PROFILE_TARGETS)
+    result = []
+    for path, broad in roots:
+        if ctx is not None and ctx.live:
+            ctx.evidence_roots.append(path.resolve())
+        try:
+            path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if ctx is not None:
+                local_access_issue(ctx, str(path), exc, "directory_read_failed")
+            continue
+        result.append((path, broad))
+        if ctx is not None and broad:
+            ctx.lmstudio_homes.append(str(path.resolve()))
+    return result
+
+
+def directory_roots(input_path: Path, ctx: AnalysisContext | None = None) -> list[tuple[Path, bool]]:
     roots: list[tuple[Path, bool]] = []
     if input_path.name.lower() == ".lmstudio":
         return [(input_path, True)]
     users = input_path / "Users"
     if users.is_dir():
         for user in sorted((p for p in users.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
-            for candidate in (
-                user / ".lmstudio",
-                user / "AppData" / "Local" / "Programs" / "LM Studio",
-                user / "AppData" / "Local" / "lm-studio-updater",
-                user / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu",
-                user / "Desktop",
-                user / "Downloads",
-                user / "Documents",
-            ):
-                if candidate.exists():
-                    roots.append((candidate, candidate.name.lower() == ".lmstudio"))
+            roots.extend(profile_roots(user, ctx, input_path))
         prefetch = input_path / "Windows" / "Prefetch"
         if prefetch.exists():
             roots.append((prefetch, False))
@@ -651,24 +772,15 @@ def directory_roots(input_path: Path) -> list[tuple[Path, bool]]:
         if recycle.exists():
             roots.append((recycle, False))
         return roots
-    if (input_path / ".lmstudio").is_dir() or (input_path / "AppData").is_dir():
-        candidates = [
-            input_path / ".lmstudio",
-            input_path / "AppData" / "Local" / "Programs" / "LM Studio",
-            input_path / "AppData" / "Local" / "lm-studio-updater",
-            input_path / "AppData" / "Roaming" / "Microsoft" / "Windows" / "Start Menu",
-            input_path / "Desktop",
-            input_path / "Downloads",
-            input_path / "Documents",
-        ]
-        return [(p, p.name.lower() == ".lmstudio") for p in candidates if p.exists()]
+    if any((input_path / name).exists() for name in (".lmstudio", "AppData", ".lmstudio-home-pointer")):
+        return profile_roots(input_path, ctx, input_path)
     # Research extracts and other focused artifact directories are safe to scan broadly.
     return [(input_path, True)]
 
 
 def collect_directory(ctx: AnalysisContext) -> None:
     seen: set[str] = set()
-    for root, broad in directory_roots(ctx.input_path):
+    for root, broad in directory_roots(ctx.input_path, ctx):
         key = str(root.resolve()).lower()
         if key in seen:
             continue
@@ -677,6 +789,61 @@ def collect_directory(ctx: AnalysisContext) -> None:
             add_local_file(ctx, root)
         else:
             walk_selected_local(ctx, root, broad=broad)
+
+
+def live_roots(ctx: AnalysisContext, root: Path | None = None) -> list[tuple[Path, bool]]:
+    profiles: list[Path] = []
+    windows_root = root or Path(os.environ.get("SystemDrive", "C:") + "\\")
+    users = windows_root / "Users"
+    try:
+        profiles.extend(sorted(users.iterdir(), key=lambda p: str(p).lower()))
+    except OSError as exc:
+        local_access_issue(ctx, str(users), exc, "directory_read_failed")
+    current = os.environ.get("USERPROFILE")
+    if root is None and current:
+        profiles.append(Path(current))
+    roots: list[tuple[Path, bool]] = []
+    seen: set[str] = set()
+    for profile in profiles:
+        if profile.name.lower() in EXCLUDED_PROFILES:
+            continue
+        try:
+            profile.stat()
+            if not profile.is_dir() or local_reparse_point(profile):
+                continue
+            key = str(profile.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.extend(profile_roots(profile, ctx))
+        except OSError as exc:
+            local_access_issue(ctx, str(profile), exc, "directory_read_failed")
+    roots.append((windows_root / "Windows" / "Prefetch", False))
+    ctx.evidence_roots = list(dict.fromkeys([*ctx.evidence_roots, *(path.resolve() for path, _ in roots)]))
+    return roots
+
+
+def collect_live(ctx: AnalysisContext, root: Path | None = None) -> None:
+    if sys.platform != "win32":
+        ctx.issue("live_platform_unsupported", "Windows Live", "--live는 Windows에서만 지원됨", True)
+        return
+    seen: set[str] = set()
+    for path, broad in live_roots(ctx, root):
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            path.stat()
+            if path.is_dir() and not local_reparse_point(path):
+                walk_selected_local(ctx, path, broad=broad)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            local_access_issue(ctx, str(path), exc, "directory_read_failed")
+    if not ctx.lmstudio_homes:
+        ctx.issue("live_home_not_found", "Windows Live", "접근 가능한 LM Studio Home을 찾지 못함")
+    ctx.issue("live_metadata_limited", "Windows Live", "현재 접근 가능한 파일만 수집; raw $MFT/$UsnJrnl 및 삭제 파일 복구는 수행하지 않음")
 
 
 # ---------------------------------------------------------------------------
@@ -1329,7 +1496,109 @@ def open_image_stream(path: Path) -> tuple[BinaryIO, list[Any]]:
     return fh, keepalive
 
 
-def collect_image(ctx: AnalysisContext) -> None:
+@dataclass(repr=False)
+class BitLockerCredential:
+    """Ephemeral access material; never attach this object to AnalysisContext."""
+
+    kind: str
+    value: str | bytes | Path = field(repr=False)
+
+
+@contextmanager
+def quiet_fve_logs() -> Iterator[None]:
+    # The backend can log exception objects when DISSECT_LOG_BDE is enabled.
+    loggers = [logging.getLogger(name) for name in list(logging.Logger.manager.loggerDict)
+               if name == "dissect.fve" or name.startswith("dissect.fve.")]
+    states = [(logger, logger.disabled) for logger in loggers]
+    try:
+        for logger, _ in states:
+            logger.disabled = True
+        yield
+    finally:
+        for logger, disabled in states:
+            logger.disabled = disabled
+
+
+def open_volume_stream(ctx: AnalysisContext, volume: BinaryIO, location: str,
+                       credential: BitLockerCredential | None = None) -> tuple[BinaryIO | None, bool]:
+    """Return a normal or on-the-fly decrypted stream, never an evidence copy."""
+    try:
+        from dissect.fve.bde import BDE, is_bde_volume
+    except ImportError:
+        # OEM bytes are only a backend-unavailable hint, never a positive verdict.
+        volume.seek(0)
+        hint = volume.read(512)
+        volume.seek(0)
+        if hint[3:11] == b"-FVE-FS-":
+            ctx.issue("bitlocker_backend_unavailable", location, "BitLocker 보조 indicator 발견; dissect.fve 설치가 필요하며 공식 판별/unlock은 수행하지 못함")
+            return None, False
+        return volume, False
+    with quiet_fve_logs():
+        try:
+            detected = is_bde_volume(volume)
+            volume.seek(0)
+        except Exception:
+            ctx.issue("volume_detection_failed", location, "공식 volume 판별 읽기 실패; 해당 volume 건너뜀")
+            return None, False
+        if not detected:
+            return volume, False
+        try:
+            bde = BDE(volume)
+            has_clear_key = bde.has_clear_key()
+        except Exception:
+            ctx.issue("bitlocker_metadata_failed", location, "BitLocker detected; encryption metadata를 열지 못함; 해당 partition 건너뜀")
+            return None, True
+        if credential is None and not has_clear_key:
+            ctx.issue("bitlocker_credential_missing", location, "BitLocker encrypted volume detected. Authorized recovery material was not provided. Skipping this partition.")
+            return None, True
+        unlocked = False
+        if has_clear_key:
+            try:
+                bde.unlock_with_clear_key()
+                unlocked = True
+            except Exception:
+                # A real but unusable clear protector may coexist with a user protector.
+                pass
+        if not unlocked and credential is not None:
+            try:
+                if credential.kind == "recovery":
+                    bde.unlock_with_recovery_password(credential.value)
+                elif credential.kind == "passphrase":
+                    bde.unlock_with_passphrase(credential.value)
+                elif credential.kind == "bek":
+                    with Path(credential.value).open("rb") as bek:
+                        bde.unlock_with_bek(bek)
+                elif credential.kind == "fvek":
+                    bde.unlock_with_fvek(credential.value)
+                else:
+                    raise ValueError("unsupported credential type")
+                unlocked = True
+            except Exception:
+                pass
+        if not unlocked:
+            ctx.issue("bitlocker_unlock_failed", location, "BitLocker unlock failed; recovery material이 잘못되었거나 protector를 해제하지 못함; 해당 partition 건너뜀")
+            return None, True
+        decrypted = None
+        try:
+            decrypted = bde.open()
+            decrypted.seek(0)
+            header = decrypted.read(512)
+            decrypted.seek(0)
+            if credential is not None and credential.kind == "fvek" and header[3:11] != b"NTFS    ":
+                # Raw FVEK has no authentication: successful API return is insufficient.
+                ctx.issue("bitlocker_unlock_failed", location, "Raw FVEK stream의 NTFS header 검증 실패; 잘못된 key/손상/비지원 filesystem 가능; 해당 partition 건너뜀")
+                decrypted.close()
+                return None, True
+        except Exception:
+            if decrypted is not None:
+                decrypted.close()
+            ctx.issue("bitlocker_stream_error", location, "BitLocker 해제 후 decrypted stream 읽기 실패; 해당 partition 건너뜀")
+            return None, True
+        ctx.issue("bitlocker_unlocked", location, "BitLocker volume read-only unlock 성공; 기존 NTFS 분석 경로 사용")
+        return decrypted, True
+
+
+def collect_image(ctx: AnalysisContext, credential: BitLockerCredential | None = None) -> None:
     try:
         from dissect.ntfs import NTFS
         from dissect.volume.disk import Disk
@@ -1344,27 +1613,48 @@ def collect_image(ctx: AnalysisContext) -> None:
     except Exception:
         ctx.issue("image_open_failed", str(ctx.input_path), "image를 읽기 전용으로 열지 못함", True)
         return
+    if not any(handle is stream for handle in keepalive):
+        keepalive.append(stream)
     ntfs_volumes: list[Any] = []
+    encrypted_seen = False
     try:
         try:
             disk = Disk(stream)
-            for partition in disk.partitions:
-                try:
-                    ntfs_volumes.append(NTFS(partition.open()))
-                except Exception:
-                    continue
+            partitions = list(disk.partitions)
         except Exception:
+            partitions = []
+        volumes: list[tuple[str, BinaryIO]] = []
+        for index, partition in enumerate(partitions):
             try:
-                stream.seek(0)
-                ntfs_volumes.append(NTFS(stream))
+                volume = partition.open()
+                keepalive.append(volume)
+                volumes.append((f"partition{index}@{partition.offset}", volume))
             except Exception:
-                pass
+                ctx.issue("partition_open_failed", f"partition{index}", "partition stream 접근 실패; 다른 partition 분석은 계속됨")
+        if not partitions:
+            stream.seek(0)
+            volumes.append(("volume@0", stream))
+        for location, volume in volumes:
+            try:
+                accessible, encrypted = open_volume_stream(ctx, volume, location, credential)
+                encrypted_seen = encrypted_seen or encrypted
+                if accessible is None:
+                    continue
+                if accessible is not volume:
+                    keepalive.append(accessible)
+                accessible.seek(0)
+                ntfs_volumes.append(NTFS(accessible))
+            except Exception:
+                ctx.issue("volume_filesystem_unavailable", location, "지원 NTFS filesystem을 열지 못함; unsupported/손상/읽기 실패 가능; 다른 partition 분석은 계속됨")
         if not ntfs_volumes:
-            ctx.issue("ntfs_not_found", str(ctx.input_path), "지원되는 NTFS volume을 찾지 못함", True)
+            ctx.issue("ntfs_not_found", str(ctx.input_path), "지원되는 NTFS volume을 찾지 못함; BitLocker partition 접근 진단도 확인하십시오." if encrypted_seen else "지원되는 NTFS volume을 찾지 못함", True)
             return
         for index, ntfs in enumerate(ntfs_volumes):
-            collect_ntfs_current(ctx, ntfs, index)
-            collect_ntfs_usn(ctx, ntfs, index)
+            try:
+                collect_ntfs_current(ctx, ntfs, index)
+                collect_ntfs_usn(ctx, ntfs, index)
+            except Exception:
+                ctx.issue("ntfs_collection_failed", f"volume{index}", "NTFS 수집 중 읽기 실패; 다른 volume 분석은 계속됨")
     finally:
         # EWF owns lazily opened segments. Explicitly close only handles that expose close().
         for handle in reversed(keepalive):
@@ -1509,7 +1799,7 @@ def parse_logs(ctx: AnalysisContext) -> list[ObservedFact]:
     for artifact in sorted(ctx.artifacts, key=lambda a: a.path.lower()):
         if artifact.content is None or not basename(artifact.path).lower().endswith((".log", ".txt")):
             continue
-        if "\\.lmstudio\\server-logs\\" not in lower_path(artifact.path):
+        if not lmstudio_log_path(ctx, artifact.path):
             continue
         try:
             text = artifact.content.decode("utf-8-sig", errors="replace")
@@ -3190,7 +3480,7 @@ def write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[str]]) 
 
 
 def write_outputs(ctx: AnalysisContext, output: Path) -> None:
-    error = validate_paths(ctx.input_path, output)
+    error = validate_live_output(ctx, output) if ctx.live else validate_paths(ctx.input_path, output)
     if error:
         raise ValueError(error)
     output.mkdir(parents=True, exist_ok=True)
@@ -3246,6 +3536,13 @@ def validate_paths(input_path: Path, output_path: Path) -> str:
     return ""
 
 
+def validate_live_output(ctx: AnalysisContext, output: Path) -> str:
+    for protected in (Path(r"C:\WHS\DiskImages"), Path(r"C:\WHS\LMStudio_Research_Evidence"), *ctx.evidence_roots):
+        if is_inside(output, protected) or is_inside(protected, output):
+            return "Live 출력 경로가 수집 대상 directory와 겹칩니다. 별도 output directory를 지정하십시오."
+    return ""
+
+
 def terminal_text(value: str) -> str:
     text = safe_nonconversation_text(value, max_length=4000)
     text = re.sub(r"(?i)\b(?:access[_-]?token|refresh[_-]?token|credential|secret|passkey|password|private[_-]?key)\s*[=:]\s*[^\s;]+", "[REDACTED]", text)
@@ -3274,12 +3571,16 @@ def report_analysis(ctx: AnalysisContext, stream: TextIO | None = None) -> None:
 
 
 def analyze(input_path: Path, before_path: Path | None = None,
-            progress: Callable[[int, str], None] | None = None) -> AnalysisContext:
-    ctx = AnalysisContext(input_path=input_path, source_image=str(input_path.resolve()) if is_image_path(input_path) else "")
+            progress: Callable[[int, str], None] | None = None, *,
+            live: bool = False, live_root: Path | None = None,
+            credential: BitLockerCredential | None = None) -> AnalysisContext:
+    ctx = AnalysisContext(input_path=input_path, source_image=str(input_path.resolve()) if is_image_path(input_path) else "", live=live)
     if progress:
         progress(2, "파일시스템 및 아티팩트 수집")
-    if is_image_path(input_path):
-        collect_image(ctx)
+    if live:
+        collect_live(ctx, live_root)
+    elif is_image_path(input_path):
+        collect_image(ctx, credential)
     elif input_path.is_dir():
         collect_directory(ctx)
         collect_standalone_mft(ctx)
@@ -3324,7 +3625,7 @@ def analyze(input_path: Path, before_path: Path | None = None,
         if fact.direct_tag == "explicit_model_load_log":
             add_candidate(ctx, "model_change", [fact], ["explicit model load event record"], "명시적 모델 로드 로그", timestamp=fact.timestamp)
     if before_path is not None:
-        before_ctx = analyze(before_path)
+        before_ctx = analyze(before_path, credential=credential)
         if any(issue.fatal for issue in before_ctx.issues):
             ctx.issue("before_input_failed", str(before_path), "Before snapshot 분석 실패", True)
         else:
@@ -3389,7 +3690,9 @@ def _read_and_validate_csv(path: Path, header: Sequence[str], expected: Sequence
 
 
 def validate_analysis(ctx: AnalysisContext, input_path: Path, output_path: Path,
-                      before_image_stat: ImageStatSnapshot | None = None) -> dict[str, Any]:
+                      before_image_stat: ImageStatSnapshot | None = None, *,
+                      credential: BitLockerCredential | None = None,
+                      before_path: Path | None = None) -> dict[str, Any]:
     """Self-contained production validation; never relies on project fixtures."""
     timeline, timeline_hash = _read_and_validate_csv(
         output_path / "timeline.csv", TIMELINE_HEADER, timeline_rows(ctx))
@@ -3427,7 +3730,7 @@ def validate_analysis(ctx: AnalysisContext, input_path: Path, output_path: Path,
     if before_image_stat is not None and image_stat(input_path) != before_image_stat:
         raise AssertionError("Evidence image size/mtime 변경")
     with tempfile.TemporaryDirectory(prefix="LMSTUDIO_VALIDATION_") as temporary:
-        repeat_ctx = analyze(input_path)
+        repeat_ctx = analyze(input_path, before_path, credential=credential)
         if any(issue.fatal for issue in repeat_ctx.issues):
             raise AssertionError("반복 분석 fatal issue")
         repeat_output = Path(temporary) / "repeat"
@@ -3465,27 +3768,78 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description="Windows LM Studio forensic artifact parser (read-only evidence access)",
     )
     parser.add_argument("input", nargs="?", type=Path, help=".lmstudio, User Profile, Windows root, DD/RAW/IMG (including split .001), or E01")
-    parser.add_argument("--output", type=Path, help="Directory for timeline.csv and recovered_conversation.csv")
+    parser.add_argument("--output", type=Path, help="Directory for timeline.csv and recovered_conversations.csv")
     parser.add_argument("--before", type=Path, help="Explicit earlier snapshot of the same subject; no folder-name inference")
     parser.add_argument("--validate", action="store_true", help="Analyze twice and validate CSV, security, integrity, and determinism")
     parser.add_argument("--self-test", action="store_true", help="Run the embedded regression suite")
+    parser.add_argument("--live", action="store_true", help="Read current Windows profiles and LM Studio files")
+    parser.add_argument("--live-root", type=Path, help="Windows root containing Users; requires --live (default: SystemDrive)")
+    credential = parser.add_mutually_exclusive_group()
+    credential.add_argument("--bitlocker-recovery-prompt", action="store_true", help="Prompt for authorized recovery password without echo")
+    credential.add_argument("--bitlocker-passphrase-prompt", action="store_true", help="Prompt for authorized user passphrase without echo")
+    credential.add_argument("--bitlocker-bek", type=Path, help="Authorized BEK file, opened read-only")
+    credential.add_argument("--bitlocker-fvek", type=Path, help="Authorized raw binary FVEK file (no hex/header/container)")
     return parser
+
+
+def read_bitlocker_credential(args: argparse.Namespace) -> BitLockerCredential | None:
+    if args.bitlocker_recovery_prompt or args.bitlocker_passphrase_prompt:
+        kind = "recovery" if args.bitlocker_recovery_prompt else "passphrase"
+        # getpass can fall back to echoed stdin. Reject that fallback explicitly.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            value = getpass.getpass("BitLocker recovery password: " if kind == "recovery" else "BitLocker passphrase: ")
+        if not value:
+            raise ValueError("empty credential")
+        return BitLockerCredential(kind, value)
+    if args.bitlocker_bek is not None:
+        return BitLockerCredential("bek", args.bitlocker_bek)
+    if args.bitlocker_fvek is not None:
+        with args.bitlocker_fvek.open("rb") as fh:
+            value = fh.read(65)
+        if len(value) not in {16, 32, 64}:
+            raise ValueError("invalid raw FVEK size")
+        return BitLockerCredential("fvek", value)
+    return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    has_credential = bool(args.bitlocker_recovery_prompt or args.bitlocker_passphrase_prompt
+                          or args.bitlocker_bek is not None or args.bitlocker_fvek is not None)
     if args.self_test:
-        if args.input is not None or args.output is not None or args.before is not None or args.validate:
+        if args.input is not None or args.output is not None or args.before is not None or args.validate or args.live or args.live_root is not None or has_credential:
             print("오류: --self-test는 다른 분석 인자와 함께 사용할 수 없습니다.", file=sys.stderr)
             return 2
         return run_self_tests()
-    if args.input is None or args.output is None:
+    if args.live_root is not None and not args.live:
+        print("오류: --live-root에는 --live가 필요합니다.", file=sys.stderr)
+        return 2
+    if args.live and (args.input is not None or args.before is not None or args.validate or has_credential):
+        print("오류: --live에는 input/--before/--validate/BitLocker credential을 함께 지정할 수 없습니다.", file=sys.stderr)
+        return 2
+    if args.live and sys.platform != "win32":
+        print("오류: live_platform_unsupported; --live는 Windows에서만 지원됩니다.", file=sys.stderr)
+        return 2
+    if (args.input is None and not args.live) or args.output is None:
         print("오류: 분석에는 input과 --output이 필요합니다.", file=sys.stderr)
         return 2
-    input_path = args.input.resolve()
+    input_path = (args.input or args.live_root or Path(os.environ.get("SystemDrive", "C:") + "\\")).resolve()
+    if args.live and (not input_path.is_dir() or str(input_path).startswith("\\\\")):
+        print("오류: --live-root는 로컬 Windows root directory여야 합니다.", file=sys.stderr)
+        return 2
+    if has_credential and not is_image_path(input_path):
+        print("오류: BitLocker credential은 forensic image 입력에만 사용됩니다.", file=sys.stderr)
+        return 2
     output_path = args.output.resolve()
-    emit_progress(1, f"입력 검증: {input_path}; 입력 유형={input_path.suffix.upper().lstrip('.') + ' image' if is_image_path(input_path) else 'directory/file'}")
-    path_error = validate_paths(input_path, output_path)
+    input_kind = "Windows Live" if args.live else (input_path.suffix.upper().lstrip('.') + " image" if is_image_path(input_path) else "directory/file")
+    emit_progress(1, f"입력 검증: {input_path}; 입력 유형={input_kind}")
+    if args.live:
+        preflight = AnalysisContext(input_path, live=True)
+        live_roots(preflight, args.live_root)
+        path_error = validate_live_output(preflight, output_path)
+    else:
+        path_error = validate_paths(input_path, output_path)
     if args.before is not None:
         path_error = path_error or validate_paths(args.before.resolve(), output_path)
     if path_error:
@@ -3493,7 +3847,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     before = image_stat(input_path)
     before_snapshot_stat = image_stat(args.before.resolve()) if args.before is not None else None
-    ctx = analyze(input_path, args.before.resolve() if args.before is not None else None, progress=emit_progress)
+    try:
+        credential = read_bitlocker_credential(args)
+    except (OSError, ValueError, EOFError, KeyboardInterrupt, getpass.GetPassWarning):
+        print("오류: BitLocker credential을 안전하게 읽지 못했습니다. 값은 기록하지 않습니다.", file=sys.stderr)
+        return 2
+    ctx = analyze(input_path, args.before.resolve() if args.before is not None else None, progress=emit_progress,
+                  live=args.live, live_root=args.live_root, credential=credential)
     report_analysis(ctx)
     if any(issue.fatal for issue in ctx.issues):
         print("오류: 입력 Evidence를 분석할 수 없습니다. dependency, filesystem, image 형식을 확인하십시오.", file=sys.stderr)
@@ -3519,7 +3879,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(terminal_text(str(output_path / name)), flush=True)
     if args.validate:
         try:
-            validation = validate_analysis(ctx, input_path, output_path, before)
+            validation = validate_analysis(ctx, input_path, output_path, before, credential=credential,
+                                           before_path=args.before.resolve() if args.before is not None else None)
             validation_path = output_path / "validation.json"
             validation_path.write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
             print("검증 PASS: " + terminal_text(str(validation_path)), flush=True)
@@ -4886,6 +5247,522 @@ class FinalContractTests(FixtureCase):
         parser.report_analysis(ctx, stream)
         self.assertIn('[fatal] test_fatal', stream.getvalue())
         self.assertIn('[non-fatal] test_partial', stream.getvalue())
+
+
+class WindowsLiveTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="SYNTHETIC_LIVE_")
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name)
+        self.root = self.base / "WindowsRoot"
+        (self.root / "Users").mkdir(parents=True)
+
+    def profile(self, name="TEST_USER", home=".lmstudio"):
+        profile = self.root / "Users" / name
+        path = profile / home / CONV
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(conversation(message(), message("assistant"))), encoding="utf-8")
+        return profile, path
+
+    def analyze_live(self):
+        with patch.object(sys, "platform", "win32"):
+            return parser.analyze(self.root, live=True, live_root=self.root)
+
+    def test_windows_live_cli_selects_local_collector(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        self.profile()
+        with patch.object(sys, "platform", "win32"), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = parser.main(["--live", "--live-root", str(self.root), "--output", str(self.base / "out")])
+        self.assertEqual(0, rc)
+        self.assertTrue((self.base / "out" / "recovered_conversations.csv").exists())
+
+    def test_non_windows_rejected(self):
+        from contextlib import redirect_stderr
+        error = io.StringIO()
+        with patch.object(sys, "platform", "linux"), redirect_stderr(error):
+            rc = parser.main(["--live", "--output", str(self.base / "out")])
+        self.assertEqual(2, rc)
+        self.assertIn("live_platform_unsupported", error.getvalue())
+        self.assertFalse((self.base / "out").exists())
+
+    def test_default_home_and_existing_core(self):
+        _, path = self.profile()
+        ctx = self.analyze_live()
+        self.assertEqual(2, len(ctx.messages))
+        self.assertIn(str(path.resolve()), [a.path for a in ctx.artifacts])
+        self.assertTrue(ctx.candidates)
+
+    def test_relative_home_pointer_and_custom_home_logs(self):
+        profile, path = self.profile(home="custom_home")
+        (profile / ".lmstudio-home-pointer").write_text("custom_home\n", encoding="utf-8")
+        log = path.parent.parent / "server-logs" / "events.log"
+        log.parent.mkdir()
+        log.write_text("2026-09-20T00:00:00Z login succeeded", encoding="utf-8")
+        ctx = self.analyze_live()
+        self.assertEqual(2, len(ctx.messages))
+        self.assertTrue(any(f.direct_tag == "explicit_login_log" for f in ctx.facts))
+        self.assertTrue(any(a.path == str(path.resolve()) for a in ctx.artifacts))
+
+    def test_absolute_home_pointer(self):
+        profile, path = self.profile(home="relocated")
+        (profile / ".lmstudio-home-pointer").write_text(str(path.parent.parent), encoding="utf-8")
+        self.assertEqual(2, len(self.analyze_live().messages))
+
+    def test_multiple_profiles_and_excluded_system_profiles(self):
+        for name in ("TEST_A", "TEST_B", "Public", "Default", "Default User", "All Users"):
+            self.profile(name)
+        ctx = self.analyze_live()
+        self.assertEqual(4, len(ctx.messages))
+        self.assertEqual(2, len(ctx.lmstudio_homes))
+
+    def test_current_profile_outside_users_root(self):
+        current = self.base / "relocated_profile"
+        (current / ".lmstudio").mkdir(parents=True)
+        ctx = parser.AnalysisContext(self.root, live=True)
+        path_type = Path
+        with patch.dict(os.environ, {"SystemDrive": str(self.root), "USERPROFILE": str(current)}):
+            # Keep the Windows root synthetic, but exercise USERPROFILE discovery.
+            with patch.object(parser, "Path", wraps=Path) as paths:
+                paths.side_effect = lambda value: self.root if str(value).endswith("\\") else path_type(value)
+                roots = parser.live_roots(ctx)
+        self.assertIn(current / ".lmstudio", [p for p, _ in roots])
+
+    def test_no_home_is_diagnostic_not_user_behavior(self):
+        ctx = self.analyze_live()
+        self.assertIn("live_home_not_found", [i.code for i in ctx.issues])
+        self.assertFalse(ctx.candidates)
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def read_failure(self, exc):
+        _, target = self.profile()
+        original = Path.open
+        def open_read(path, *args, **kwargs):
+            if path == target:
+                raise exc
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "open", open_read):
+            return self.analyze_live()
+
+    def test_permission_denied_is_nonfatal(self):
+        ctx = self.read_failure(PermissionError("synthetic denied"))
+        self.assertIn("live_permission_denied", [i.code for i in ctx.issues])
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def test_locked_file_is_nonfatal(self):
+        exc = OSError("synthetic sharing violation")
+        exc.winerror = 32
+        ctx = self.read_failure(exc)
+        self.assertIn("live_artifact_locked", [i.code for i in ctx.issues])
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def test_file_removed_during_read(self):
+        ctx = self.read_failure(FileNotFoundError("synthetic disappeared"))
+        self.assertIn("live_artifact_not_found", [i.code for i in ctx.issues])
+
+    def test_changed_file_content_is_not_parsed(self):
+        _, target = self.profile()
+        before = target.stat()
+        after = SimpleNamespace(st_size=before.st_size + 1, st_mtime_ns=before.st_mtime_ns + 1, st_ctime_ns=before.st_ctime_ns)
+        ctx = parser.AnalysisContext(self.root, live=True)
+        with patch.object(Path, "stat", side_effect=[before, after]), patch.object(Path, "is_file", return_value=False):
+            parser.add_local_file(ctx, target, str(target))
+        self.assertIn("live_artifact_changed", [i.code for i in ctx.issues])
+        self.assertIsNone(ctx.artifacts[0].content)
+
+    def test_directory_permission_error_reported(self):
+        ctx = parser.AnalysisContext(self.root, live=True)
+        def failed_walk(root, **kwargs):
+            kwargs["onerror"](PermissionError(13, "synthetic", str(root)))
+            return iter(())
+        with patch.object(os, "walk", side_effect=failed_walk):
+            parser.walk_selected_local(ctx, self.root)
+        self.assertIn("live_permission_denied", [i.code for i in ctx.issues])
+
+    def test_output_deterministic_and_offline_equivalent(self):
+        profile, path = self.profile()
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        live = self.analyze_live()
+        offline = parser.analyze(profile / ".lmstudio")
+        self.assertEqual(parser.timeline_rows(offline), parser.timeline_rows(live))
+        self.assertEqual(parser.conversation_rows(offline), parser.conversation_rows(live))
+        for index, ctx in enumerate((live, self.analyze_live(), offline)):
+            parser.write_outputs(ctx, self.base / f"out{index}")
+        for name in ("timeline.csv", "recovered_conversations.csv"):
+            self.assertEqual((self.base / "out0" / name).read_bytes(), (self.base / "out1" / name).read_bytes())
+            self.assertEqual((self.base / "out0" / name).read_bytes(), (self.base / "out2" / name).read_bytes())
+        self.assertEqual(before, (path.read_bytes(), path.stat().st_mtime_ns))
+
+    def test_output_in_default_or_pointer_home_rejected(self):
+        profile, _ = self.profile(home="custom")
+        (profile / ".lmstudio-home-pointer").write_text("custom", encoding="utf-8")
+        ctx = self.analyze_live()
+        for home in (profile / "custom", profile / ".lmstudio"):
+            with self.assertRaises(ValueError):
+                parser.write_outputs(ctx, home / "out")
+
+    def test_live_does_not_use_offline_history_collectors(self):
+        self.profile()
+        with patch.object(parser, "collect_standalone_mft") as mft, patch.object(parser, "collect_preparsed_history") as history:
+            ctx = self.analyze_live()
+        mft.assert_not_called()
+        history.assert_not_called()
+        self.assertFalse(ctx.usn_stats)
+        self.assertFalse(any(f.fact_type.startswith("history_") for f in ctx.facts))
+
+    def test_offline_pointer_cannot_escape_evidence(self):
+        profile, _ = self.profile()
+        external = self.base / "external"
+        external.mkdir()
+        (profile / ".lmstudio-home-pointer").write_text(str(external), encoding="utf-8")
+        ctx = parser.analyze(profile)
+        self.assertIn("home_pointer_outside_evidence", [i.code for i in ctx.issues])
+        self.assertNotIn(str(external), ctx.lmstudio_homes)
+
+    def test_network_pointer_rejected(self):
+        profile, _ = self.profile()
+        (profile / ".lmstudio-home-pointer").write_text(r"\\server\share\home", encoding="utf-8")
+        ctx = self.analyze_live()
+        self.assertIn("home_pointer_invalid", [i.code for i in ctx.issues])
+
+
+class BitLockerAccessTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="SYNTHETIC_BDE_")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.image = self.root / "evidence.dd"
+        self.image.write_bytes(b"ENCRYPTED" + bytes(1015))
+        self.ctx = parser.AnalysisContext(self.image, source_image=str(self.image))
+        self.plain = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(1013))
+        self.bde = Mock()
+        self.bde.has_clear_key.return_value = False
+        self.bde.open.return_value = self.plain
+        self.detect = patch("dissect.fve.bde.is_bde_volume", return_value=True).start()
+        self.backend = patch("dissect.fve.bde.BDE", return_value=self.bde).start()
+        self.addCleanup(patch.stopall)
+
+    def open(self, credential=None):
+        return parser.open_volume_stream(self.ctx, io.BytesIO(self.image.read_bytes()), "partition1", credential)
+
+    def test_non_bitlocker_preserves_stream(self):
+        self.detect.return_value = False
+        stream = io.BytesIO(b"ordinary")
+        result, encrypted = parser.open_volume_stream(self.ctx, stream, "partition0")
+        self.assertIs(stream, result)
+        self.assertFalse(encrypted)
+        self.backend.assert_not_called()
+
+    def test_official_detection_used(self):
+        self.open()
+        self.detect.assert_called_once()
+        self.backend.assert_called_once()
+        self.assertIn("bitlocker_credential_missing", [i.code for i in self.ctx.issues])
+
+    def test_real_detection_accepts_guid_without_oem_signature(self):
+        from dissect.fve.bde import bde as implementation
+        from dissect.fve.bde.c_bde import INFORMATION_OFFSET_GUID
+        header = bytearray(512)
+        header[160:176] = INFORMATION_OFFSET_GUID.bytes_le
+        volume = io.BytesIO(header)
+        volume.seek(7)
+        self.assertTrue(implementation.is_bde_volume(volume))
+        self.assertEqual(7, volume.tell())
+        self.assertFalse(implementation.is_bde_volume(io.BytesIO(bytes(512))))
+
+    def test_clear_key_only_when_protector_exists(self):
+        self.bde.has_clear_key.return_value = True
+        stream, encrypted = self.open()
+        self.bde.unlock_with_clear_key.assert_called_once_with()
+        self.assertIs(self.plain, stream)
+        self.assertTrue(encrypted)
+
+    def test_no_credential_skips_without_guessing(self):
+        stream, encrypted = self.open()
+        self.assertIsNone(stream)
+        self.assertTrue(encrypted)
+        self.bde.unlock_with_clear_key.assert_not_called()
+        self.bde.unlock_with_recovery_password.assert_not_called()
+        self.bde.open.assert_not_called()
+
+    def test_recovery_password_path(self):
+        credential = parser.BitLockerCredential("recovery", "SYNTHETIC_AUTHORIZED_RECOVERY")
+        stream, _ = self.open(credential)
+        self.assertIs(self.plain, stream)
+        self.bde.unlock_with_recovery_password.assert_called_once_with(credential.value)
+
+    def test_invalid_recovery_material_is_redacted(self):
+        secret = "SYNTHETIC_NEVER_LOG_RECOVERY"
+        self.bde.unlock_with_recovery_password.side_effect = ValueError(secret)
+        stream, _ = self.open(parser.BitLockerCredential("recovery", secret))
+        self.assertIsNone(stream)
+        self.assertIn("bitlocker_unlock_failed", [i.code for i in self.ctx.issues])
+        diagnostic = io.StringIO()
+        parser.report_analysis(self.ctx, diagnostic)
+        self.assertNotIn(secret, diagnostic.getvalue() + repr(self.ctx))
+
+    def test_passphrase_path(self):
+        self.open(parser.BitLockerCredential("passphrase", "SYNTHETIC_PASSPHRASE"))
+        self.bde.unlock_with_passphrase.assert_called_once_with("SYNTHETIC_PASSPHRASE")
+
+    def test_bek_file_read_only_and_closed(self):
+        bek = self.root / "synthetic.bek"
+        bek.write_bytes(b"SYNTHETIC_BEK")
+        state = (bek.read_bytes(), bek.stat().st_mtime_ns)
+        self.open(parser.BitLockerCredential("bek", bek))
+        handle = self.bde.unlock_with_bek.call_args.args[0]
+        self.assertEqual("rb", handle.mode)
+        self.assertTrue(handle.closed)
+        self.assertEqual(state, (bek.read_bytes(), bek.stat().st_mtime_ns))
+
+    def test_fvek_uses_raw_bytes(self):
+        key = bytes(range(32))
+        stream, _ = self.open(parser.BitLockerCredential("fvek", key))
+        self.bde.unlock_with_fvek.assert_called_once_with(key)
+        self.assertIs(self.plain, stream)
+
+    def test_wrong_fvek_header_not_reported_as_success(self):
+        self.bde.open.return_value = io.BytesIO(bytes(512))
+        stream, _ = self.open(parser.BitLockerCredential("fvek", bytes(32)))
+        self.assertIsNone(stream)
+        self.assertIn("bitlocker_unlock_failed", [i.code for i in self.ctx.issues])
+        self.assertNotIn("bitlocker_unlocked", [i.code for i in self.ctx.issues])
+
+    def test_clear_key_failure_can_use_authorized_recovery(self):
+        self.bde.has_clear_key.return_value = True
+        self.bde.unlock_with_clear_key.side_effect = ValueError("bad protector")
+        self.assertIs(self.plain, self.open(parser.BitLockerCredential("recovery", "SYNTHETIC"))[0])
+        self.bde.unlock_with_recovery_password.assert_called_once_with("SYNTHETIC")
+
+    def test_decrypted_stream_position_and_eof(self):
+        self.bde.has_clear_key.return_value = True
+        stream, _ = self.open()
+        self.assertEqual(0, stream.tell())
+        self.assertEqual(b"NTFS    ", (stream.read(11))[3:11])
+        stream.seek(0, os.SEEK_END)
+        self.assertEqual(b"", stream.read(512))
+
+    def test_real_bitlocker_stream_decrypts_sectors_read_only(self):
+        from dissect.fve.bde.bde import BDE, BitlockerStream
+        from dissect.fve.bde.c_bde import CIPHER_MAP, FVE_KEY_TYPE
+        from dissect.fve.crypto import create_cipher
+        key = bytes(range(16))
+        plain = b"\xeb\x52\x90NTFS    " + bytes(1013)
+        fvek_type = FVE_KEY_TYPE.AES_128
+        cipher = create_cipher(CIPHER_MAP[fvek_type], key, sector_size=512)
+        ciphertext = cipher.encrypt(plain)
+        volume = SimpleNamespace(
+            fh=io.BytesIO(ciphertext), sector_size=512, encrypted=True,
+            _fvek_type=fvek_type, _fvek=key, version=2, unlocked=True,
+            eow_information=None, reserved_regions=lambda: [],
+            information=SimpleNamespace(virtualized_block_offset=0, virtualized_sectors=0, state_offset=0),
+        )
+        stream = BDE.open(volume)
+        self.assertIsInstance(stream, BitlockerStream)
+        self.assertFalse(stream.writable())
+        self.assertEqual(plain, stream.read())
+        stream.seek(510)
+        self.assertEqual(plain[510:520], stream.read(10))
+        stream.seek(0, os.SEEK_END)
+        self.assertEqual(b"", stream.read(1))
+        with self.assertRaises(NotImplementedError):
+            stream.write(b"forbidden")
+        self.assertEqual(ciphertext, volume.fh.getvalue())
+        stream.close()
+
+    def collect(self, path=None, partitions=None, credential=None):
+        ctx = parser.AnalysisContext(path or self.image, source_image=str(path or self.image))
+        def ntfs(stream):
+            self.assertEqual(b"NTFS    ", stream.read(11)[3:11])
+            stream.seek(0)
+            return SimpleNamespace(fh=stream)
+        with patch("dissect.volume.disk.Disk", return_value=SimpleNamespace(partitions=partitions)) if partitions is not None else patch("dissect.volume.disk.Disk", side_effect=ValueError("no table")), \
+                patch("dissect.ntfs.NTFS", side_effect=ntfs) as constructor, \
+                patch.object(parser, "collect_ntfs_current") as current, \
+                patch.object(parser, "collect_ntfs_usn") as usn:
+            parser.collect_image(ctx, credential)
+        return ctx, constructor, current, usn
+
+    def test_dd_decrypted_stream_enters_existing_ntfs_layer(self):
+        self.bde.has_clear_key.return_value = True
+        ctx, constructor, current, usn = self.collect()
+        constructor.assert_called_once_with(self.plain)
+        current.assert_called_once()
+        usn.assert_called_once()
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+        self.assertTrue(self.plain.closed)
+
+    def test_ewf_container_then_inner_volume(self):
+        path = self.root / "synthetic.E01"
+        path.write_bytes(b"OUTER_EWF")
+        self.bde.has_clear_key.return_value = True
+        outer = io.BytesIO(self.image.read_bytes())
+        ewf = Mock()
+        ewf.open.return_value = outer
+        with patch("dissect.evidence.ewf.find_files", return_value=[str(path)]) as find, patch("dissect.evidence.ewf.EWF", return_value=ewf):
+            ctx, constructor, _, _ = self.collect(path)
+        find.assert_called_once_with(path)
+        constructor.assert_called_once_with(self.plain)
+        self.assertTrue(outer.closed)
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def test_split_raw_bitlocker_without_join(self):
+        first, second = self.root / "split.001", self.root / "split.002"
+        first.write_bytes(self.image.read_bytes()[:100])
+        second.write_bytes(self.image.read_bytes()[100:])
+        state = parser.image_stat(first)
+        self.bde.has_clear_key.return_value = True
+        ctx, constructor, _, _ = self.collect(first)
+        self.assertIsInstance(self.backend.call_args.args[0], parser.SegmentedRawStream)
+        self.assertEqual(state, parser.image_stat(first))
+        constructor.assert_called_once_with(self.plain)
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def test_failed_partition_does_not_block_normal_partition(self):
+        normal = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        partitions = [SimpleNamespace(offset=1024, open=lambda: io.BytesIO(bytes(512))),
+                      SimpleNamespace(offset=2048, open=lambda: normal)]
+        self.detect.side_effect = [True, False]
+        ctx, constructor, current, _ = self.collect(partitions=partitions)
+        self.assertIn("bitlocker_credential_missing", [i.code for i in ctx.issues])
+        constructor.assert_called_once_with(normal)
+        current.assert_called_once()
+        self.assertFalse(any(i.fatal for i in ctx.issues))
+
+    def test_invalid_key_partition_does_not_block_other_partition(self):
+        self.bde.unlock_with_passphrase.side_effect = ValueError("SYNTHETIC_SECRET")
+        normal = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        partitions = [SimpleNamespace(offset=0, open=lambda: io.BytesIO(bytes(512))),
+                      SimpleNamespace(offset=512, open=lambda: normal)]
+        self.detect.side_effect = [True, False]
+        ctx, constructor, _, _ = self.collect(partitions=partitions, credential=parser.BitLockerCredential("passphrase", "SYNTHETIC_SECRET"))
+        self.assertIn("bitlocker_unlock_failed", [i.code for i in ctx.issues])
+        constructor.assert_called_once_with(normal)
+        self.assertNotIn("SYNTHETIC_SECRET", repr(ctx))
+
+    def test_metadata_failure_and_stream_error_are_distinct(self):
+        self.backend.side_effect = ValueError("SYNTHETIC_SECRET")
+        self.open()
+        self.assertIn("bitlocker_metadata_failed", [i.code for i in self.ctx.issues])
+        self.backend.side_effect = None
+        self.bde.has_clear_key.return_value = True
+        self.bde.open.side_effect = OSError("SYNTHETIC_SECRET")
+        self.open()
+        self.assertIn("bitlocker_stream_error", [i.code for i in self.ctx.issues])
+        self.assertNotIn("SYNTHETIC_SECRET", repr(self.ctx))
+
+    def test_original_image_bytes_size_and_mtime_unchanged(self):
+        before = (self.image.read_bytes(), parser.image_stat(self.image))
+        self.bde.has_clear_key.return_value = True
+        self.collect()
+        self.assertEqual(before, (self.image.read_bytes(), parser.image_stat(self.image)))
+        self.assertEqual([self.image], list(self.root.iterdir()))
+
+    def test_credentials_absent_from_csv_validation_and_diagnostics(self):
+        secret = "SYNTHETIC_SECRET_NO_LEAK"
+        credential = parser.BitLockerCredential("recovery", secret)
+        self.bde.unlock_with_recovery_password.side_effect = ValueError(secret)
+        self.open(credential)
+        output = self.root / "out"
+        parser.write_outputs(self.ctx, output)
+        diagnostic = io.StringIO()
+        parser.report_analysis(self.ctx, diagnostic)
+        with patch.object(parser, "analyze", return_value=self.ctx):
+            validation = parser.validate_analysis(self.ctx, self.image, output, credential=credential)
+        emitted = diagnostic.getvalue() + json.dumps(validation) + repr(credential)
+        emitted += "".join(p.read_text(encoding="utf-8-sig") for p in output.iterdir())
+        self.assertNotIn(secret, emitted)
+        self.assertEqual([], parser.timeline_rows(self.ctx))
+
+    def test_prompt_uses_getpass_and_rejects_echo_fallback(self):
+        args = parser.build_argument_parser().parse_args(["--bitlocker-recovery-prompt"])
+        with patch.object(getpass, "getpass", return_value="SYNTHETIC_RECOVERY") as prompt:
+            credential = parser.read_bitlocker_credential(args)
+        self.assertEqual("recovery", credential.kind)
+        self.assertNotIn(credential.value, repr(credential))
+        prompt.assert_called_once()
+        with patch.object(getpass, "getpass", side_effect=getpass.GetPassWarning("no tty")):
+            with self.assertRaises(getpass.GetPassWarning):
+                parser.read_bitlocker_credential(args)
+
+    def test_non_bitlocker_dd_and_ewf_keep_existing_path(self):
+        self.detect.return_value = False
+        self.image.write_bytes(b"\xeb\x52\x90NTFS    " + bytes(501))
+        _, constructor, current, _ = self.collect()
+        self.assertEqual(1, constructor.call_count)
+        current.assert_called_once()
+        path = self.root / "synthetic.E01"
+        path.write_bytes(b"EWF")
+        outer = io.BytesIO(self.image.read_bytes())
+        with patch("dissect.evidence.ewf.find_files", return_value=[str(path)]), patch("dissect.evidence.ewf.EWF", return_value=SimpleNamespace(open=lambda: outer)):
+            _, constructor, current, _ = self.collect(path)
+        constructor.assert_called_once_with(outer)
+        current.assert_called_once()
+        self.backend.assert_not_called()
+
+    def test_backend_unavailable_oem_is_only_a_hint(self):
+        with patch.dict(sys.modules, {"dissect.fve.bde": None}):
+            stream, encrypted = parser.open_volume_stream(
+                self.ctx, io.BytesIO(b"\xeb\x52\x90-FVE-FS-" + bytes(501)), "partition0")
+        self.assertIsNone(stream)
+        self.assertFalse(encrypted)
+        self.assertIn("bitlocker_backend_unavailable", [i.code for i in self.ctx.issues])
+
+    def test_backend_exception_logging_cannot_leak_credential(self):
+        secret = "SYNTHETIC_BACKEND_LOG_SECRET"
+        logger = logging.getLogger("dissect.fve.bde.bde")
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        previous_disabled, previous_level = logger.disabled, logger.level
+        logger.disabled, logger.level = False, logging.DEBUG
+        logger.addHandler(handler)
+        def failed(value):
+            logger.error(value)
+            raise ValueError(value)
+        self.bde.unlock_with_passphrase.side_effect = failed
+        try:
+            self.open(parser.BitLockerCredential("passphrase", secret))
+            self.assertFalse(logger.disabled)
+        finally:
+            logger.removeHandler(handler)
+            logger.disabled, logger.level = previous_disabled, previous_level
+        self.assertNotIn(secret, output.getvalue() + repr(self.ctx))
+
+    def test_decrypted_artifact_reuses_parser_core_and_deterministic_csv(self):
+        content = json.dumps(conversation(message(), message("assistant"))).encode("utf-8")
+        record = SimpleNamespace(
+            is_dir=lambda: False, size=lambda: len(content), open=lambda: io.BytesIO(content),
+            has_stream=lambda name: False, segment=42, header=SimpleNamespace(SequenceNumber=1),
+        )
+        self.bde.has_clear_key.return_value = True
+        self.bde.open.side_effect = lambda: io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        def current(ctx, ntfs, index):
+            self.assertEqual(b"NTFS    ", ntfs.fh.read(11)[3:11])
+            parser.add_ntfs_file(ctx, record, r"volume0:\Users\TEST\.lmstudio\conversations\TEST.conversation.json", index)
+        with patch("dissect.volume.disk.Disk", side_effect=ValueError("volume image")), \
+                patch("dissect.ntfs.NTFS", side_effect=lambda stream: SimpleNamespace(fh=stream)), \
+                patch.object(parser, "collect_ntfs_current", side_effect=current), \
+                patch.object(parser, "collect_ntfs_usn"):
+            first = parser.analyze(self.image)
+            second = parser.analyze(self.image)
+        self.assertEqual(2, len(first.messages))
+        self.assertTrue(first.candidates)
+        for index, ctx in enumerate((first, second)):
+            parser.write_outputs(ctx, self.root / f"out{index}")
+        for name in ("timeline.csv", "recovered_conversations.csv"):
+            self.assertEqual((self.root / "out0" / name).read_bytes(), (self.root / "out1" / name).read_bytes())
+
+    def test_decrypted_stream_error_isolated_from_next_partition(self):
+        self.bde.has_clear_key.return_value = True
+        self.bde.open.side_effect = OSError("synthetic stream failure")
+        normal = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        partitions = [SimpleNamespace(offset=0, open=lambda: io.BytesIO(bytes(512))),
+                      SimpleNamespace(offset=512, open=lambda: normal)]
+        self.detect.side_effect = [True, False]
+        ctx, constructor, current, _ = self.collect(partitions=partitions)
+        self.assertIn("bitlocker_stream_error", [i.code for i in ctx.issues])
+        constructor.assert_called_once_with(normal)
+        current.assert_called_once()
+        self.assertFalse(any(i.fatal for i in ctx.issues))
 
 
 def run_self_tests() -> int:
