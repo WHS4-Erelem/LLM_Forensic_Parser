@@ -2,6 +2,10 @@
 """Gemini Web forensic-image/artifact parser; Python 3.10+.
 
 Image mode requires pytsk3; EWF additionally requires pyewf (libewf-python).
+BitLocker partitions additionally require dissect.fve and dissect.ntfs. Only an
+image-internal Clear Key is supported; external credentials are not accepted.
+Decrypted reads are partition-relative and read-only;
+no full decrypted image is created. States are in JSON partition_status detail.
 Profile mode still uses only the standard library. Dependency installation is
 external to this script; there is no automatic install, mount, or image write.
 
@@ -78,7 +82,7 @@ TIMELINE_FIELDS = ("Model", "Timestamp", "User_behavior", "Behavior_details ", "
 CONVERSATION_FIELDS = ("Model", "timestamp", "conversation_uuid", "conversation_title",
                        "message_uuid", "parent_message_uuid", "message order", "role",
                        "content", "Artifact_path")
-PARSER_VERSION = "1.4.6-freeze-candidate-edgecase-fix"
+PARSER_VERSION = "1.4.8.6-bitlocker-clear-key"
 OUTPUT_CONTRACT_VERSION = "2026-09-team-v1"
 COVERAGE_FIELDS = ("Model", "Scope", "Item", "Status", "Reason", "Artifact_path", "Artifact_details")
 TEAM_VERDICTS = {"확정", "의심"}
@@ -1579,6 +1583,8 @@ class GeminiParser:
         if not isinstance(text, str) or not text:
             return []
 
+
+
         variants = [(text, False)]
         unescaped = html.unescape(text.replace('\\"', '"').replace("\\/", "/"))
         if unescaped != text:
@@ -1591,8 +1597,11 @@ class GeminiParser:
             if decoded != text and decoded != unescaped:
                 variants.append((decoded, True))
 
+        # Disjoint escape/plain branches avoid backtracking over alternate parses
+        # of backslashes. Plain text excludes both quotes, so greediness cannot
+        # consume an unescaped closing quote; retain the existing 8192-atom bound.
         quoted = re.compile(
-            r'''(?is)["']?(?P<label>prompt_text|prompt|user_input|input|query|message_text|message|content|text)["']?\s*[:=]\s*(?P<quote>["'])(?P<value>(?:\\.|(?!["']).){2,8192}?)(?P=quote)'''
+            r'''(?is)["']?(?P<label>prompt_text|prompt|user_input|input|query|message_text|message|content|text)["']?\s*[:=]\s*(?P<quote>["'])(?P<value>(?:\\.|[^\\"']){2,8192})(?P=quote)'''
         )
         form = re.compile(
             r'''(?is)(?:^|[?&;\s])(?P<label>prompt_text|prompt|user_input|input|query)\s*=\s*(?P<value>[^&\r\n]{2,8192})'''
@@ -1603,39 +1612,55 @@ class GeminiParser:
 
         output, seen = [], set()
         for variant, approximate in variants:
+            # Exact ranges are meaningful only within this particular variant.
+            google_search_cache, cid_cache, strong_rpc_cache = {}, {}, {}
+            cross_service_cache, role_cache = {}, {}
             for rx in (quoted, form, colon):
                 for match in rx.finditer(variant):
                     label = str(match.group("label") or "").casefold()
                     start = match.start()
                     c0 = max(0, start - AGGRESSIVE_PROMPT_CONTEXT)
                     c1 = min(len(variant), match.end() + AGGRESSIVE_PROMPT_CONTEXT)
+                    context_key = (c0, c1)
                     context = variant[c0:c1]
 
-                    if cls._is_google_search_context(context):
+                    if context_key not in google_search_cache:
+                        google_search_cache[context_key] = cls._is_google_search_context(context)
+                    if google_search_cache[context_key]:
                         continue
 
-                    cid = cls._explicit_conversation_id_from_text(context)
-                    strong_rpc = bool(re.search(
-                        r"(?i)(?:\bhnvQHb\b|StreamGenerate|BardChatUi|gemini\.google\.com/_/|"
-                        r"origin\s*=\s*(?:https?%3A%2F%2F|https?://)?gemini\.google\.com|"
-                        r"source-path\s*[:=]\s*[\"']?/app)", context
-                    ))
+                    if context_key not in cid_cache:
+                        cid_cache[context_key] = cls._explicit_conversation_id_from_text(context)
+                    cid = cid_cache[context_key]
+                    if context_key not in strong_rpc_cache:
+                        strong_rpc_cache[context_key] = bool(re.search(
+                            r"(?i)(?:\bhnvQHb\b|StreamGenerate|BardChatUi|gemini\.google\.com/_/|"
+                            r"origin\s*=\s*(?:https?%3A%2F%2F|https?://)?gemini\.google\.com|"
+                            r"source-path\s*[:=]\s*[\"']?/app)", context
+                        ))
+                    strong_rpc = strong_rpc_cache[context_key]
                     gemini_anchor = bool(cid or origin_scoped or strong_rpc)
                     if not gemini_anchor:
                         continue
-                    if cls._is_cross_service_prompt_context(context) and not (cid or strong_rpc):
+                    if context_key not in cross_service_cache:
+                        cross_service_cache[context_key] = cls._is_cross_service_prompt_context(context)
+                    if cross_service_cache[context_key] and not (cid or strong_rpc):
                         continue
 
                     role = "user" if label in {"prompt_text", "prompt", "user_input", "input", "query"} else ""
                     if not role:
-                        user_side = bool(re.search(
-                            r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:user|human)["']|["']author["']\s*[:=]\s*["']user["']|user[_ -]?message|user[_ -]?input)''',
-                            context,
-                        ))
-                        assistant_side = bool(re.search(
-                            r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:assistant|model)["']|["']author["']\s*[:=]\s*["'](?:assistant|model)["'])''',
-                            context,
-                        ))
+                        if context_key not in role_cache:
+                            user_side = bool(re.search(
+                                r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:user|human)["']|["']author["']\s*[:=]\s*["']user["']|user[_ -]?message|user[_ -]?input)''',
+                                context,
+                            ))
+                            assistant_side = bool(re.search(
+                                r'''(?i)(?:["']role["']\s*[:=]\s*["'](?:assistant|model)["']|["']author["']\s*[:=]\s*["'](?:assistant|model)["'])''',
+                                context,
+                            ))
+                            role_cache[context_key] = (user_side, assistant_side)
+                        else:
+                            user_side, assistant_side = role_cache[context_key]
                         if not user_side or assistant_side:
                             continue
                         role = "user"
@@ -2478,6 +2503,7 @@ class GeminiParser:
         Encoded/compressed records are deliberately not interpreted as live
         values. Offsets always point to original bytes, including UTF-16 hits.
         """
+        service_worker = key == "service_worker"
         initial = path.stat()
         size = initial.st_size
         hits, images, protocol_messages, prompt_candidates = [], [], [], []
@@ -2486,6 +2512,13 @@ class GeminiParser:
         consumed, tail = 0, b""
         protocol_carry, protocol_carry_base = b"", 0
         gzip_carry, gzip_carry_base = b"", 0
+
+
+        # Superset of the existing literal/protocol/aggressive-prompt anchors, in both
+        # encodings. This is a scheduling filter, never a new forensic detection rule.
+        sw_needles = tuple(marker.encode(enc) for enc in ("utf-8", "utf-16le")
+                           for marker in ("gemini.google.com", "wrb.fr", "hnvqhb", "f.req",
+                                          "streamgenerate", "batchexecute", "bardchatui"))
         budget = min(size, self.max_binary_bytes) if self.max_binary_bytes else size
         header = b""
         with path.open("rb") as stream:
@@ -2563,6 +2596,15 @@ class GeminiParser:
                                                "detection_method": "magic_signature_only"})
                             at = data.find(signature, at + len(signature))
 
+                # Keep enumeration, inventory and literal search for every Service Worker
+                # file. Irrelevant chunks need no full text decode or protocol recovery;
+                # overlap and pending records preserve candidates crossing chunk boundaries.
+                if (service_worker and not protocol_carry and not gzip_carry
+                        and b"\x1f\x8b\x08" not in data
+                        and not any(needle in lowered for needle in sw_needles)):
+                    tail = data[-OVERLAP:]
+                    continue
+
                 # Decode structured Gemini request/response payloads independently of the
                 # domain-string hit path. A batchexecute JSON frame can be larger than the normal
                 # raw-search overlap, so preserve an incomplete marker-bearing line across chunks
@@ -2573,7 +2615,39 @@ class GeminiParser:
                 else:
                     protocol_data = data
                     protocol_base = base
-                protocol_inputs = [(protocol_data, protocol_base)]
+                protocol_carry, protocol_carry_base = b"", 0
+                pending_start = None
+                if not final and len(protocol_data) < MAX_PROTOCOL_TEXT:
+                    marker_positions = [
+                        pos for marker in (b"wrb.fr", b"hNvQHb", b"f.req", b"StreamGenerate", b"batchexecute")
+                        if (pos := protocol_data.find(marker)) >= 0
+                    ]
+                    if marker_positions:
+                        first_marker = min(marker_positions)
+                        line_start = max(protocol_data.rfind(b"\n", 0, first_marker),
+                                         protocol_data.rfind(b"\r", 0, first_marker)) + 1
+                        line_end_n = protocol_data.find(b"\n", first_marker)
+                        line_end_r = protocol_data.find(b"\r", first_marker)
+                        ends = [x for x in (line_end_n, line_end_r) if x >= 0]
+                        if not ends:
+                            candidate_carry = protocol_data[line_start:]
+                            if len(candidate_carry) < MAX_PROTOCOL_TEXT:
+                                protocol_carry = candidate_carry
+                                protocol_carry_base = protocol_base + line_start
+                                pending_start = line_start
+
+                # Defer only a single unfinished line. With a completed prefix, retain the
+                # full old context (f.req can use a Gemini anchor on a neighboring line).
+                # Keep gzip handling unchanged: a binary member is not a text line.
+                protocol_input = protocol_data
+                if service_worker and pending_start == 0 and b"\x1f\x8b\x08" not in protocol_data:
+                    protocol_input = b""
+                protocol_inputs = [(protocol_input, protocol_base)] if protocol_input else []
+                if (service_worker and len(protocol_data) >= MAX_PROTOCOL_TEXT
+                        and b"\x1f\x8b\x08" not in protocol_data):
+                    # A valid frame may precede a very long unterminated suffix. Preserve
+                    # recovery at the bound before the full line exceeds the decoder cap.
+                    protocol_inputs.insert(0, (protocol_data[:MAX_PROTOCOL_TEXT], protocol_base))
                 if gzip_carry:
                     gzip_probe = gzip_carry + block
                     protocol_inputs.append((gzip_probe, gzip_carry_base))
@@ -2582,7 +2656,8 @@ class GeminiParser:
                     gzip_carry_base = base
 
                 for protocol_input, input_base in protocol_inputs:
-                    for message in self._protocol_messages_from_bytes(protocol_input, input_base):
+                    for message in self._protocol_messages_from_bytes(
+                            protocol_input, input_base):
                         identity = (
                             message.get("conversation_id"), message.get("response_id"), message.get("choice_id"),
                             message.get("role"), message.get("message_content"), message.get("protocol_offset"),
@@ -2594,26 +2669,6 @@ class GeminiParser:
                             break
                         seen_protocol.add(identity)
                         protocol_messages.append(message)
-
-                protocol_carry, protocol_carry_base = b"", 0
-                if not final and len(protocol_data) < MAX_PROTOCOL_TEXT:
-                    marker_positions = [
-                        pos for marker in (b"wrb.fr", b"hNvQHb", b"f.req", b"StreamGenerate", b"batchexecute")
-                        if (pos := protocol_data.find(marker)) >= 0
-                    ]
-                    if marker_positions:
-                        first_marker = min(marker_positions)
-                        line_start = max(protocol_data.rfind(b"\n", 0, first_marker),
-                                         protocol_data.rfind(b"\r", 0, first_marker)) + 1
-                        # Keep only when the marker-bearing record has no line terminator yet.
-                        line_end_n = protocol_data.find(b"\n", first_marker)
-                        line_end_r = protocol_data.find(b"\r", first_marker)
-                        ends = [x for x in (line_end_n, line_end_r) if x >= 0]
-                        if not ends:
-                            candidate_carry = protocol_data[line_start:]
-                            if len(candidate_carry) < MAX_PROTOCOL_TEXT:
-                                protocol_carry = candidate_carry
-                                protocol_carry_base = protocol_base + line_start
 
                 # Aggressive prompt fallback: search the full chunk (not only the ±2 KiB
                 # gemini.google.com hit context) for explicitly labelled user text.  The helper
@@ -3688,8 +3743,6 @@ class GeminiParser:
                 self._issue(key, root, f"Configured file limit ({self.max_files}) reached", status="partial")
                 break
             file_count += 1
-            if file_count % 100 == 0:
-                self._say(f"[.] {self.ARTIFACTS[key]}: scanned {file_count} files")
             try:
                 relative = str(path.relative_to(root)).replace("\\", "/")
                 origin = key == "indexeddb" and bool(re.search(
@@ -3873,6 +3926,8 @@ class GeminiParser:
                         findings += 1
             except (OSError, ValueError, struct.error) as exc:
                 self._issue(key, path, error_text(exc))
+            if file_count % 100 == 0:
+                self._say(f"[.] {self.ARTIFACTS[key]}: processed {file_count} files")
         read_errors = sum(r["status"] == "parse_error" for r in self.results[start:])
         scan_status = ("parse_error" if read_errors and not files_read else
                        "partial" if read_errors else "success" if findings else "no_relevant_trace")
@@ -7080,6 +7135,141 @@ class ImageReadError(OSError):
     """An image object is unreadable, incomplete, or outside its bounds."""
 
 
+class BitLockerError(ImageReadError):
+    """Only fixed, key-free messages cross the BitLocker input boundary."""
+
+    def __init__(self, status, message):
+        self.status = status
+        super().__init__(message)
+
+
+class PartitionView(io.RawIOBase):
+    """Bounded read-only file object; closing it never closes the evidence."""
+
+    def __init__(self, image, offset, length):
+        super().__init__()
+        if offset < 0 or length <= 0 or offset + length > image.get_size():
+            raise ImageReadError("Invalid partition view bounds")
+        self.image, self.offset, self.length = image, offset, length
+        self.position = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def get_size(self):
+        self._checkClosed()
+        return self.length
+
+    def tell(self):
+        self._checkClosed()
+        return self.position
+
+    def seek(self, offset, whence=0):
+        self._checkClosed()
+        if whence not in (0, 1, 2):
+            raise ValueError("Invalid partition seek origin")
+        position = offset + (self.position if whence == 1 else self.length if whence == 2 else 0)
+        if position < 0:
+            raise ValueError("Negative partition seek")
+        self.position = position
+        return position
+
+    def read(self, size=-1):
+        self._checkClosed()
+        available = max(0, self.length - self.position)
+        size = available if size is None or size < 0 else min(size, available)
+        if not size:
+            return b""
+        try:
+            data = self.image.read(self.offset + self.position, size)
+        except Exception:
+            raise ImageReadError("Unable to read BitLocker partition bytes") from None
+        if len(data) != size:
+            raise ImageReadError("Short read within BitLocker partition")
+        self.position += len(data)
+        return data
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+
+
+
+class DissectBitLockerVolume:
+    """Own the read-only clear-key stream and NTFS backend until reader.close()."""
+
+    @staticmethod
+    def has_signature(boot):
+        # Windows Vista/7/used-space-only/BitLocker To Go signatures.
+        identifier = bytes.fromhex("3bd66749292ed84a8399f6a339e3d001")
+        used_space = bytes.fromhex("3b4da89280dd0e4d9e4eb1e3284eaed8")
+        return (boot[3:11] == b"-FVE-FS-" or boot[160:176] in (identifier, used_space)
+                or boot[424:440] == identifier)
+
+    def __init__(self, reader, metadata):
+        self.view = self.bde = self.stream = self.ntfs = self.filesystem = None
+        self.size = 0
+        metadata.update(bitlocker_backend="dissect.fve -> dissect.ntfs",
+                        bitlocker_has_clear_key=None)
+        try:
+            try:
+                from dissect.fve.bde import BDE
+                from dissect.ntfs import NTFS
+            except Exception:
+                metadata["bitlocker_reason"] = "dependency_unavailable"
+                raise BitLockerError("BITLOCKER_UNSUPPORTED",
+                                     "BitLocker requires compatible dissect.fve and dissect.ntfs dependencies") from None
+
+            metadata["bitlocker_reason"] = "metadata_parse_failed"
+            self.view = PartitionView(reader.image, metadata["partition_offset"], metadata["partition_length"])
+            self.bde = BDE(self.view)
+            metadata["bitlocker_has_clear_key"] = bool(self.bde.has_clear_key())
+            if not metadata["bitlocker_has_clear_key"]:
+                metadata["bitlocker_reason"] = "clear_key_missing"
+                raise BitLockerError("BITLOCKER_LOCKED", "BitLocker volume has no image-internal clear key")
+
+            metadata["bitlocker_reason"] = "clear_key_unlock_failed"
+            self.bde.unlock_with_clear_key()
+            metadata["bitlocker_reason"] = "decrypted_stream_open_failed"
+            self.stream = self.bde.open()
+            self.stream.seek(0, io.SEEK_END)
+            self.size = int(self.stream.tell())
+            if self.size <= 0 or self.size > metadata["partition_length"]:
+                raise ImageReadError("Invalid decrypted BitLocker volume size")
+            self.stream.seek(0)
+            metadata["bitlocker_reason"] = "ntfs_open_failed"
+            self.ntfs = NTFS(self.stream)
+            self.filesystem = DissectForensicFilesystem(reader, self.ntfs, metadata, self)
+            metadata.update(bitlocker_reason="clear_key_unlocked", bitlocker_unlock_method="clear_key")
+        except BitLockerError:
+            self.close()
+            raise
+        except Exception:
+            self.close()
+            raise BitLockerError("BITLOCKER_OPEN_ERROR",
+                                 "BitLocker clear-key volume could not be opened; see bitlocker_reason") from None
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        stream, self.stream = self.stream, None
+        self.filesystem = self.ntfs = self.bde = None
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if self.view is not None:
+            self.view.close()
+            self.view = None
+
+
 class ForensicImageReader:
     """Read-only RAW/split-RAW -> pytsk3 / EWF -> pyewf -> pytsk3 adapter.
 
@@ -7100,6 +7290,7 @@ class ForensicImageReader:
         self.raw_handles = []
         self.size = 0
         self.initial_stats = {}
+        self._bitlocker_volumes = []
 
     @staticmethod
     def _split_raw_match(path):
@@ -7308,6 +7499,9 @@ class ForensicImageReader:
         return {str(p): (p.stat().st_size, p.stat().st_mtime_ns) for p in self.segments}
 
     def close(self):
+        volumes, self._bitlocker_volumes = self._bitlocker_volumes, []
+        for volume in reversed(volumes):
+            volume.close()
         try:
             if self.image is not None:
                 self.image.close()
@@ -7360,20 +7554,31 @@ class ForensicImageReader:
                 yield metadata, None, "Partition extends beyond available image bytes"
                 continue
             try:
-                fs = self.tsk.FS_Info(self.image, offset=offset)
+                boot = self.image.read(offset, min(512, length))
+                metadata["bitlocker_status"] = "NOT_ENCRYPTED"
+                fs_image, fs_offset = self.image, offset
+                if DissectBitLockerVolume.has_signature(boot):
+                    metadata["filesystem_type"] = "BitLocker_locked"
+                    # legacy compatibility field; external BitLocker credentials are no longer supported
+                    metadata["bitlocker_key_supplied"] = False
+                    decrypted = DissectBitLockerVolume(self, metadata)
+                    self._bitlocker_volumes.append(decrypted)
+                    metadata.update(bitlocker_status="BITLOCKER_UNLOCKED", bitlocker_read_only=True,
+                                    decrypted_volume_size=decrypted.size)
+                    metadata.update(filesystem_type="NTFS")
+                    yield metadata, decrypted.filesystem, None
+                    continue
+                fs = self.tsk.FS_Info(fs_image, offset=fs_offset)
                 ftype = int(fs.info.ftype)
                 is_ntfs = bool(ftype & self.tsk.TSK_FS_TYPE_NTFS_DETECT)
                 metadata.update(filesystem_type="NTFS" if is_ntfs else "non_NTFS:" + str(ftype),
                                 filesystem_type_code=ftype)
                 yield metadata, ForensicFilesystem(self, fs, metadata) if is_ntfs else None, None
+            except BitLockerError as exc:
+                metadata["bitlocker_status"] = exc.status
+                yield metadata, None, str(exc)
             except (OSError, RuntimeError) as exc:
                 metadata["filesystem_type"] = "unrecognized"
-                try:
-                    boot = self.image.read(offset, 16)
-                    if b"-FVE-FS-" in boot:
-                        metadata["filesystem_type"] = "BitLocker_locked"
-                except (OSError, RuntimeError) as read_exc:
-                    metadata["boot_read_error"] = error_text(read_exc)
                 yield metadata, None, error_text(exc)
 
 
@@ -7469,6 +7674,116 @@ class ForensicFilesystem:
                 "metadata_changed_time": normalize_timestamp(node.get("metadata_changed_ns"), "unix_ns"),
                 "timestamp_format": "unix_nanoseconds", "timestamp_role": "NTFS_metadata_not_user_action",
                 "filesystem_type": "NTFS", "inode": node["inode"], "sequence": node["sequence"]}
+
+
+class DissectForensicFilesystem(ForensicFilesystem):
+    """Expose allocated Dissect NTFS records through the existing collector interface."""
+
+    def __init__(self, reader, fs, metadata, owner):
+        super().__init__(reader, fs, metadata)
+        from dissect.ntfs.c_ntfs import ATTRIBUTE_TYPE_CODE, FILE_NUMBER_ROOT, FILE_RECORD_SEGMENT_IN_USE
+        self._data_type = ATTRIBUTE_TYPE_CODE.DATA
+        self._standard_type = ATTRIBUTE_TYPE_CODE.STANDARD_INFORMATION
+        self._in_use = FILE_RECORD_SEGMENT_IN_USE
+        self._root_segment = FILE_NUMBER_ROOT
+        self._owner = owner
+
+    def _directory_record(self, path):
+        # Integer MFT lookup cannot follow a symlink/junction. Non-root paths are
+        # resolved by the inherited component-wise, case-insensitive lookup.
+        if path == "/":
+            record = self.fs.mft.get(self._root_segment)
+        else:
+            node = self.lookup(path)
+            if node is None or not node["is_dir"]:
+                raise ImageReadError("Image directory not found")
+            record = node["_record"]
+        if record.is_reparse_point():
+            raise ImageReadError("Reparse point is not followed")
+        return record
+
+    def listdir(self, path):
+        path = str(PurePosixPath(path))
+        parts = PurePosixPath(path).parts
+        if not parts or parts[0] != "/" or ".." in parts:
+            raise ValueError("Image filesystem path must be absolute without traversal")
+        if path in self._directories:
+            return self._directories[path]
+        try:
+            record = self._directory_record(path)
+            nodes = []
+            # Keep directory-index names: dereference=True expands record-wide
+            # hard-link names, which can belong to a different parent directory.
+            for name, entry in record.listdir(dereference=False, ignore_dos=True).items():
+                if name in (".", ".."):
+                    continue
+                name = self._name(name)
+                if not name or any(c in name for c in ("/", "\\", "\x00")):
+                    raise ImageReadError("Invalid image directory entry name")
+                child = entry.dereference()
+                if not child.header.Flags & self._in_use:
+                    continue
+                if entry.header.FileReference.SequenceNumber != child.header.SequenceNumber:
+                    continue
+                standard = child.attributes[self._standard_type]
+                if len(standard) != 1:
+                    raise ImageReadError("Missing or ambiguous NTFS standard information")
+                is_dir = child.is_dir()
+                nodes.append({"path": str(PurePosixPath(path) / name), "name": name,
+                              "inode": int(child.segment), "sequence": int(child.header.SequenceNumber),
+                              "size": 0 if is_dir or not child.has_stream() else child.size(),
+                              "is_dir": is_dir, "is_file": child.is_file(),
+                              "created_ns": standard.creation_time_ns,
+                              "modified_ns": standard.last_modification_time_ns,
+                              "metadata_changed_ns": standard.last_change_time_ns,
+                              "_record": child})
+            self._directories[path] = sorted(nodes, key=lambda n: n["name"].casefold())
+            return self._directories[path]
+        except (ImageReadError, ValueError):
+            raise
+        except Exception:
+            raise ImageReadError("Unable to enumerate Dissect NTFS directory") from None
+
+    def is_reparse(self, node):
+        if "inode" not in node:
+            return False
+        try:
+            return node["_record"].is_reparse_point()
+        except Exception:
+            raise ImageReadError("Unable to inspect NTFS reparse attribute") from None
+
+    def streams(self, node):
+        try:
+            record = node["_record"]
+            streams, seen = [], set()
+            for attr in record.attributes[self._data_type]:
+                name = attr.name
+                if name in seen:
+                    continue  # One logical stream can span multiple DATA attributes.
+                seen.add(name)
+                streams.append({"name": name, "type": int(self._data_type.value),
+                                "id": int(attr.header.header.Instance), "size": record.size(name=name)})
+            return streams
+        except Exception:
+            raise ImageReadError("Unable to enumerate NTFS DATA streams") from None
+
+    def chunks(self, node, stream=None):
+        size = stream["size"] if stream else node["size"]
+        try:
+            record = node["_record"]
+            with record.open(name=stream["name"]) if stream else record.open() as source:
+                offset = 0
+                while offset < size:
+                    amount = min(CHUNK, size - offset)
+                    data = source.read(amount)
+                    if len(data) != amount:
+                        raise ImageReadError("Short/invalid NTFS stream read at file offset " + str(offset))
+                    yield data
+                    offset += len(data)
+        except ImageReadError:
+            raise
+        except Exception:
+            raise ImageReadError("Unable to read NTFS DATA stream") from None
 
 
 class ImageArtifactCollector:
@@ -7954,6 +8269,11 @@ class GeminiImageParser(GeminiParser):
                                                        "split-raw -> pytsk3" if self.image_type == "SPLIT_RAW" else "pytsk3")})
                 filesystems = []
                 for metadata, fs, error in reader.filesystems():
+                    bitlocker_status = metadata.get("bitlocker_status", "NOT_ENCRYPTED")
+                    if bitlocker_status != "NOT_ENCRYPTED":
+                        self._say(f"[BitLocker] partition offset {metadata['partition_offset']}: {bitlocker_status}")
+                        if error:
+                            self._say("[BitLocker] " + error)
                     self._image_record("Partition/filesystem probe", self._context(**metadata),
                                        status="success" if fs else "unsupported",
                                        error=error, detail={"record_type": "partition_status", **metadata})
@@ -8000,6 +8320,534 @@ class GeminiImageParser(GeminiParser):
             status = "unsupported" if isinstance(exc, (ImageDependencyError, ValueError)) else "parse_error"
             self._image_record("Image input could not be analyzed", status=status, error=error_text(exc),
                                detail={"record_type": "image_status", "reason": "image_open_failed"})
+        return self.results
+
+
+class LiveArtifactCollector:
+    """Read-only, non-atomic filesystem acquisition; no Gemini interpretation.
+
+    Use as a context manager. Only verified stable copies are published to the
+    profile parser. SQLite main/WAL/SHM/journal are acquired as one group.
+    """
+
+    PROFILE_MARKERS = ("History", "Preferences", "Network/Cookies", "Sessions",
+                       "Local Storage", "IndexedDB", "Session Storage", "Service Worker")
+    TREES = {"Sessions": "sessions", "Cache/Cache_Data": "cache",
+             "Local Storage/leveldb": "local_storage", "Session Storage": "session_storage",
+             "IndexedDB": "indexeddb", "Service Worker": "service_worker"}
+    CHROME_PARTS = ("AppData", "Local", "Google", "Chrome", "User Data")
+
+    class Changed(OSError):
+        pass
+
+    class Unsafe(OSError):
+        pass
+
+    def __init__(self, source_path, *, evidence_root=None, temp_root=None, copy_attempts=2):
+        self.source = Path(os.path.abspath(Path(source_path).expanduser()))
+        self.evidence_root = Path(os.path.abspath(Path(evidence_root).expanduser())) if evidence_root else None
+        self.temp_root = Path(temp_root).expanduser().absolute() if temp_root else None
+        if not isinstance(copy_attempts, int) or not 1 <= copy_attempts <= 3:
+            raise ValueError("copy_attempts must be between 1 and 3")
+        self.copy_attempts = copy_attempts
+        self.profiles, self.events, self.manifest, self.aliases = [], [], {}, {}
+        self.zone_cache = {}
+        self.scratch = self.volume = self._temporary = None
+
+    @staticmethod
+    def _signature(info):
+        return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino)
+
+    @staticmethod
+    def _identity_signature(info):
+        # Windows path stat and fd fstat can expose different ctime semantics.
+        # Keep ctime in _signature for all same-API snapshot comparisons.
+        return (info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino)
+
+    @classmethod
+    def _safe_stat(cls, path):
+        # lstat every ancestor: Python 3.10 also rejects Windows junctions and
+        # other reparse points, without relying on Path.is_junction (3.12+).
+        path = Path(path).absolute()
+        for item in (*reversed(path.parents), path):
+            info = item.lstat()
+            if (stat.S_ISLNK(info.st_mode) or
+                    getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                raise cls.Unsafe("Linked or reparse path skipped")
+            if item != path and not stat.S_ISDIR(info.st_mode):
+                raise cls.Unsafe("Non-directory path component skipped")
+        return info
+
+    @staticmethod
+    def _failure_state(exc):
+        if isinstance(exc, LiveArtifactCollector.Changed):
+            return "changed_during_copy"
+        if isinstance(exc, LiveArtifactCollector.Unsafe):
+            return "unsafe_path"
+        if getattr(exc, "winerror", None) in (32, 33):
+            return "locked"
+        if isinstance(exc, PermissionError):
+            return "permission_denied"
+        if isinstance(exc, FileNotFoundError):
+            return "not_found"
+        return "copy_error"
+
+    def _event(self, path, key, state, *, profile=None, **detail):
+        self.events.append({"record_type": "acquisition_status", "artifact_key": key,
+                            "acquisition_state": state, "source_path": str(path),
+                            "profile_source": str(profile) if profile else None, **detail})
+
+    def _directory(self, path, key="discovery", profile=None):
+        try:
+            info = self._safe_stat(path)
+            if not stat.S_ISDIR(info.st_mode):
+                raise self.Unsafe("Expected an ordinary directory")
+            return True
+        except OSError as exc:
+            self._event(path, key, self._failure_state(exc), profile=profile)
+            return False
+
+    def _entries(self, path, key="discovery", profile=None):
+        if not self._directory(path, key, profile):
+            return []
+        try:
+            return sorted(Path(path).iterdir(), key=lambda p: (p.name.casefold(), p.name))
+        except OSError as exc:
+            self._event(path, key, self._failure_state(exc), profile=profile)
+            return []
+
+    def _profile_candidate(self, path):
+        if not (path.name.casefold() == "default" or re.fullmatch(r"Profile [0-9]+", path.name, re.I)):
+            return False
+        if not self._directory(path):
+            return False
+        for relative in self.PROFILE_MARKERS:
+            try:
+                info = self._safe_stat(path / relative)
+                is_file = relative in {"History", "Preferences", "Network/Cookies"}
+                if stat.S_ISREG(info.st_mode) if is_file else stat.S_ISDIR(info.st_mode):
+                    return True
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                self._event(path / relative, "discovery", self._failure_state(exc), profile=path)
+        return False
+
+    def _user_for_data(self, data):
+        if len(data.parts) >= 6 and tuple(p.casefold() for p in data.parts[-5:]) == tuple(p.casefold() for p in self.CHROME_PARTS):
+            return data.parents[4]
+        return None
+
+    def _add_profiles(self, data, user):
+        for candidate in self._entries(data):
+            if self._profile_candidate(candidate):
+                self.profiles.append({"source": candidate, "user": user})
+        if not any(p["source"].parent == data for p in self.profiles):
+            self._event(data, "discovery", "not_found", reason="no_chrome_profiles")
+
+    def discover(self):
+        """Recognize a volume/Users/user/User Data/conventional profile only."""
+        self.profiles = []
+        if not self._directory(self.source):
+            return []
+        if self.evidence_root and not self._directory(self.evidence_root):
+            self.evidence_root = None
+        if self._profile_candidate(self.source):
+            data = self.source.parent
+            user = self._user_for_data(data)
+            self.profiles.append({"source": self.source, "user": user})
+        elif self.source.name.casefold() == "user data":
+            user = self._user_for_data(self.source)
+            self._add_profiles(self.source, user)
+        else:
+            user = None
+            users = self.source if self.source.name.casefold() == "users" else self.source / "Users"
+            try:
+                info = self._safe_stat(users)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise self.Unsafe("Users is not a directory")
+            except FileNotFoundError:
+                # A user with no Chrome profile is a valid empty acquisition.
+                user = self.source
+                self._add_profiles(user.joinpath(*self.CHROME_PARTS), user)
+            except OSError as exc:
+                self._event(users, "discovery", self._failure_state(exc))
+            else:
+                self.evidence_root = self.evidence_root or users.parent
+                for candidate in self._entries(users):
+                    try:
+                        if not stat.S_ISDIR(self._safe_stat(candidate).st_mode):
+                            continue
+                        self._add_profiles(candidate.joinpath(*self.CHROME_PARTS), candidate)
+                    except OSError as exc:
+                        self._event(candidate, "discovery", self._failure_state(exc))
+        if not self.evidence_root:
+            known_user = user if user else (self.profiles[0]["user"] if self.profiles else None)
+            if known_user and known_user.parent.name.casefold() == "users":
+                self.evidence_root = known_user.parent.parent
+        for spec in self.profiles:
+            spec["context"] = {"windows_user": spec["user"].name if spec["user"] else None,
+                               "chrome_profile": spec["source"].name,
+                               "source_profile": str(spec["source"]), "acquisition_mode": "filesystem",
+                               "source_snapshot": "non_atomic_filesystem_copy", "staged_copy": True}
+        return self.profiles
+
+    def __enter__(self):
+        self.discover()
+        base = self.temp_root or Path(tempfile.gettempdir())
+        self._safe_stat(base)
+        protected = [p["source"].parent for p in self.profiles]
+        protected += [p["user"] / "Downloads" for p in self.profiles if p["user"]]
+        if self.evidence_root:
+            protected.append(self.evidence_root / "$Recycle.Bin")
+        if any(within(base, path) for path in protected):
+            raise ValueError("Temporary workspace must be outside Chrome, Downloads and Recycle Bin sources")
+        self._temporary = tempfile.TemporaryDirectory(prefix="gemini_filesystem_", dir=base)
+        self.scratch = Path(self._temporary.name)
+        self.volume = self.scratch / "volume"
+        try:
+            self.volume.mkdir(mode=0o700)
+            if self.evidence_root:
+                self.aliases[str(self.volume)] = str(self.evidence_root)
+            for index, spec in enumerate(self.profiles):
+                spec["staged"] = self.scratch / ("profile_" + str(index))
+                spec["staged"].mkdir(mode=0o700)
+                self.aliases[str(spec["staged"])] = str(spec["source"])
+        except BaseException:
+            self._temporary.cleanup()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._temporary is not None:
+            try:
+                self._temporary.cleanup()
+            except OSError:
+                self._event(self.source, "cleanup", "copy_error", reason="private_workspace_cleanup_failed")
+            finally:
+                self._temporary = None
+
+    def _copy_one(self, source, destination, before):
+        """Bounded read from a verified descriptor; never open source for write."""
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or self._identity_signature(opened) != self._identity_signature(before):
+                raise self.Changed("Source replaced before copy")
+            if self._signature(self._safe_stat(source)) != self._signature(before):
+                raise self.Changed("Source changed before copy")
+            with destination.open("xb") as output:
+                remaining = before.st_size
+                while remaining:
+                    block = stream.read(min(CHUNK, remaining))
+                    if not block:
+                        raise self.Changed("Source shortened during copy")
+                    output.write(block)
+                    digest.update(block)
+                    remaining -= len(block)
+                if stream.read(1) or self._signature(os.fstat(stream.fileno())) != self._signature(opened):
+                    raise self.Changed("Source changed during copy")
+        return digest.hexdigest()
+
+    def _group(self, pairs, key, profile=None, *, sqlite_group=False):
+        """Publish a whole stable group; discard incomplete/unstable attempts."""
+        last_state, failure_path, snapshots = "copy_error", pairs[0][0], {}
+        for attempt in range(self.copy_attempts):
+            copied = []
+            try:
+                before = {}
+                for source, destination in pairs:
+                    failure_path = source
+                    try:
+                        info = self._safe_stat(source)
+                        if not stat.S_ISREG(info.st_mode):
+                            raise self.Unsafe("Expected an ordinary file")
+                        before[source] = info
+                    except FileNotFoundError:
+                        before[source] = None
+                snapshots = {str(p): ({"size": s.st_size, "mtime_ns": s.st_mtime_ns} if s else None)
+                             for p, s in before.items()}
+                if before[pairs[0][0]] is None:
+                    state = "changed_during_copy" if last_state == "changed_during_copy" else "not_found"
+                    self._event(pairs[0][0], key, state, profile=profile,
+                                sqlite_group=sqlite_group, members=snapshots,
+                                attempts=attempt + 1, passed_to_parser=False)
+                    return False
+                with tempfile.TemporaryDirectory(prefix="attempt_", dir=self.scratch) as work:
+                    for index, (source, destination) in enumerate(pairs):
+                        failure_path = source
+                        info = before[source]
+                        if info is None:
+                            continue
+                        metadata = GeminiParser._file_metadata(source)
+                        temporary = Path(work) / str(index)
+                        digest = self._copy_one(source, temporary, info)
+                        copied.append((source, destination, temporary, info, digest, metadata))
+                    for source, _ in pairs:
+                        failure_path = source
+                        try:
+                            after = self._safe_stat(source)
+                        except FileNotFoundError:
+                            after = None
+                        prior = before[source]
+                        if (prior is None) != (after is None) or (prior and self._signature(prior) != self._signature(after)):
+                            raise self.Changed("Acquisition group changed during copy")
+                    for source, destination, temporary, info, digest, metadata in copied:
+                        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        os.utime(temporary, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        os.replace(temporary, destination)
+                        self.aliases[str(destination)] = str(source)
+                        self.manifest[str(destination)] = {"source": str(source), "sha256": digest,
+                            "metadata": metadata, "signature": self._signature(info), "artifact_key": key}
+                self._event(pairs[0][0], key, "copied", profile=profile, attempts=attempt + 1,
+                            sqlite_group=sqlite_group, members=snapshots, stable=True,
+                            absent_sidecars=[str(p) for p, s in before.items() if s is None])
+                return True
+            except OSError as exc:
+                last_state = self._failure_state(exc)
+                if isinstance(exc, FileNotFoundError) and before.get(failure_path) is not None:
+                    last_state = "changed_during_copy"
+                # No incomplete attempt is passed to the artifact engine.
+                for _, destination, *_ in copied:
+                    if str(destination) in self.manifest:
+                        destination.unlink(missing_ok=True)
+                        self.manifest.pop(str(destination), None)
+                        self.aliases.pop(str(destination), None)
+                if last_state not in {"changed_during_copy", "not_found"}:
+                    break
+        self._event(pairs[0][0], key, last_state, profile=profile, attempts=attempt + 1,
+                    sqlite_group=sqlite_group, members=snapshots, failed_source=str(failure_path),
+                    stable=False, passed_to_parser=False)
+        return False
+
+    def _tree(self, source, destination, key, profile=None, predicate=None):
+        if not self._directory(source, key, profile):
+            return
+        pending = [(source, destination)]
+        while pending:
+            folder, target = pending.pop()
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.aliases[str(target)] = str(folder)
+            for entry in self._entries(folder, key, profile):
+                try:
+                    info = self._safe_stat(entry)
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append((entry, target / entry.name))
+                    elif stat.S_ISREG(info.st_mode) and (predicate is None or predicate(entry.name)):
+                        self._group([(entry, target / entry.name)], key, profile)
+                    elif not stat.S_ISREG(info.st_mode):
+                        self._event(entry, key, "unsafe_path", profile=profile, reason="non_regular_file")
+                except OSError as exc:
+                    self._event(entry, key, self._failure_state(exc), profile=profile)
+
+    def collect_profile(self, spec):
+        source, target = spec["source"], spec["staged"]
+        for relative, key in (("History", "history"), ("Network/Cookies", "cookies")):
+            pairs = [(source / (relative + suffix), target / (relative + suffix))
+                     for suffix in ("", "-wal", "-shm", "-journal")]
+            self._group(pairs, key, source, sqlite_group=True)
+        for relative, key in (("Preferences", "preferences"), ("Secure Preferences", "secure_preferences")):
+            self._group([(source / relative, target / relative)], key, source)
+        for relative, key in self.TREES.items():
+            predicate = (lambda n: n.startswith(("Session_", "Tabs_"))) if key == "sessions" else None
+            self._tree(source / relative, target / relative, key, source, predicate)
+
+    def collect_recycle(self):
+        if self.evidence_root:
+            self._tree(self.evidence_root / "$Recycle.Bin", self.volume / "$Recycle.Bin",
+                       "recycle_bin", predicate=lambda n: n.startswith("$I"))
+        else:
+            self._event(self.source, "recycle_bin", "not_found", reason="volume_root_unknown")
+
+    def original_path(self, value):
+        text = str(value)
+        for prefix in sorted(self.aliases, key=len, reverse=True):
+            if text == prefix or text.startswith(prefix + os.sep) or text.startswith(prefix + ":"):
+                return self.aliases[prefix] + text[len(prefix):]
+        return text
+
+    def rewrite(self, value):
+        if isinstance(value, dict):
+            return {k: self.rewrite(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.rewrite(v) for v in value]
+        if isinstance(value, Path):
+            value = str(value)
+        if isinstance(value, str):
+            for prefix in sorted(self.aliases, key=len, reverse=True):
+                value = value.replace(prefix, self.aliases[prefix])
+            if self.scratch:
+                value = value.replace(str(self.scratch), "[private acquisition workspace]")
+        return value
+
+    def payload_exists(self, local):
+        source = Path(self.original_path(local))
+        try:
+            return stat.S_ISREG(self._safe_stat(source).st_mode)
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            self._event(source, "recycle_bin", self._failure_state(exc), reason="payload_presence_only")
+            return None
+
+    def resolve_download(self, spec, target_path, current_path):
+        # Reuse the existing strict path mapping and attribution engine. Supplying
+        # a root disables fallback to arbitrary files on the analyst's machine.
+        resolver = GeminiParser(spec["source"], image_mode=False,
+                                user_root=spec["user"] if not self.evidence_root else None,
+                                evidence_root=self.evidence_root or (spec["source"] if not spec["user"] else None))
+        result = resolver.resolve_download_path(target_path, current_path)
+        if not result.get("resolved_path"):
+            return result
+        original = Path(result["resolved_path"])
+        token = hashlib.sha256(str(original).encode("utf-8")).hexdigest()
+        local = self.scratch / "downloads" / token / original.name
+        # Reuse a stable acquisition made earlier in this run; do not read the
+        # source again merely because another profile references the same file.
+        if str(local) not in self.manifest and not self._group([(original, local)], "downloaded_file", spec["source"]):
+            return {**result, "file_exists": None, "resolved_path": None,
+                    "resolution_error": "Referenced download could not be safely staged"}
+        return {**result, "resolved_path": str(local)}
+
+    def zone(self, local):
+        if str(local) not in self.zone_cache:
+            manifest = self.manifest[str(local)]
+            source = Path(manifest["source"])
+            try:
+                if self._signature(self._safe_stat(source)) != manifest["signature"]:
+                    raise self.Changed("Download changed before ADS inspection")
+                result = GeminiParser._read_zone(source)
+                if self._signature(self._safe_stat(source)) != manifest["signature"]:
+                    raise self.Changed("Download changed during ADS inspection")
+            except OSError as exc:
+                self._event(source, "downloaded_file", self._failure_state(exc), reason="zone_inspection")
+                result = {"status": "partial", "values": {}, "error": "Source changed or was inaccessible during Zone.Identifier inspection"}
+            self.zone_cache[str(local)] = result
+        return self.zone_cache[str(local)]
+
+
+class FilesystemProfileParser(GeminiParser):
+    """Only acquisition hooks differ; all artifact/semantic routines are inherited."""
+
+    def __init__(self, collector, spec, **options):
+        super().__init__(spec["staged"], image_mode=False, **options)
+        self.collector, self.spec = collector, spec
+
+    def _emit(self, key, observation, **kwargs):
+        # Establish original, stable scope before title correlation, message IDs
+        # or summaries are derived. No parser routine reopens row.source_path.
+        kwargs = self.collector.rewrite(kwargs)
+        kwargs["detail"] = {**(kwargs.get("detail") or {}), **self.spec["context"]}
+        if key == "recycle_bin" and kwargs["detail"].get("payload_path"):
+            kwargs["detail"]["payload_exists"] = self.collector.payload_exists(kwargs["detail"]["payload_path"])
+            kwargs["detail"]["payload_extracted"] = False
+        return super()._emit(key, self.collector.rewrite(observation), **kwargs)
+
+    def discover_artifacts(self):
+        super().discover_artifacts()
+        for event in self.collector.events:
+            key = event["artifact_key"]
+            if event.get("profile_source") != str(self.spec["source"]) or key not in self.artifact_status:
+                continue
+            if event["acquisition_state"] not in {"copied", "not_found"} and self.artifact_status[key] == "artifact_not_found":
+                self.artifact_status[key] = "locked_database" if event["acquisition_state"] == "locked" else "parse_error"
+                self._discovery_errors[key] = "Filesystem acquisition incomplete: " + event["acquisition_state"]
+        return self.artifacts.copy()
+
+    def resolve_download_path(self, target_path, current_path=None):
+        return self.collector.resolve_download(self.spec, target_path, current_path)
+
+    def _read_zone(self, path):
+        return self.collector.zone(path)
+
+    def _file_metadata(self, path):
+        return self.collector.manifest[str(path)]["metadata"]
+
+
+class GeminiFilesystemParser(GeminiParser):
+    """Internal directory API. The existing CLI remains unchanged.
+
+    parse() owns acquisition and cleanup. Inherited export methods operate on
+    original-path results after the private staging directory has been removed.
+    """
+
+    def __init__(self, source_path, *, evidence_root=None, temp_root=None, copy_attempts=2, **options):
+        super().__init__(source_path, image_mode=False, evidence_root=evidence_root, **options)
+        self.filesystem_temp_root = temp_root
+        self.copy_attempts = copy_attempts
+        self.profile_summaries = []
+        self.acquisition_manifest = {}
+
+    def parse(self):
+        self.results, self._downloads, self.profile_summaries = [], [], []
+        self._source_files = set()
+        self.artifacts = {}
+        self.acquisition_manifest = {}
+        collector = LiveArtifactCollector(self.profile_path, evidence_root=self.evidence_root,
+                                          temp_root=self.filesystem_temp_root, copy_attempts=self.copy_attempts)
+        try:
+            with collector:
+                self.artifacts["recycle_bin"] = ([str(collector.evidence_root / "$Recycle.Bin")]
+                                                  if collector.evidence_root else [])
+                for spec in collector.profiles:
+                    start = len(collector.events)
+                    try:
+                        collector.collect_profile(spec)
+                        parser = FilesystemProfileParser(collector, spec, **self._artifact_options())
+                        self.results.extend(parser.parse())
+                        self._downloads.extend(parser._downloads)
+                        self._source_files.update(str(Path(r["source_path"]).absolute()).casefold()
+                                                  for r in parser.results if r.get("source_path"))
+                        failures = any(e["acquisition_state"] not in {"copied", "not_found"} for e in collector.events[start:])
+                        row = self._emit("Filesystem Acquisition", "Chrome profile examined from private staging",
+                            path=spec["source"], status="partial" if failures else "success", level="unconfirmed",
+                            detail={"record_type": "profile_status", **spec["context"],
+                                    "artifact_status": parser.artifact_status, "acquisition_incomplete": failures})
+                    except Exception:
+                        row = self._emit("Filesystem Acquisition", "Profile acquisition or analysis failed; other profiles continue",
+                            path=spec["source"], status="partial", level="unconfirmed",
+                            error="Filesystem profile could not be fully analyzed",
+                            detail={"record_type": "profile_status", **spec["context"], "acquisition_incomplete": True})
+                    self.profile_summaries.append(row)
+                # Parse $I metadata once, after all History downloads are known.
+                # Reuse the original recycle parser and semantic rules unchanged.
+                collector.collect_recycle()
+                recycle_spec = {"source": collector.evidence_root or collector.source,
+                                "staged": collector.volume, "user": None,
+                                "context": {"acquisition_mode": "filesystem", "source_snapshot": "non_atomic_filesystem_copy",
+                                            "staged_copy": True, "windows_user": None, "chrome_profile": None}}
+                recycle = FilesystemProfileParser(collector, recycle_spec, **self._artifact_options())
+                root = collector.volume / "$Recycle.Bin"
+                recycle.artifacts = {"recycle_bin": [str(root)] if root.is_dir() else []}
+                recycle._expected = {"recycle_bin": root}
+                recycle._downloads = self._downloads
+                if collector.evidence_root:
+                    recycle._parse_recycle_bin("recycle_bin")
+                    recycle._derive_semantic_actions()
+                    self.results.extend(recycle.results)
+                self.acquisition_manifest = {m["source"]: {k: v for k, v in m.items() if k != "source"}
+                                             for m in collector.manifest.values()}
+                self._source_files.update(str(Path(p).absolute()).casefold() for p in self.acquisition_manifest)
+        except (OSError, ValueError):
+            self._emit("Filesystem Acquisition", "Filesystem acquisition could not be completed",
+                       path=self.profile_path, status="partial", level="unconfirmed",
+                       detail={"record_type": "acquisition_status", "acquisition_state": "copy_error"})
+        finally:
+            for event in collector.events:
+                state = event["acquisition_state"]
+                status = {"copied": "success", "not_found": "artifact_not_found", "locked": "locked_database"}.get(state, "partial")
+                self._emit(self.ARTIFACTS.get(event["artifact_key"], "Filesystem Acquisition"),
+                           "Filesystem acquisition status", path=event["source_path"], status=status, level="unconfirmed",
+                           detail={**event, "acquisition_mode": "filesystem", "atomic_snapshot": False})
+            self._emit("Filesystem Acquisition", "Filesystem acquisition is not an atomic snapshot",
+                       path=self.profile_path, level="unconfirmed", status="partial",
+                       detail={"record_type": "acquisition_summary", "acquisition_mode": "filesystem",
+                               "atomic_snapshot": False, "profiles_discovered": len(collector.profiles),
+                               "profiles_examined": len(self.profile_summaries),
+                               "staged_file_count": len(self.acquisition_manifest),
+                               "limitation": "Stable size/mtime checks do not prove an atomic live snapshot; locked or unstable files may be absent from this analysis."})
         return self.results
 
 
@@ -8094,6 +8942,14 @@ def _apply_interactive_image_input(args):
     return args
 
 
+def analyze_filesystem(source_path, **options):
+    """Parse a directory through private filesystem acquisition and validate output."""
+    parser = GeminiFilesystemParser(source_path, **options)
+    parser.parse()
+    parser.validate_team_contract()
+    return parser
+
+
 def analyze_image(image_path, **options):
     """Integration-friendly API: parse one DD/RAW/split-RAW/E01 image and validate final output contract.
 
@@ -8121,12 +8977,13 @@ def analyze_image_with_baseline(image_path, baseline_image_path, **options):
 
 
 def main(argv=None):
-    cli = argparse.ArgumentParser(description="Gemini Web forensic image parser: RAW/DD/split-RAW via pytsk3; E01 via pyewf + pytsk3")
+    cli = argparse.ArgumentParser(description="Gemini Web forensic parser: image input or --folder filesystem acquisition; RAW/DD/split-RAW via pytsk3; E01 via pyewf + pytsk3; BitLocker clear key via dissect.fve + dissect.ntfs")
     cli.add_argument("image", nargs="?", help="Primary input: .dd / .img / .raw / first .001 split-RAW segment / first .E01 segment")
+    cli.add_argument("--folder", help="Filesystem acquisition input: Chrome User Data (recommended), profile, Windows user, Users or volume root")
     cli.add_argument("--profile", help="Development/debug input: extracted Chrome Profile directory")
     cli.add_argument("--baseline-image", help="Optional BEFORE image for state-difference rules (conversation/history/cache deletion/edit)")
-    cli.add_argument("--user-root", help="Acquired user directory (also accepts a Users/drive evidence tree)")
-    cli.add_argument("--evidence-root", help="Optional acquired volume root for drive-path mapping and $Recycle.Bin")
+    cli.add_argument("--user-root", help="Acquired user directory; --profile development/debug mode only")
+    cli.add_argument("--evidence-root", help="Optional acquired volume root for drive-path mapping and $Recycle.Bin; --profile or --folder mode")
     cli.add_argument("--output", help=r"Result directory. Interactive example: C:\Users\me\Desktop\gemini_parser\result")
     cli.add_argument("--csv", action="store_true", help="Also export team-format timeline.csv and recovered_conversations.csv")
     cli.add_argument("--debug-output", action="store_true",
@@ -8136,12 +8993,22 @@ def main(argv=None):
     cli.add_argument("--max-matches-per-file", type=positive_int, default=200, help="String/image finding cap per file (default: 200 each)")
     cli.add_argument("--max-files", type=nonnegative_int, default=0, help="File cap per binary artifact tree; 0 is unlimited")
     cli.add_argument("--max-json-mib", type=positive_int, default=64, help="Preferences input size cap (default: 64 MiB)")
-    cli.add_argument("--temp-root", help="Parent directory for private image extraction workspaces")
-    cli.add_argument("--keep-temp", action="store_true", help="Retain extracted files for debugging (default: clean up)")
-    cli.add_argument("--max-extracted-mib", type=nonnegative_int, default=0,
-                     help="Extraction byte limit per profile; 0 is unlimited. Incomplete extraction is reported.")
+    cli.add_argument("--temp-root", help="Parent directory for private image or filesystem staging; for --folder it must already exist")
+    cli.add_argument("--keep-temp", action="store_true", help="Image only: retain extracted files for debugging (default: clean up)")
+    cli.add_argument("--max-extracted-mib", type=nonnegative_int, default=None,
+                     help="Image only: extraction byte limit per profile; default/0 is unlimited. Incomplete extraction is reported.")
     args = cli.parse_args(argv)
-    if not args.image and not args.profile:
+    if sum(value is not None for value in (args.image, args.folder, args.profile)) > 1:
+        cli.error("provide one image path OR --folder OR --profile")
+    if args.folder is not None:
+        if not args.folder.strip():
+            cli.error("--folder requires a non-empty directory path")
+        if (args.baseline_image is not None
+                or args.keep_temp or args.max_extracted_mib is not None):
+            cli.error("--baseline-image, --keep-temp and --max-extracted-mib are image-only options; not supported with --folder")
+    if args.user_root is not None and args.profile is None:
+        cli.error("--user-root applies only to --profile mode")
+    if args.image is None and args.folder is None and args.profile is None:
         try:
             args = _apply_interactive_image_input(args)
         except (EOFError, KeyboardInterrupt):
@@ -8149,25 +9016,29 @@ def main(argv=None):
             return 130
     if args.debug_output:
         args.csv = True
-    if args.image and args.profile:
-        cli.error("provide one image path OR --profile")
     if args.baseline_image and not args.image:
         cli.error("--baseline-image is supported only with an image input")
     if args.image and (args.user_root or args.evidence_root):
-        cli.error("--user-root and --evidence-root apply only to --profile mode")
+        cli.error("--user-root applies only to --profile; --evidence-root applies to --profile or --folder")
     options = dict(correlation_seconds=args.correlation_seconds,
                    max_binary_bytes=args.max_binary_mib * 1024 * 1024,
                    max_matches_per_file=args.max_matches_per_file, max_files=args.max_files,
                    max_json_bytes=args.max_json_mib * 1024 * 1024, verbose=True)
-    parser = (GeminiImageParser(args.image, temp_root=args.temp_root, keep_temp=args.keep_temp,
-                               max_extracted_bytes=args.max_extracted_mib * 1024 * 1024, **options)
-              if args.image else GeminiParser(args.profile, args.user_root, evidence_root=args.evidence_root,
-                                              image_mode=False, **options))
+    if args.image:
+        parser = GeminiImageParser(args.image, temp_root=args.temp_root, keep_temp=args.keep_temp,
+                                   max_extracted_bytes=(args.max_extracted_mib or 0) * 1024 * 1024, **options)
+    elif args.folder is not None:
+        parser = GeminiFilesystemParser(args.folder, evidence_root=args.evidence_root,
+                                        temp_root=args.temp_root, **options)
+    else:
+        parser = GeminiParser(args.profile, args.user_root, evidence_root=args.evidence_root,
+                              image_mode=False, **options)
     try:
         if args.image:
             ForensicImageReader(args.image).identify()
         elif not parser.profile_path.is_dir():
-            print("Error: Chrome Profile directory does not exist or is not a directory: " + str(parser.profile_path), file=sys.stderr)
+            label = "Filesystem source" if args.folder is not None else "Chrome Profile"
+            print("Error: " + label + " directory does not exist or is not a directory: " + str(parser.profile_path), file=sys.stderr)
             return 2
         for label, root in (("user-root", parser.user_root), ("evidence-root", parser.evidence_root)):
             if root is not None and not root.is_dir():
@@ -8176,8 +9047,9 @@ def main(argv=None):
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
         output = Path(args.output).expanduser().absolute() if args.output else Path.cwd() / ("gemini_output_" + stamp)
         # Fail early for unsafe or existing export destinations.
-        if args.profile and within(output, parser.profile_path):
-            raise ValueError("Output must be outside the evidence Chrome Profile")
+        if (args.profile or args.folder is not None) and within(output, parser.profile_path):
+            raise ValueError("Output must be outside the evidence filesystem source" if args.folder is not None
+                             else "Output must be outside the evidence Chrome Profile")
         planned = ["gemini_results.json"]
         if args.csv:
             planned += ["timeline.csv", "recovered_conversations.csv"]
@@ -8188,13 +9060,13 @@ def main(argv=None):
                 raise FileExistsError("Output already exists; choose a new --output directory: " + str(output / filename))
         print("========================================\nGemini Web Forensic Parser\n========================================")
         print(f"Parser version: {PARSER_VERSION} | Output contract: {OUTPUT_CONTRACT_VERSION}")
-        print(("Image:\n" if args.image else "Profile:\n") + str(parser.profile_path) + "\n", flush=True)
+        print(("Image:\n" if args.image else "Folder:\n" if args.folder is not None else "Profile:\n") + str(parser.profile_path) + "\n", flush=True)
         if args.baseline_image:
             print("Baseline image:\n" + str(Path(args.baseline_image).expanduser().absolute()) + "\n", flush=True)
         results = parser.parse()
         if args.baseline_image:
             baseline = GeminiImageParser(args.baseline_image, temp_root=args.temp_root, keep_temp=args.keep_temp,
-                                         max_extracted_bytes=args.max_extracted_mib * 1024 * 1024, **options)
+                                         max_extracted_bytes=(args.max_extracted_mib or 0) * 1024 * 1024, **options)
             baseline.parse()
             parser.compare_with_baseline(baseline.results)
             results = parser.results
@@ -8251,6 +9123,12 @@ def main(argv=None):
             outcomes = Counter(r["detail"]["profile_outcome"] for r in parser.profile_summaries)
             print("Profiles:", dict(outcomes))
             if any(r["detail"].get("reason") == "image_open_failed" for r in results):
+                return 2
+            examined = results + (baseline.results if args.baseline_image else [])
+            if any(r["detail"].get("bitlocker_status") in {
+                    "BITLOCKER_LOCKED", "BITLOCKER_UNSUPPORTED",
+                    "BITLOCKER_OPEN_ERROR"} for r in examined):
+                print("BitLocker: one or more partitions could not be unlocked; see partition_status in JSON.", file=sys.stderr)
                 return 2
         # Partial/unsupported raw formats are expected non-fatal analysis outcomes.
         return 0
