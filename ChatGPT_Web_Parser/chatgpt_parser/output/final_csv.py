@@ -58,6 +58,8 @@ CSV_USER_BEHAVIOR_LABELS = {
     "CONVERSATION_DELETE": "기존 대화 삭제",  # 팀 분류 체계의 이름 (Rule 이 보는 것은 개별 대화 1건의 삭제다)
     "PROMPT_DRAFT": "사용자 프롬프트 입력/전송",  # 팀 행위 분류 체계: 초안은 별도 행위가 아니라 전송 미확인(의심) 으로 표기 (2026-09-23)
     "PROMPT_SEND": "사용자 프롬프트 입력/전송",
+    # FILE_UPLOAD 는 csv_final_upload_behavior() 가 첨부 MIME 으로 문서/이미지를 가릴 때만 최종 행위가 된다.
+    # 아래 값은 종류를 가리지 못한 업로드의 내부 표기이며 최종 CSV 에는 쓰지 않는다 (FILE_DOWNLOAD 와 같다).
     "FILE_UPLOAD": "파일 업로드",
     "FILE_UPLOAD_DELETE": "업로드한 파일 삭제",
     # FILE_DOWNLOAD 는 csv_final_download_behavior() 가 evidence 로 문서/생성 이미지를 가릴 때만
@@ -95,7 +97,9 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
 #   CONVERSATION_ACCESS            대화 열람 — 회의에서 개별 삭제 확정 ("무려 29개나, 얘도 그냥 지우는 걸로")
 #   PROFILE_ACCESS                 프로필 화면 접근 — 분석표에 없는 파서 고유 행위
 #   CONVERSATION_REMOVED_FROM_LIST 대화 목록에서 사라짐 — 기존 대화 삭제 판정의 보조 근거로만 남긴다
-#   FILE_UPLOAD / FILE_UPLOAD_DELETE  분석표는 종류별(이미지/문서)로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
+#   FILE_UPLOAD                    파일 업로드 — 첨부 MIME 으로 문서/이미지 업로드를 가려 낸다
+#                                  (csv_final_upload_behavior). 상위 이름 자체는 분석표에 없어 여기 남는다.
+#   FILE_UPLOAD_DELETE             업로드한 파일 삭제 — 분석표는 종류별로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
 # label 이 아예 없는 action 은 이 집합에 들어오지 않지만 최종 timeline 에서 빠지는 결과는 같다
 # (csv_final_user_behavior() 가 팀 목록 대조 하나로 판단한다). 내부 action 코드를 User_behavior 로
 # 내보내는 fallback 은 두지 않는다 — 팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다 (2026-10-01 확정).
@@ -159,15 +163,52 @@ def csv_final_download_behavior(event: Event) -> str | None:
     return None
 
 
+# --- 업로드: 종류가 evidence 로 확인될 때만 최종 행위로 올린다 (다운로드와 같은 설계) ---
+# 분석표는 업로드를 종류별(이미지 업로드 / 문서 업로드)로 쓰는데 Rule 은 상위 이름 FILE_UPLOAD 하나만 낸다.
+# 첨부 MIME 은 Cache 대화 응답의 user 메시지에 이미 들어 있어 (Reader 가 읽어 둔 observed["mime_type"]),
+# 그 값만으로 종류를 가린다. 탐지 Rule·Evidence 는 건드리지 않는다 — 최종 표기만 정한다.
+# MIME 으로 가려지지 않으면 None (최종 행 없음). 확장자·파일명으로 추측해 올리지 않는다.
+CSV_UPLOAD_DOCUMENT = "문서 업로드"
+CSV_UPLOAD_IMAGE = "이미지 업로드"
+
+
+def _upload_observed(event: Event) -> dict[str, Any]:
+    """업로드 Event 의 관찰값 (Reader 가 Cache user 메시지 첨부에서 읽은 그대로)."""
+    for item in list(event.primary_evidence) + list(event.supporting_evidence):
+        observed = item.observed if isinstance(item.observed, dict) else {}
+        if observed.get("mime_type"):
+            return observed
+    return {}
+
+
+def csv_final_upload_behavior(event: Event) -> str | None:
+    """FILE_UPLOAD 의 최종 User_behavior. 종류를 확인하지 못하면 None (최종 행 없음).
+
+    - 문서: 첨부 MIME 이 문서 형식 (다운로드 쪽과 같은 CSV_DOCUMENT_MIME_PREFIXES 목록)
+    - 이미지: 첨부 MIME 이 image/*
+    그 밖의 MIME(예: text/x-python)·MIME 없음 은 올리지 않는다 — FILE_UPLOAD Event·Evidence 로 그대로 남는다.
+    """
+    mime = str(_upload_observed(event).get("mime_type") or "").lower()
+    if any(mime.startswith(prefix) for prefix in CSV_DOCUMENT_MIME_PREFIXES):
+        return CSV_UPLOAD_DOCUMENT
+    if mime.startswith("image/"):
+        return CSV_UPLOAD_IMAGE
+    return None
+
+
 def csv_final_user_behavior(action: str, event: Event | None = None) -> str | None:
     """최종 timeline.csv 의 User_behavior. 팀 목록에 없는 action(라벨이 없는 경우까지) 은 None.
 
     None 은 "이 Event 로 최종 timeline 행을 만들지 않는다" 는 뜻이다. 탐지를 멈추거나 근거를 지우는 것이
     아니라서 Event·Evidence·Coverage 는 events.csv / result.json 에 그대로 남는다.
     FILE_DOWNLOAD 는 종류가 evidence 로 확인될 때만 문서/생성 이미지 다운로드로 나간다.
+    FILE_UPLOAD 도 같게 — 첨부 MIME 으로 문서/이미지 업로드를 가릴 때만 나간다.
     """
     if action == "FILE_DOWNLOAD":
         label = csv_final_download_behavior(event) if event is not None else None
+        return label if label in CSV_TEAM_USER_BEHAVIORS else None
+    if action == "FILE_UPLOAD":
+        label = csv_final_upload_behavior(event) if event is not None else None
         return label if label in CSV_TEAM_USER_BEHAVIORS else None
     label = CSV_USER_BEHAVIOR_LABELS.get(action)
     return label if label in CSV_TEAM_USER_BEHAVIORS else None

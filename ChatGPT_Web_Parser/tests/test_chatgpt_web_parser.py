@@ -6704,6 +6704,80 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
             self._download_behaviors([self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
             ["생성 이미지 다운로드"])
 
+    # --- FILE_UPLOAD 최종 분류 (첨부 MIME 으로 문서/이미지 업로드를 가린다) ---
+    @staticmethod
+    def _upload_event(event_id, observed):
+        """Cache user 메시지 첨부 관찰값을 가진 FILE_UPLOAD Event."""
+        return make_event(event_id=event_id, action="FILE_UPLOAD",
+                          primary_evidence=[make_evidence(observed=observed)], supporting_evidence=[])
+
+    def _upload_behaviors(self, events):
+        result = make_result()
+        result.events = list(events)
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    PDF_UPLOAD_OBSERVED = {"file_name": "에레렘_LLMHub_장애로그_20261001.pdf", "mime_type": "application/pdf",
+                           "conversation_id": "conv-0001"}
+    PNG_UPLOAD_OBSERVED = {"file_name": "MRK_ELELEM_LLMHUB_DASHBOARD.png", "mime_type": "image/png",
+                           "conversation_id": "conv-0001"}
+    JPEG_UPLOAD_OBSERVED = {"file_name": "whs_upload_photo_001.jpg", "mime_type": "image/jpeg",
+                            "conversation_id": "conv-0001"}
+    UNKNOWN_UPLOAD_OBSERVED = {"file_name": "whs_upload_unknown_001.bin",
+                               "mime_type": "application/octet-stream", "conversation_id": "conv-0001"}
+
+    def test_pdf_upload_is_promoted_to_document_upload(self):
+        """CASE 1 — application/pdf 첨부 → 팀 공식 이름 '문서 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED)]),
+                         ["문서 업로드"])
+
+    def test_png_upload_is_promoted_to_image_upload(self):
+        """CASE 2 — image/png 첨부 → '이미지 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_jpeg_upload_is_promoted_to_image_upload(self):
+        """CASE 3 — image/* 대분류로 가린다 (image/jpeg)."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:jpeg", self.JPEG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_unknown_upload_mime_is_not_forced_into_a_category(self):
+        """CASE 4 — 근거 없는 MIME 은 문서/이미지로 만들지 않는다. MIME 이 아예 없는 경우도 같다."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                                 self._upload_event("event:nomime", {})]), [])
+        self.assertIsNone(_final_csv.csv_final_user_behavior("FILE_UPLOAD"))  # event 없이 호출해도 승격 없음
+
+    def test_upload_classification_does_not_change_download_classification(self):
+        """CASE 5 — 기존 FILE_DOWNLOAD 분류 결과가 그대로다 (문서만 승격, 코드·blob 이미지는 제외)."""
+        self.assertEqual(
+            self._download_behaviors([self._download_event("event:doc", self.DOC_OBSERVED),
+                                      self._download_event("event:code", self.CODE_OBSERVED),
+                                      self._download_event("event:png", self.BLOB_PNG_OBSERVED),
+                                      self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
+            ["문서 다운로드", "생성 이미지 다운로드"])
+
+    def test_upload_rows_keep_the_timeline_header_and_one_row_per_file(self):
+        """CASE 6 — timeline.csv 열 구조·형식은 그대로이고, 파일 1개 = 행 1개 granularity 를 유지한다."""
+        result = make_result()
+        result.events = [self._upload_event("event:pdf-1", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:pdf-2", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        self.assertEqual(header, list(p.CSV_TIMELINE_COLUMNS))
+        self.assertEqual([dict(zip(header, row))["User_behavior"] for row in rows],
+                         ["문서 업로드", "문서 업로드", "이미지 업로드"])
+        self.assertEqual([dict(zip(header, row))["Model"] for row in rows], ["chatgpt-web"] * 3)
+
+    def test_generic_file_upload_never_reaches_the_final_timeline(self):
+        """어떤 조합에서도 최종 timeline 에 '파일 업로드' 는 나오지 않는다."""
+        behaviors = self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED),
+                                            self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                            self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)])
+        self.assertNotIn("파일 업로드", behaviors)
+        self.assertEqual(behaviors, ["문서 업로드", "이미지 업로드"])
+
     def test_generic_file_download_never_reaches_the_final_timeline(self):
         """어떤 조합에서도 최종 timeline 에 '파일 다운로드' 는 나오지 않는다 (2026-10-05 팀 결정)."""
         events = [self._download_event("event:doc", self.DOC_OBSERVED),
