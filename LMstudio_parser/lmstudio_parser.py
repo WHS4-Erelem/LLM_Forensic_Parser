@@ -1502,6 +1502,20 @@ class BitLockerCredential:
 
     kind: str
     value: str | bytes | Path = field(repr=False)
+    reader: Callable[[], BitLockerCredential | None] | None = field(default=None, repr=False)
+
+    def resolve(self) -> BitLockerCredential:
+        """Read an explicit credential once, only if Clear Key did not unlock."""
+        if self.reader is not None:
+            reader, self.reader = self.reader, None
+            resolved = reader()
+            if resolved is None:
+                raise ValueError("authorized credential unavailable")
+            self.kind, self.value = resolved.kind, resolved.value
+        if self.kind == "deferred":
+            # A failed/cancelled prompt must not be repeated for every partition.
+            raise ValueError("authorized credential unavailable")
+        return self
 
 
 @contextmanager
@@ -1549,17 +1563,24 @@ def open_volume_stream(ctx: AnalysisContext, volume: BinaryIO, location: str,
             ctx.issue("bitlocker_metadata_failed", location, "BitLocker detected; encryption metadata를 열지 못함; 해당 partition 건너뜀")
             return None, True
         if credential is None and not has_clear_key:
-            ctx.issue("bitlocker_credential_missing", location, "BitLocker encrypted volume detected. Authorized recovery material was not provided. Skipping this partition.")
+            ctx.issue("bitlocker_credential_missing", location, "BitLocker detected; Clear Key protector unavailable; no authorized credential provided; 해당 partition 건너뜀")
             return None, True
         unlocked = False
+        unlock_kind = ""
         if has_clear_key:
             try:
                 bde.unlock_with_clear_key()
                 unlocked = True
+                unlock_kind = "clear_key"
             except Exception:
                 # A real but unusable clear protector may coexist with a user protector.
-                pass
+                ctx.issue("bitlocker_clear_key_unlock_failed", location, "Clear Key protector detected; Clear Key unlock failed; explicit authorized credential이 있을 때만 fallback 시도")
         if not unlocked and credential is not None:
+            try:
+                credential = credential.resolve()
+            except (Exception, KeyboardInterrupt):
+                ctx.issue("bitlocker_credential_read_failed", location, "명시적으로 요청한 BitLocker credential을 안전하게 읽지 못함; 값은 기록하지 않으며 해당 partition 건너뜀")
+                return None, True
             try:
                 if credential.kind == "recovery":
                     bde.unlock_with_recovery_password(credential.value)
@@ -1573,6 +1594,7 @@ def open_volume_stream(ctx: AnalysisContext, volume: BinaryIO, location: str,
                 else:
                     raise ValueError("unsupported credential type")
                 unlocked = True
+                unlock_kind = credential.kind
             except Exception:
                 pass
         if not unlocked:
@@ -1584,7 +1606,7 @@ def open_volume_stream(ctx: AnalysisContext, volume: BinaryIO, location: str,
             decrypted.seek(0)
             header = decrypted.read(512)
             decrypted.seek(0)
-            if credential is not None and credential.kind == "fvek" and header[3:11] != b"NTFS    ":
+            if unlock_kind == "fvek" and header[3:11] != b"NTFS    ":
                 # Raw FVEK has no authentication: successful API return is insufficient.
                 ctx.issue("bitlocker_unlock_failed", location, "Raw FVEK stream의 NTFS header 검증 실패; 잘못된 key/손상/비지원 filesystem 가능; 해당 partition 건너뜀")
                 decrypted.close()
@@ -1594,7 +1616,9 @@ def open_volume_stream(ctx: AnalysisContext, volume: BinaryIO, location: str,
                 decrypted.close()
             ctx.issue("bitlocker_stream_error", location, "BitLocker 해제 후 decrypted stream 읽기 실패; 해당 partition 건너뜀")
             return None, True
-        ctx.issue("bitlocker_unlocked", location, "BitLocker volume read-only unlock 성공; 기존 NTFS 분석 경로 사용")
+        ctx.issue("bitlocker_unlocked", location,
+                  "Clear Key protector detected; Clear Key unlock succeeded; 기존 NTFS 분석 경로 사용"
+                  if unlock_kind == "clear_key" else "BitLocker volume read-only unlock 성공; 기존 NTFS 분석 경로 사용")
         return decrypted, True
 
 
@@ -3886,7 +3910,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def read_bitlocker_credential(args: argparse.Namespace) -> BitLockerCredential | None:
+def read_bitlocker_credential(args: argparse.Namespace, *, defer: bool = False) -> BitLockerCredential | None:
+    if defer and (args.bitlocker_recovery_prompt or args.bitlocker_passphrase_prompt
+                  or args.bitlocker_bek is not None or args.bitlocker_fvek is not None):
+        return BitLockerCredential("deferred", "", reader=lambda: read_bitlocker_credential(args))
     if args.bitlocker_recovery_prompt or args.bitlocker_passphrase_prompt:
         kind = "recovery" if args.bitlocker_recovery_prompt else "passphrase"
         # getpass can fall back to echoed stdin. Reject that fallback explicitly.
@@ -3952,7 +3979,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     before = image_stat(input_path)
     before_snapshot_stat = image_stat(args.before.resolve()) if args.before is not None else None
     try:
-        credential = read_bitlocker_credential(args)
+        credential = read_bitlocker_credential(args, defer=True)
     except (OSError, ValueError, EOFError, KeyboardInterrupt, getpass.GetPassWarning):
         print("오류: BitLocker credential을 안전하게 읽지 못했습니다. 값은 기록하지 않습니다.", file=sys.stderr)
         return 2
@@ -6133,6 +6160,405 @@ class BitLockerAccessTests(unittest.TestCase):
         constructor.assert_called_once_with(normal)
         current.assert_called_once()
         self.assertFalse(any(i.fatal for i in ctx.issues))
+
+
+class BitLockerClearKeyRegressionTests(unittest.TestCase):
+    # Reuse fixtures, without inheriting and counting the original 28 tests again.
+    setUp = BitLockerAccessTests.setUp
+    open = BitLockerAccessTests.open
+    collect = BitLockerAccessTests.collect
+
+    ENV_KEYS = (
+        "BITLOCKER_RECOVERY_KEY", "BITLOCKER_RECOVERY_PASSWORD",
+        "LMSTUDIO_BITLOCKER_RECOVERY_KEY", "BITLOCKER_PASSPHRASE",
+        "BITLOCKER_BEK", "BITLOCKER_FVEK",
+    )
+
+    def deferred(self, *options):
+        args = parser.build_argument_parser().parse_args(list(options))
+        return parser.read_bitlocker_credential(args, defer=True)
+
+    def add_conversation(self, ctx, ntfs, index):
+        content = json.dumps(conversation(message(), message("assistant"))).encode("utf-8")
+        record = SimpleNamespace(
+            is_dir=lambda: False, size=lambda: len(content), open=lambda: io.BytesIO(content),
+            has_stream=lambda name: False, segment=42, header=SimpleNamespace(SequenceNumber=1),
+        )
+        parser.add_ntfs_file(ctx, record,
+                            rf"volume{index}:\Users\TEST\.lmstudio\conversations\TEST.conversation.json", index)
+
+    def test_clear_key_without_any_credential_never_prompts(self):
+        self.bde.has_clear_key.return_value = True
+        with patch.object(getpass, "getpass") as prompt:
+            stream, encrypted = self.open()
+        self.assertIs(self.plain, stream)
+        self.assertTrue(encrypted)
+        self.bde.has_clear_key.assert_called_once_with()
+        self.bde.unlock_with_clear_key.assert_called_once_with()
+        prompt.assert_not_called()
+        self.assertIn("Clear Key unlock succeeded", self.ctx.issues[-1].limitation)
+
+    def test_clear_key_stream_uses_real_read_only_bitlocker_stream(self):
+        from dissect.fve.bde.bde import BDE, BitlockerStream
+        from dissect.fve.bde.c_bde import CIPHER_MAP, FVE_KEY_TYPE
+        from dissect.fve.crypto import create_cipher
+        key = bytes(range(16))
+        plaintext = b"\xeb\x52\x90NTFS    " + bytes(1013)
+        key_type = FVE_KEY_TYPE.AES_128
+        ciphertext = create_cipher(CIPHER_MAP[key_type], key, sector_size=512).encrypt(plaintext)
+        volume = SimpleNamespace(
+            fh=io.BytesIO(ciphertext), sector_size=512, encrypted=True,
+            _fvek_type=key_type, _fvek=key, version=2, unlocked=True,
+            eow_information=None, reserved_regions=lambda: [],
+            information=SimpleNamespace(virtualized_block_offset=0, virtualized_sectors=0, state_offset=0),
+        )
+        self.bde.has_clear_key.return_value = True
+        self.bde.open.side_effect = lambda: BDE.open(volume)
+        stream, _ = self.open()
+        self.addCleanup(stream.close)
+        self.assertIsInstance(stream, BitlockerStream)
+        self.assertTrue(stream.readable())
+        self.assertFalse(stream.writable())
+        self.assertEqual(plaintext, stream.read())
+        with self.assertRaises(NotImplementedError):
+            stream.write(b"forbidden")
+        self.assertEqual(ciphertext, volume.fh.getvalue())
+
+    def test_clear_key_stream_reconstructs_conversation_through_existing_ntfs(self):
+        self.bde.has_clear_key.return_value = True
+        with patch("dissect.volume.disk.Disk", side_effect=ValueError("volume image")), \
+                patch("dissect.ntfs.NTFS", side_effect=lambda stream: SimpleNamespace(fh=stream)) as constructor, \
+                patch.object(parser, "collect_ntfs_current", side_effect=self.add_conversation), \
+                patch.object(parser, "collect_ntfs_usn") as usn:
+            ctx = parser.analyze(self.image)
+        constructor.assert_called_once_with(self.plain)
+        usn.assert_called_once()
+        self.assertEqual(2, len(ctx.messages))
+        self.assertTrue(ctx.candidates)
+        self.assertTrue(self.plain.closed)
+        self.assertFalse(any(issue.fatal for issue in ctx.issues))
+
+    def test_locked_partition_keeps_both_neighboring_ntfs_partitions(self):
+        normals = [io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501)) for _ in range(2)]
+        volumes = [normals[0], io.BytesIO(bytes(512)), normals[1]]
+        partitions = [SimpleNamespace(offset=index * 512, open=lambda stream=stream: stream)
+                      for index, stream in enumerate(volumes)]
+        self.detect.side_effect = [False, True, False]
+        ctx, constructor, current, usn = self.collect(partitions=partitions)
+        self.assertEqual(2, constructor.call_count)
+        self.assertEqual(2, current.call_count)
+        self.assertEqual(2, usn.call_count)
+        issue = next(issue for issue in ctx.issues if issue.code == "bitlocker_credential_missing")
+        self.assertIn("Clear Key protector unavailable", issue.limitation)
+        self.assertIn("no authorized credential provided", issue.limitation)
+        self.bde.unlock_with_clear_key.assert_not_called()
+        self.bde.open.assert_not_called()
+        self.assertFalse(any(issue.fatal for issue in ctx.issues))
+
+    def test_explicit_recovery_is_prompted_only_after_clear_key_check(self):
+        events = []
+        self.bde.has_clear_key.side_effect = lambda: events.append("clear_key_check") or False
+        with patch.object(getpass, "getpass", side_effect=lambda _: events.append("prompt") or "SYNTHETIC_RECOVERY"):
+            credential = self.deferred("--bitlocker-recovery-prompt")
+            self.assertEqual([], events)
+            stream, _ = self.open(credential)
+        self.assertEqual(["clear_key_check", "prompt"], events)
+        self.assertIs(self.plain, stream)
+        self.bde.unlock_with_recovery_password.assert_called_once_with("SYNTHETIC_RECOVERY")
+
+    def test_explicit_passphrase_is_deferred_until_fallback(self):
+        with patch.object(getpass, "getpass", return_value="SYNTHETIC_PASSPHRASE") as prompt:
+            credential = self.deferred("--bitlocker-passphrase-prompt")
+            prompt.assert_not_called()
+            stream, _ = self.open(credential)
+        self.assertIs(self.plain, stream)
+        prompt.assert_called_once()
+        self.bde.unlock_with_passphrase.assert_called_once_with("SYNTHETIC_PASSPHRASE")
+
+    def test_explicit_bek_fallback_remains_read_only(self):
+        bek = self.root / "authorized.bek"
+        bek.write_bytes(b"SYNTHETIC_BEK")
+        before = (bek.read_bytes(), bek.stat().st_mtime_ns)
+        stream, _ = self.open(self.deferred("--bitlocker-bek", str(bek)))
+        self.assertIs(self.plain, stream)
+        handle = self.bde.unlock_with_bek.call_args.args[0]
+        self.assertEqual("rb", handle.mode)
+        self.assertTrue(handle.closed)
+        self.assertEqual(before, (bek.read_bytes(), bek.stat().st_mtime_ns))
+
+    def test_explicit_fvek_fallback_reads_raw_key_once(self):
+        fvek = self.root / "authorized.fvek"
+        key = bytes(range(32))
+        fvek.write_bytes(key)
+        before = (fvek.read_bytes(), fvek.stat().st_mtime_ns)
+        credential = self.deferred("--bitlocker-fvek", str(fvek))
+        self.assertEqual("deferred", credential.kind)
+        stream, _ = self.open(credential)
+        self.assertIs(self.plain, stream)
+        self.bde.unlock_with_fvek.assert_called_once_with(key)
+        self.assertEqual(before, (fvek.read_bytes(), fvek.stat().st_mtime_ns))
+
+    def test_recovery_like_environment_values_are_not_credentials(self):
+        with patch.dict(os.environ, {key: "SYNTHETIC_ENV_SECRET" for key in self.ENV_KEYS}), \
+                patch.object(getpass, "getpass") as prompt:
+            self.assertIsNone(self.deferred())
+            stream, _ = self.open()
+        self.assertIsNone(stream)
+        prompt.assert_not_called()
+        for method in ("unlock_with_clear_key", "unlock_with_recovery_password", "unlock_with_passphrase",
+                       "unlock_with_bek", "unlock_with_fvek"):
+            getattr(self.bde, method).assert_not_called()
+        self.assertNotIn("SYNTHETIC_ENV_SECRET", repr(self.ctx))
+
+    def test_environment_changes_leave_cli_csv_and_candidates_identical(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        results = []
+        for index, value in enumerate(("SYNTHETIC_ENV_A", "SYNTHETIC_ENV_B")):
+            self.detect.side_effect = [True, False]
+            volumes = [io.BytesIO(bytes(512)), io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))]
+            partitions = [SimpleNamespace(offset=i * 512, open=lambda stream=stream: stream)
+                          for i, stream in enumerate(volumes)]
+            output = self.root / f"env_out{index}"
+            with patch.dict(os.environ, {key: value for key in self.ENV_KEYS}), \
+                    patch("dissect.volume.disk.Disk", return_value=SimpleNamespace(partitions=partitions)), \
+                    patch("dissect.ntfs.NTFS", side_effect=lambda stream: SimpleNamespace(fh=stream)), \
+                    patch.object(parser, "collect_ntfs_current", side_effect=self.add_conversation), \
+                    patch.object(parser, "collect_ntfs_usn"), \
+                    patch.object(getpass, "getpass") as prompt, \
+                    patch.object(parser, "report_analysis", wraps=parser.report_analysis) as report, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(0, parser.main([str(self.image), "--output", str(output)]))
+                ctx = report.call_args.args[0]
+            prompt.assert_not_called()
+            self.assertEqual(2, len(ctx.messages))
+            self.assertTrue(ctx.candidates)
+            results.append((ctx.candidates, ctx.messages, ctx.issues,
+                            [(output / name).read_bytes() for name in
+                             ("timeline.csv", "recovered_conversations.csv")]))
+        self.assertEqual(results[0], results[1])
+
+    def test_clear_key_and_credential_exceptions_never_expose_material(self):
+        clear_secret, recovery_secret = "SYNTHETIC_CLEAR_KEY_SECRET", "SYNTHETIC_RECOVERY_SECRET"
+        logger = logging.getLogger("dissect.fve.bde.bde")
+        logs = io.StringIO()
+        handler = logging.StreamHandler(logs)
+        previous_disabled, previous_level = logger.disabled, logger.level
+        logger.disabled, logger.level = False, logging.DEBUG
+        logger.addHandler(handler)
+        def fail_clear():
+            logger.error(clear_secret)
+            raise ValueError(clear_secret)
+        def fail_recovery(value):
+            logger.error(value)
+            raise ValueError(value)
+        self.bde.has_clear_key.return_value = True
+        self.bde.unlock_with_clear_key.side_effect = fail_clear
+        self.bde.unlock_with_recovery_password.side_effect = fail_recovery
+        try:
+            stream, _ = self.open(parser.BitLockerCredential("recovery", recovery_secret))
+        finally:
+            logger.removeHandler(handler)
+            logger.disabled, logger.level = previous_disabled, previous_level
+        self.assertIsNone(stream)
+        output = self.root / "secret_out"
+        parser.write_outputs(self.ctx, output)
+        diagnostic = io.StringIO()
+        parser.report_analysis(self.ctx, diagnostic)
+        with patch.object(parser, "analyze", return_value=self.ctx):
+            validation = parser.validate_analysis(self.ctx, self.image, output)
+        emitted = logs.getvalue() + diagnostic.getvalue() + json.dumps(validation) + repr(self.ctx)
+        emitted += "".join((output / name).read_text(encoding="utf-8-sig") for name in
+                           ("timeline.csv", "recovered_conversations.csv"))
+        for secret in (clear_secret, recovery_secret):
+            self.assertNotIn(secret, emitted)
+
+    def test_clear_key_failure_skips_partition_without_blocking_next(self):
+        self.bde.has_clear_key.return_value = True
+        self.bde.unlock_with_clear_key.side_effect = ValueError("SYNTHETIC_CLEAR_SECRET")
+        normal = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        partitions = [SimpleNamespace(offset=0, open=lambda: io.BytesIO(bytes(512))),
+                      SimpleNamespace(offset=512, open=lambda: normal)]
+        self.detect.side_effect = [True, False]
+        ctx, constructor, current, _ = self.collect(partitions=partitions)
+        self.assertIn("bitlocker_clear_key_unlock_failed", [issue.code for issue in ctx.issues])
+        self.assertIn("bitlocker_unlock_failed", [issue.code for issue in ctx.issues])
+        constructor.assert_called_once_with(normal)
+        current.assert_called_once()
+        self.assertFalse(any(issue.fatal for issue in ctx.issues))
+        self.assertNotIn("SYNTHETIC_CLEAR_SECRET", repr(ctx))
+
+    def test_non_bitlocker_dd_raw_img_ewf_split_preserve_streams(self):
+        self.detect.return_value = False
+        plaintext = b"\xeb\x52\x90NTFS    " + bytes(501)
+        for suffix in (".dd", ".raw", ".img", ".E01", ".001"):
+            with self.subTest(suffix=suffix):
+                path = self.root / ("normal" + suffix)
+                path.write_bytes(plaintext if suffix != ".001" else plaintext[:100])
+                if suffix == ".001":
+                    path.with_suffix(".002").write_bytes(plaintext[100:])
+                before = parser.image_stat(path)
+                if suffix == ".E01":
+                    outer = io.BytesIO(plaintext)
+                    with patch("dissect.evidence.ewf.find_files", return_value=[str(path)]), \
+                            patch("dissect.evidence.ewf.EWF", return_value=SimpleNamespace(open=lambda: outer)):
+                        ctx, constructor, current, _ = self.collect(path)
+                    constructor.assert_called_once_with(outer)
+                else:
+                    ctx, constructor, current, _ = self.collect(path)
+                    self.assertEqual(1, constructor.call_count)
+                current.assert_called_once()
+                self.assertFalse(any(issue.fatal for issue in ctx.issues))
+                self.assertEqual(before, parser.image_stat(path))
+        self.backend.assert_not_called()
+
+    def test_live_results_ignore_bitlocker_environment_credentials(self):
+        root = self.root / "live"
+        home = root / "Users" / "TEST" / ".lmstudio"
+        path = home / CONV
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(conversation(message(), message("assistant"))), encoding="utf-8")
+        results = []
+        for value in ("SYNTHETIC_ENV_A", "SYNTHETIC_ENV_B"):
+            with patch.dict(os.environ, {key: value for key in self.ENV_KEYS}), \
+                    patch.object(sys, "platform", "win32"), patch.object(getpass, "getpass") as prompt:
+                ctx = parser.analyze(root, live=True, live_root=root)
+            prompt.assert_not_called()
+            self.assertEqual(2, len(ctx.messages))
+            results.append((ctx.facts, ctx.candidates, parser.timeline_rows(ctx), parser.conversation_rows(ctx)))
+        self.assertEqual(results[0], results[1])
+        self.backend.assert_not_called()
+
+    def test_artifact_normalization_and_raw_facts_ignore_environment_keys(self):
+        home = self.root / ".lmstudio"
+        prefetch = home / "Windows" / "Prefetch"
+        prefetch.mkdir(parents=True)
+        for name in ("LM STUDIO.EXE-AAAA.pf", "LM STUDIO.EXE-BBBB.pf"):
+            (prefetch / name).write_bytes(b"SYNTHETIC")
+        results = []
+        for value in ("SYNTHETIC_ENV_A", "SYNTHETIC_ENV_B"):
+            with patch.dict(os.environ, {key: value for key in self.ENV_KEYS}):
+                ctx = parser.analyze(home)
+            before = copy.deepcopy(ctx)
+            rows = parser.timeline_rows(ctx)
+            self.assertEqual(before, ctx)
+            self.assertEqual(2, len(ctx.candidates[0].facts))
+            self.assertIn("동일 근거=2건", rows[0][6])
+            self.assertEqual(1, len(rows[0][5].split(" | ")))
+            results.append((ctx.facts, ctx.candidates, rows, parser.conversation_rows(ctx)))
+        self.assertEqual(results[0], results[1])
+
+    def test_clear_key_priority_preserves_source_size_mtime_and_content(self):
+        before = (self.image.read_bytes(), self.image.stat().st_size, self.image.stat().st_mtime_ns)
+        self.bde.has_clear_key.return_value = True
+        with patch.object(getpass, "getpass") as prompt:
+            ctx, _, _, _ = self.collect(credential=self.deferred("--bitlocker-recovery-prompt"))
+        prompt.assert_not_called()
+        self.assertFalse(any(issue.fatal for issue in ctx.issues))
+        self.assertEqual(before, (self.image.read_bytes(), self.image.stat().st_size, self.image.stat().st_mtime_ns))
+        self.assertEqual([self.image], list(self.root.iterdir()))
+
+    def test_cli_clear_key_skips_all_explicit_credential_reads(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        options = [("--bitlocker-recovery-prompt",), ("--bitlocker-passphrase-prompt",),
+                   ("--bitlocker-bek", str(self.root / "missing.bek")),
+                   ("--bitlocker-fvek", str(self.root / "missing.fvek"))]
+        self.bde.has_clear_key.return_value = True
+        self.bde.open.side_effect = lambda: io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        for index, option in enumerate(options):
+            with self.subTest(option=option), \
+                    patch("dissect.volume.disk.Disk", side_effect=ValueError("volume image")), \
+                    patch("dissect.ntfs.NTFS", side_effect=lambda stream: SimpleNamespace(fh=stream)), \
+                    patch.object(parser, "collect_ntfs_current", side_effect=self.add_conversation), \
+                    patch.object(parser, "collect_ntfs_usn"), \
+                    patch.object(parser, "read_bitlocker_credential", wraps=parser.read_bitlocker_credential) as read, \
+                    patch.object(getpass, "getpass") as prompt, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(0, parser.main([str(self.image), "--output", str(self.root / f"clear_out{index}"),
+                                                "--validate", "--before", str(self.image), *option]))
+                read.assert_called_once()
+                self.assertTrue(read.call_args.kwargs["defer"])
+                prompt.assert_not_called()
+        for method in ("unlock_with_recovery_password", "unlock_with_passphrase", "unlock_with_bek", "unlock_with_fvek"):
+            getattr(self.bde, method).assert_not_called()
+
+    def test_prompt_result_is_reused_across_partitions_and_reanalysis(self):
+        credential = self.deferred("--bitlocker-recovery-prompt")
+        self.bde.open.side_effect = lambda: io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+        with patch.object(getpass, "getpass", return_value="SYNTHETIC_RECOVERY") as prompt:
+            for _ in range(2):
+                partitions = [SimpleNamespace(offset=index * 512, open=lambda: io.BytesIO(bytes(512)))
+                              for index in range(2)]
+                ctx, constructor, _, _ = self.collect(partitions=partitions, credential=credential)
+                self.assertFalse(any(issue.fatal for issue in ctx.issues))
+                self.assertEqual(2, constructor.call_count)
+        prompt.assert_called_once()
+        self.assertEqual(4, self.bde.unlock_with_recovery_password.call_count)
+        self.assertNotIn("SYNTHETIC_RECOVERY", repr(credential))
+
+    def test_cancelled_or_unsafe_prompt_skips_partition_without_reprompt(self):
+        for failure in (EOFError("SYNTHETIC_SECRET"), KeyboardInterrupt("SYNTHETIC_SECRET"),
+                        getpass.GetPassWarning("SYNTHETIC_SECRET")):
+            with self.subTest(failure=type(failure).__name__):
+                credential = self.deferred("--bitlocker-recovery-prompt")
+                normal = io.BytesIO(b"\xeb\x52\x90NTFS    " + bytes(501))
+                partitions = [SimpleNamespace(offset=0, open=lambda: io.BytesIO(bytes(512))),
+                              SimpleNamespace(offset=512, open=lambda: io.BytesIO(bytes(512))),
+                              SimpleNamespace(offset=1024, open=lambda: normal)]
+                self.detect.side_effect = [True, True, False]
+                with patch.object(getpass, "getpass", side_effect=failure) as prompt:
+                    ctx, constructor, current, _ = self.collect(partitions=partitions, credential=credential)
+                prompt.assert_called_once()
+                constructor.assert_called_once_with(normal)
+                current.assert_called_once()
+                self.assertEqual(2, sum(issue.code == "bitlocker_credential_read_failed" for issue in ctx.issues))
+                self.assertNotIn("SYNTHETIC_SECRET", repr(ctx) + repr(credential))
+                self.assertFalse(any(issue.fatal for issue in ctx.issues))
+
+    def test_failed_clear_key_allows_each_explicit_credential_fallback(self):
+        bek, fvek = self.root / "authorized.bek", self.root / "authorized.fvek"
+        bek.write_bytes(b"SYNTHETIC_BEK")
+        fvek.write_bytes(bytes(range(32)))
+        options = [("--bitlocker-recovery-prompt",), ("--bitlocker-passphrase-prompt",),
+                   ("--bitlocker-bek", str(bek)), ("--bitlocker-fvek", str(fvek))]
+        methods = ("unlock_with_recovery_password", "unlock_with_passphrase", "unlock_with_bek", "unlock_with_fvek")
+        self.bde.has_clear_key.return_value = True
+        self.bde.unlock_with_clear_key.side_effect = ValueError("SYNTHETIC_CLEAR_SECRET")
+        for option, method in zip(options, methods):
+            with self.subTest(option=option), patch.object(getpass, "getpass", return_value="SYNTHETIC_AUTHORIZED"):
+                credential = self.deferred(*option)
+                stream, _ = self.open(credential)
+            self.assertIs(self.plain, stream)
+            getattr(self.bde, method).assert_called_once()
+            self.assertNotIn("SYNTHETIC_CLEAR_SECRET", repr(self.ctx))
+        self.assertEqual(4, self.bde.unlock_with_clear_key.call_count)
+
+    def test_unused_raw_fvek_cannot_override_successful_clear_key(self):
+        self.bde.has_clear_key.return_value = True
+        # Unsupported filesystems belong to NTFS handling, not unused-key validation.
+        self.bde.open.return_value = io.BytesIO(bytes(512))
+        stream, _ = self.open(parser.BitLockerCredential("fvek", bytes(32)))
+        self.assertIs(self.bde.open.return_value, stream)
+        self.bde.unlock_with_fvek.assert_not_called()
+        self.assertNotIn("bitlocker_unlock_failed", [issue.code for issue in self.ctx.issues])
+
+    def test_installed_clear_key_api_requires_real_protector_and_uses_vmk(self):
+        from dissect.fve.bde.bde import BDE
+        vmk = Mock()
+        clear_key, master_key = b"SYNTHETIC_CLEAR_KEY", b"SYNTHETIC_MASTER_KEY"
+        vmk.clear_key.return_value = clear_key
+        vmk.decrypt.return_value = master_key
+        backend = SimpleNamespace(information=SimpleNamespace(dataset=Mock()), unlock=Mock())
+        backend.information.dataset.find_clear_vmk.return_value = None
+        self.assertFalse(BDE.has_clear_key(backend))
+        with self.assertRaisesRegex(ValueError, "No clear VMK found"):
+            BDE.unlock_with_clear_key(backend)
+        backend.unlock.assert_not_called()
+        backend.information.dataset.find_clear_vmk.return_value = vmk
+        self.assertTrue(BDE.has_clear_key(backend))
+        BDE.unlock_with_clear_key(backend)
+        vmk.clear_key.assert_called_once_with()
+        vmk.decrypt.assert_called_once_with(clear_key)
+        backend.unlock.assert_called_once_with(master_key)
 
 
 def run_self_tests() -> int:

@@ -52,7 +52,7 @@ Windows의 LM Studio forensic artifact를 읽기 전용으로 분석하는 파�
 .\.venv312\Scripts\python.exe -B LMstudio_parser\lmstudio_parser.py evidence.E01 --bitlocker-recovery-prompt --output C:\ForensicOutput\lmstudio
 ```
 
-DD/RAW/IMG, EWF, Split RAW 내부 BitLocker 볼륨을 authorized credential로 읽기 전용 해제합니다. 복호화 stream을 기존 filesystem 분석에 연결하며 전체 decrypted DD는 생성하지 않습니다. 실제 clear-key protector가 있으면 별도 옵션 없이 해제를 시도합니다.
+DD/RAW/IMG, EWF, Split RAW 내부 BitLocker 볼륨에 실제 Clear Key protector가 있으면 별도 Recovery Password 입력 없이 자동 해제를 시도합니다. Clear Key가 없거나 해제에 실패하면 사용자가 명시적으로 지정한 authorized credential만 fallback으로 사용하며, credential 입력·파일 읽기는 fallback이 필요할 때 수행합니다. 환경변수에서 Recovery Key 등 credential을 암묵적으로 읽지 않습니다. `dissect.fve`의 복호화 stream을 기존 `dissect.ntfs` 분석에 연결하며 전체 decrypted DD는 생성하지 않고 원본 Evidence는 읽기 전용으로 접근합니다.
 
 | Credential | 옵션 |
 |---|---|
