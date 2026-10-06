@@ -380,3 +380,118 @@ def test_cache_bodies_and_snapshot_bodies_never_supply_messages():
               value={"clientState": {"queries": [{"state": {"data": idb_body}}]}})
     [message] = context(cached, idb).conversations.all_messages()
     assert message.content == "IndexedDB 질문" and message.evidence_ids == [idb.evidence_id]
+
+
+# ---------------------------------------------------------------------------
+# drafts, attachments and message versions seen in real cases
+# ---------------------------------------------------------------------------
+
+def tree(locator, *messages):
+    return rec(FAMILY_INDEXEDDB, locator, database="claude-conversation-store", object_store="trees",
+               record_state="LIVE", value={"conversationUuid": CONV, "chat_messages": list(messages)})
+
+
+def draft(seq, text, at, key=CONV, attachments=()):
+    return rec(FAMILY_INDEXEDDB, f"draft{seq}", at, key_kind="chat_draft", key_text=f"store:chat-draft:{key}",
+               ldb_seq_no=seq, value={"state": {"attachments": list(attachments), "tipTapEditorState": {
+                   "type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}}})
+
+
+def test_draft_continued_by_the_sent_message_is_its_writing_trace_not_a_second_row():
+    sent = {"uuid": "m1", "sender": "human", "created_at": (T + 2 * S).isoformat(), "updated_at": "x",
+            "content": "[MRK_E0401] 정렬 예제를 보여줄래?"}
+    last = draft(2, "[MRK_E0401] 정렬 예제를 보여줄", T + S)          # two more characters typed before Enter
+    events = detect_prompt(context(tree("t", sent), draft(1, "t", T - 60 * S, key="chorus-unified-composer"),
+                                   last)).events
+    assert sorted(e.action_detail for e in events) == [
+        "사용자 메시지 전송_[MRK_E0401] 정렬 예제를 보여줄래?", "프롬프트 작성 흔적(전송 미확인)_t"]
+    message = next(e for e in events if e.verdict == VERDICT_CONFIRMED)
+    assert any(eid == last.evidence_id and "전송 직전 초안" in line for eid, line in message.evidence)
+    late = detect_prompt(context(tree("t", sent), draft(2, "[MRK_E0401] 정렬 예제를 보여줄", T + 3 * S))).events
+    assert len(late) == 2                                           # saved after the send: not that message's draft
+
+
+def test_server_record_replaces_the_pages_own_copy_and_fills_what_it_lacked():
+    local = {"uuid": "m1", "sender": "human", "created_at": "2026-10-01T14:42:56.149Z", "content": "질문",
+             "attachments": [], "files_v2": []}
+    server = {**local, "created_at": "2026-10-01T14:42:56.935559Z", "updated_at": "2026-10-01T14:42:57Z",
+              "attachments": [{"id": "a1", "file_name": "MRK_E0503.txt"}]}
+    for order in ((local, server, local), (server, local)):
+        [message] = context(*(tree(f"v{i}", v) for i, v in enumerate(order))).conversations.all_messages()
+        assert message.timestamp == dt.datetime(2026, 10, 1, 14, 42, 56, 935559, tzinfo=UTC)
+        assert message.attributes["attachments"] == [{"id": "a1", "file_name": "MRK_E0503.txt"}]
+
+
+def test_attachment_sent_under_another_identifier_is_not_reported_again_as_a_draft():
+    body = "[MRK_E0503] 본문"
+    sent = {"uuid": "m1", "sender": "human", "created_at": (T + 9 * S).isoformat(), "content": "정리해줘",
+            "attachments": [{"id": "a1b2c3d4", "file_name": "MRK_E0503.txt", "file_size": 15, "extracted_content": body}]}
+    unsent = draft(1, "정리", T, attachments=[{"file_name": "MRK_E0503.txt", "file_size": 15, "extracted_content": body}])
+    [event] = detect_document_upload(context(tree("t", sent), unsent)).events
+    assert event.action_detail == "전송 메시지 첨부_MRK_E0503.txt" and event.verdict == VERDICT_CONFIRMED
+    other = draft(1, "정리", T, attachments=[{"file_name": "MRK_E0503.txt", "extracted_content": "다른 내용"}])
+    assert len(detect_document_upload(context(tree("t", sent), other)).events) == 2
+
+
+def test_uploaded_draft_file_is_one_row_at_the_servers_time_with_its_cache_asset():
+    picked = {"file_kind": "blob", "file_uuid": "local-1", "file_name": "DASH.png",
+              "created_at": "2026-10-02T03:06:30.412Z"}
+    uploaded = {**picked, "success": True, "file_kind": "image", "created_at": "2026-10-02T03:06:31.219042Z",
+                "uuid": "server-1", "serverFileUuid": "server-1"}
+    asset = rec(FAMILY_CACHE, "asset", key_kind="file_asset", file_uuid="server-1", file_variant="preview",
+                content_type="image/webp", response_at=T, cache_key="https://claude.ai/api/o/files/server-1/preview")
+    drafts = [draft(1, "", T, attachments=[picked]), draft(2, "설명해줘", T + 30 * S, attachments=[uploaded])]
+    [event] = detect_image_upload(context(asset, *drafts)).events
+    assert event.action_detail == "이미지 서버 업로드 완료(메시지 첨부 전송 미확인)_DASH.png"
+    assert event.verdict == VERDICT_SUSPECTED                       # uploaded, but no sent message holds it
+    assert event.timestamp == dt.datetime(2026, 10, 2, 3, 6, 31, 219042, tzinfo=UTC)
+    assert asset.evidence_id in [eid for eid, _ in event.evidence]
+    [only_picked] = detect_image_upload(context(drafts[0])).events
+    assert only_picked.action_detail == "이미지 업로드 준비 흔적(전송 불확인)_DASH.png"
+    assert only_picked.timestamp == dt.datetime(2026, 10, 2, 3, 6, 30, 412000, tzinfo=UTC)
+
+
+def test_one_damaged_local_storage_file_does_not_lose_the_others(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from claude_web_forensics.parsers import ccl_adapter
+
+    class File:
+        def __init__(self, path):
+            self.path = path
+
+        def __iter__(self):
+            if self.path.name == "000007.log":
+                raise ValueError("bad block")
+            return iter(())
+
+        def close(self):
+            pass
+
+    class Store:
+        def __init__(self, folder):
+            self.names = sorted(p.name for p in folder.iterdir())
+            if "000007.log" in self.names:
+                raise ValueError("bad block")
+
+        def iter_storage_keys(self):
+            return ["https://claude.ai"]
+
+        def iter_records_for_storage_key(self, key):
+            return [SimpleNamespace(script_key=name, value="v", leveldb_seq_number=1, file=name)
+                    for name in self.names]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(ccl_adapter, "ccl_chromium_localstorage", SimpleNamespace(
+        LocalStoreDb=Store, ccl_leveldb=SimpleNamespace(LogFile=File, LdbFile=File)))
+    folder = tmp_path / "leveldb"
+    folder.mkdir()
+    for name in ("000005.ldb", "000007.log", "000010.log", "CURRENT"):
+        (folder / name).write_bytes(b"x")
+    errors = []
+    records = list(ccl_adapter.iter_local_storage(folder, lambda where, exc: errors.append(where)))
+    assert [r.script_key for r in records] == ["000005.ldb", "000010.log", "CURRENT"]
+    assert errors == ["000007.log skipped (unreadable)"]
+    assert sorted(p.name for p in folder.iterdir()) == ["000005.ldb", "000007.log", "000010.log", "CURRENT"]

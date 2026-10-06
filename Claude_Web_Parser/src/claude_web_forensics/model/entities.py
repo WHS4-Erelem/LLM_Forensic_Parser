@@ -191,10 +191,7 @@ class ParseStatus:
     status: str
     source_path: str = ""
     record_count: int = 0
-    error_count: int = 0
-    error_code: str = ""
     message: str = ""
-    impact: str = ""
 
     details: list[str] = field(default_factory=list)
 

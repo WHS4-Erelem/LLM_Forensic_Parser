@@ -184,7 +184,7 @@ def parse_paths(
     status = ST_PARSED if not errors else (ST_PARTIAL if records else ST_FAILED)
     return records, ParseStatus(
         artifact="$MFT", family=FAMILY_MFT, status=status, source_path=source_path, record_count=len(records),
-        error_count=len(errors), message="; ".join(errors[:5]),
+        message="; ".join(errors[:5]),
     )
 
 ADS_NAME = "Zone.Identifier"
@@ -275,7 +275,7 @@ def zone_to_evidence(
         },
     )
 
-if TYPE_CHECKING:  # pragma: no cover
+if TYPE_CHECKING:
     from ..analysis.claude_scope import ClaudeScope
 
 @dataclass
@@ -350,13 +350,8 @@ def collect_files(
         if ADS_NAME in streams:
             fh = volume.open_record(record, ADS_NAME)
             if fh is not None:
-                try:
+                with fh:
                     zone = parse_zone_bytes(fh.read(65536))
-                finally:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
 
         size = logical_size(record)
         basis = scope.path_basis(image_path) or scope.zone_basis(zone)
@@ -371,9 +366,10 @@ def collect_files(
                 continue
 
         entry = read_entry(volume, record, image_path)
-        mft_evidence = entry_to_evidence(entry, image_path, volume.info.identifier, note="downloads candidate")
-        records.append(mft_evidence)
-        evidence_ids.append(mft_evidence.evidence_id)
+        if volume.info.filesystem != "directory":  # folder input has no $MFT: host stat() is not image evidence
+            mft_evidence = entry_to_evidence(entry, image_path, volume.info.identifier, note="downloads candidate")
+            records.append(mft_evidence)
+            evidence_ids.append(mft_evidence.evidence_id)
 
         win_path = windows_path_for(volume_letter, image_path)
         locator = f"file={image_path};mft={entry.segment}"
@@ -414,6 +410,6 @@ def collect_files(
     return (
         collected, records, ParseStatus(
             artifact="Downloads", family=FAMILY_FILESYSTEM_FILE, status=status, source_path=downloads_dir,
-            record_count=len(collected), error_count=len(errors), message="; ".join(errors[:5]),
+            record_count=len(collected), message="; ".join(errors[:5]),
         ),
     )

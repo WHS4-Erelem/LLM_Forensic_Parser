@@ -17,7 +17,7 @@ from .analysis.file_analysis import FileBuilder, build_lifecycles, plan_usn_path
 from .discovery.environment import find_chrome_profiles, find_user_sids, find_windows_installs
 from .image.acquire import ProfileStaging, Stager
 from .image.adapters import EwfImage, ImageOpenError, RawImage, looks_like_ewf
-from .image.volumes import KeyMaterial, NtfsVolume, discover_volumes, open_ntfs_volumes
+from .image.volumes import DirectoryVolume, KeyMaterial, NtfsVolume, discover_volumes, open_ntfs_volumes
 from .model.entities import (
     REASON_TEXT, ST_SKIPPED, VERDICT_CONFIRMED, VERDICT_SUSPECTED, VERDICT_UNDETERMINED, EvidenceStore,
     ParseStatus,
@@ -78,8 +78,7 @@ class RunLog:
         self.result.warnings.append(f"{item}: {message}")
 
     def failed(self, artifact: str, family: str, exc: Exception) -> None:
-        self.parse([ParseStatus(artifact=artifact, family=family, status="failed",
-                               error_code=type(exc).__name__, message=str(exc)[:400])])
+        self.parse([ParseStatus(artifact=artifact, family=family, status="failed", message=str(exc)[:400])])
 
     def parse(self, statuses) -> None:
         for status in statuses:
@@ -124,17 +123,23 @@ def _run(
     if import_error():
         log.warning("ccl_chromium_reader", import_error() or "")
 
-    logger.info("opening image %s", options.image_path)
-    image_type = EwfImage if looks_like_ewf(Path(options.image_path)) else RawImage
-    image = image_type(Path(options.image_path))
-    info = image.info
-    log.info("image", f"{info.image_type} logical={info.logical_size} container={info.container_size}")
-    for warning in info.warnings:
-        log.warning("image", warning)
+    folder = Path(options.image_path).is_dir()
+    if folder:
+        logger.info("opening folder %s", options.image_path)
+        ntfs_volumes = [DirectoryVolume(Path(options.image_path))]
+        volumes = [v.info for v in ntfs_volumes]
+    else:
+        logger.info("opening image %s", options.image_path)
+        image_type = EwfImage if looks_like_ewf(Path(options.image_path)) else RawImage
+        image = image_type(Path(options.image_path))
+        info = image.info
+        log.info("image", f"{info.image_type} logical={info.logical_size} container={info.container_size}")
+        for warning in info.warnings:
+            log.warning("image", warning)
 
-    volumes = discover_volumes(image.stream(), info.logical_size)
-    selected = _select_volumes(volumes, options)
-    ntfs_volumes = open_ntfs_volumes(image.stream(), selected, options.key_material)
+        volumes = discover_volumes(image.stream(), info.logical_size)
+        selected = _select_volumes(volumes, options)
+        ntfs_volumes = open_ntfs_volumes(image.stream(), selected, options.key_material)
     for volume in volumes:
         log.info(
             f"partition {volume.index}", f"{volume.encryption_status or volume.filesystem or 'unknown'} "
@@ -242,14 +247,17 @@ def _run(
                     logger.exception("Downloads collection failed")
                     log.failed("Downloads", "filesystem_file", exc)
 
-        try:
-            targets = [s.profile.source_path for v, s in stagings if v is volume]
-            records, status = filesystem.parse_paths(volume, targets, "/$MFT")
-            store.extend(records)
-            log.parse([status])
-        except Exception as exc:
-            logger.exception("$MFT parsing failed")
-            log.failed("$MFT", "mft", exc)
+        if folder:
+            log.parse([ParseStatus(artifact="$MFT", family="mft", status=ST_SKIPPED, message="folder input has no $MFT")])
+        else:
+            try:
+                targets = [s.profile.source_path for v, s in stagings if v is volume]
+                records, status = filesystem.parse_paths(volume, targets, "/$MFT")
+                store.extend(records)
+                log.parse([status])
+            except Exception as exc:
+                logger.exception("$MFT parsing failed")
+                log.failed("$MFT", "mft", exc)
 
         if not options.extended_fs:
             log.parse([ParseStatus(artifact=a, family=f, status=ST_SKIPPED, message="--extended-fs not enabled")

@@ -14,13 +14,13 @@ from ..model.entities import (
     EvidenceRecord, EvidenceStore, FileTrace, FinalEvent, make_action_id,
 )
 from ..parsers.browser_storage import event_time
-from ..util.common import ensure_aware, from_webkit
-from .conversations import ConversationBuilder, ConversationInfo, draft_attachment_names
+from ..util.common import ensure_aware, from_iso8601, from_webkit
+from .conversations import ConversationBuilder, ConversationInfo, _continues, draft_attachment_names
 from .correlator import Correlator
 from .file_analysis import FileLifecycle
 from .rules import ACTION_LABELS, VerdictInput, compose_detail, decide, first_meaningful_line
 from .rules import label_for, rule_for
-from .summaries import clip, kst, short_url
+from .summaries import clip, kst, short_url, summarize_record
 
 FLOW_GAP = dt.timedelta(minutes=10)
 AUTH_ACTIVITY = dt.timedelta(minutes=10)
@@ -519,22 +519,41 @@ def detect_retry(ctx: DetectorContext) -> list[FinalEvent]:
 def detect_prompt(ctx: DetectorContext) -> list[FinalEvent]:
     events = []
     sent_texts = set()
-    for uuid, info in sorted(ctx.conversations.conversations.items()):
+    drafts = ctx.conversations.draft_compositions()
+    known = ctx.conversations.conversations
+    # A composition saved shortly before a message of the same conversation, whose text that message continues
+    # (a few more characters typed before Enter), is that message's writing trace, not a separate unsent draft.
+    written: dict[str, Any] = {}
+    for message in sorted((m for i in known.values() for m in i.messages.values() if m.role == "user" and m.timestamp),
+                          key=lambda m: (m.timestamp, m.message_uuid)):
+        own = [c for c in drafts
+               if c[-1].timestamp and c[-1].timestamp <= message.timestamp <= c[-1].timestamp + DRAFT_TO_SEND
+               and ((tail := c[-1].draft_id.rsplit(":", 1)[-1]) == message.conversation_uuid or tail not in known)
+               and _continues(c[-1].text.strip(), message.content.strip())]
+        if own:
+            best = max(own, key=lambda c: c[-1].timestamp)
+            drafts.remove(best)
+            written[message.message_uuid] = best[-1]
+    for uuid, info in sorted(known.items()):
         for message in info.messages.values():
             if message.role != "user" or not message.timestamp:
                 continue
             sent_texts.add(message.content.strip())
             preview = first_meaningful_line(message.content)
+            last = written.get(message.message_uuid)
             events.append(_build_event(
                 ctx, "E04-01", {"message_uuid": message.message_uuid}, message.timestamp,
                 "사용자 메시지 전송", preview or info.title,
-                [(ctx.store.get(eid), "") for eid in message.evidence_ids],
+                [(r, summarize_record(r) if r and last else "")   # spelled out so the draft line joins it, not hides it
+                 for r in map(ctx.store.get, message.evidence_ids)]
+                + [(ctx.store.get(eid), f"[{FAMILY_DISPLAY[last.family]}] 전송 직전 초안 {last.draft_id} "
+                                        f"{len(last.text)}자 {kst(last.timestamp)}")
+                   for eid in (last.evidence_ids if last else ())],
                 conversation_uuid=uuid, basis="user_message_created_at", direct=True,
                 why="user message UUID with created_at in the conversation tree",
             ))
 
-    compositions = [c for c in ctx.conversations.draft_compositions()
-                    if c[-1].text.strip() not in sent_texts]
+    compositions = [c for c in drafts if c[-1].text.strip() not in sent_texts]
     used: set[int] = set()
     for event, record in _events_named(ctx, "claudeai.message.sent"):
         props = event.get("properties") or {}
@@ -612,17 +631,26 @@ def _event_file(props: dict[str, Any]) -> tuple[str, bool | None]:
     label = str(props.get("file_name") or props.get("fileName") or "") or (f"확장자 {ext}" if ext else mime)
     return label, _is_image(name, mime) if known and not is_executable_download(name, mime) else None
 
+def _file_ids(item: dict[str, Any]) -> set[str]:
+    """Every identifier one upload carries: the page's own file_uuid and the server's id / uuid / serverFileUuid."""
+    return {str(item[k]).lower() for k in ("id", "file_uuid", "uuid", "serverFileUuid") if item.get(k)}
+
+def _asset_line(record: EvidenceRecord) -> str:
+    return (f"[Cache] 업로드 파일 {record.attributes.get('file_variant')} 조회 "
+            f"{kst(_at(record))}, {clip(record.attributes.get('content_type'), 30)}")
+
 def _uploads(ctx: DetectorContext, want_image: bool) -> list[FinalEvent]:
     code, kind = ("E05-01", "이미지") if want_image else ("E05-03", "문서")
-    events, sent_files = [], set()
+    events, sent_files, sent_bodies = [], set(), set()
     for uuid, info in sorted(ctx.conversations.conversations.items()):
         for message in info.messages.values():
             if message.role != "user":
                 continue
             for item in (message.attributes.get("attachments") or []) + (message.attributes.get("files") or []):
                 name = str(item.get("file_name") or item.get("fileName") or "")
-                file_uuid = str(item.get("file_uuid") or item.get("uuid") or "").lower()
-                sent_files.add(file_uuid)
+                file_uuid = str(item.get("file_uuid") or item.get("uuid") or item.get("id") or "").lower()
+                sent_files |= _file_ids(item)
+                sent_bodies.add((uuid, name, item.get("extracted_content")))
                 if not name or _is_image(name, str(item.get("file_kind") or "")) != want_image:
                     continue
                 events.append(_build_event(
@@ -632,39 +660,48 @@ def _uploads(ctx: DetectorContext, want_image: bool) -> list[FinalEvent]:
                     conversation_uuid=uuid, basis="attachment_message_created_at", direct=True,
                     why="attachment inside a sent user message",
                 ))
-    seen: set[str] = set()
-    for name, item in draft_attachment_names(ctx.conversations.drafts):
-        key = str(item.get("file_uuid") or name)
-        if (key in seen or key.lower() in sent_files
-                or _is_image(name, str(item.get("file_kind") or "")) != want_image):
-            continue
-        seen.add(key)
-        drafts = [d for d in ctx.conversations.drafts
-                  if any(str(a.get("file_uuid") or a.get("file_name")) == key for a in d.attachments)]
-        events.append(_build_event(
-            ctx, code, {"file": str(item.get("file_uuid") or name), "draft": True},
-            max((d.timestamp for d in drafts if d.timestamp), default=None),
-            f"{kind} 업로드 준비 흔적(전송 불확인)", name,
-            [(ctx.store.get(eid), "") for d in drafts for eid in d.evidence_ids],
-            basis="draft_updated_at", disqualifiers=["attachment in a draft only"],
-        ))
     assets: dict[str, list[EvidenceRecord]] = defaultdict(list)
     for record in ctx.store.by_family(FAMILY_CACHE):
         if record.attributes.get("key_kind") == "file_asset":
             assets[record.attributes["file_uuid"]].append(record)
+    by_file: dict[str, list[tuple[Any, str, dict[str, Any]]]] = defaultdict(list)
+    for draft in ctx.conversations.drafts:
+        for name, item in draft_attachment_names([draft]):
+            by_file[str(item.get("file_uuid") or name)].append((draft, name, item))
+    draft_files: set[str] = set()
+    for key, versions in by_file.items():
+        drafts = [d for d, _, _ in versions]
+        # the version the server answered (success, its own uuid and created_at) describes the upload best
+        _, name, item = next((v for v in versions if v[2].get("success")), versions[0])
+        ids = set().union(*(_file_ids(a) for _, _, a in versions))
+        draft_files |= ids
+        tail, body = drafts[0].draft_id.rsplit(":", 1)[-1], item.get("extracted_content")
+        # sent already: same identifier, or (inline text has none) the same name and extracted body in that chat
+        if (ids & sent_files or _is_image(name, str(item.get("file_kind") or "")) != want_image
+                or body and any(s[1:] == (name, body) and (s[0] == tail or tail not in ctx.conversations.conversations)
+                                for s in sent_bodies)):
+            continue
+        events.append(_build_event(
+            ctx, code, {"file": key, "draft": True},
+            from_iso8601(item.get("created_at")) or min((d.timestamp for d in drafts if d.timestamp), default=None),
+            f"{kind} 서버 업로드 완료(메시지 첨부 전송 미확인)" if item.get("success") is True
+            else f"{kind} 업로드 준비 흔적(전송 불확인)", name,
+            [(ctx.store.get(eid), "") for d in drafts for eid in d.evidence_ids]
+            + [(r, _asset_line(r)) for file_uuid in sorted(ids) for r in assets.get(file_uuid, ())],
+            basis="attachment_created_at", disqualifiers=["attachment in a draft only"],
+        ))
     for file_uuid, records in sorted(assets.items()):
         variants = {r.attributes.get("file_variant") for r in records}
         image = "preview" in variants and "document_pdf" not in variants
-        if file_uuid in sent_files or image != want_image or not ({"preview", "document_pdf"} & variants):
+        if (file_uuid in sent_files or file_uuid in draft_files or image != want_image
+                or not ({"preview", "document_pdf"} & variants)):
             continue
         records.sort(key=lambda r: _order(_at(r)))
         downloads = [r for r in ctx.store.by_family(FAMILY_HISTORY)
                      if r.attributes.get("subtype") == "download"
                      and any(file_uuid in str(u).lower() for u in r.attributes.get("chain_urls") or [])]
         name = str(downloads[0].attributes.get("file_name") or "") if downloads else ""
-        evidence: Evidence = [(r, f"[Cache] 업로드 파일 {r.attributes.get('file_variant')} 조회 "
-                                  f"{kst(_at(r))}, {clip(r.attributes.get('content_type'), 30)}")
-                              for r in records]
+        evidence: Evidence = [(r, _asset_line(r)) for r in records]
         evidence += [(d, f"[History] 같은 파일 UUID 다운로드 기록: {d.attributes.get('file_name')}, "
                          f"MIME={d.attributes.get('mime_type')}") for d in downloads[:1]]
         events.append(_build_event(

@@ -1,6 +1,7 @@
 """Single place that absorbs ccl_chromium_reader version differences."""
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -14,14 +15,14 @@ CCL_VERSION = "0.3.18"
 _IMPORT_ERROR: str | None = None
 
 try:
-    from ccl_chromium_reader import (  # type: ignore
+    from ccl_chromium_reader import (
         ccl_chromium_cache, ccl_chromium_indexeddb, ccl_chromium_localstorage, ccl_chromium_snss2,
     )
-except Exception as exc:  # pragma: no cover - dependency guard
-    ccl_chromium_cache = None  # type: ignore
-    ccl_chromium_indexeddb = None  # type: ignore
-    ccl_chromium_localstorage = None  # type: ignore
-    ccl_chromium_snss2 = None  # type: ignore
+except Exception as exc:
+    ccl_chromium_cache = None
+    ccl_chromium_indexeddb = None
+    ccl_chromium_localstorage = None
+    ccl_chromium_snss2 = None
     _IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 def import_error() -> str | None:
@@ -235,7 +236,31 @@ def iter_local_storage(
 ) -> Iterator[LocalStorageRecord]:
     if ccl_chromium_localstorage is None:
         raise RuntimeError(f"ccl_chromium_reader unavailable: {_IMPORT_ERROR}")
-    store = ccl_chromium_localstorage.LocalStoreDb(leveldb_dir)
+    try:
+        store = ccl_chromium_localstorage.LocalStoreDb(leveldb_dir)
+    except Exception:
+        # CCL reads every file while opening, so one damaged .log/.ldb loses the whole store. Rebuild it beside the
+        # staged copy from the files that read cleanly on their own and report the rest.
+        leveldb = ccl_chromium_localstorage.ccl_leveldb
+        readable = leveldb_dir.with_name(leveldb_dir.name + "_readable")
+        shutil.rmtree(readable, ignore_errors=True)
+        readable.mkdir()
+        for file in sorted(p for p in leveldb_dir.iterdir() if p.is_file()):
+            reader = {".log": leveldb.LogFile, ".ldb": leveldb.LdbFile, ".sst": leveldb.LdbFile}.get(file.suffix.lower())
+            try:
+                if reader:
+                    data = reader(file)
+                    try:
+                        for _ in data:
+                            pass
+                    finally:
+                        data.close()
+            except Exception as exc:
+                if on_error:
+                    on_error(f"{file.name} skipped (unreadable)", exc)
+                continue
+            shutil.copy2(file, readable / file.name)
+        store = ccl_chromium_localstorage.LocalStoreDb(readable)
     try:
         for storage_key in store.iter_storage_keys():
             try:

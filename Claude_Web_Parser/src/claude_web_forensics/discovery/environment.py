@@ -18,15 +18,14 @@ class WindowsUser:
 class WindowsInstall:
     volume_id: str
     windows_path: str
-    users_path: str
     users: list[WindowsUser] = field(default_factory=list)
 
 def find_windows_installs(volumes: list[NtfsVolume]) -> list[WindowsInstall]:
     installs: list[WindowsInstall] = []
     for volume in volumes:
-        if not volume.exists("/Windows") or not volume.exists("/Users"):
+        if not volume.exists("/Users") or not (volume.exists("/Windows") or volume.info.filesystem == "directory"):
             continue
-        install = WindowsInstall(volume_id=volume.info.identifier, windows_path="/Windows", users_path="/Users",)
+        install = WindowsInstall(volume_id=volume.info.identifier, windows_path="/Windows",)
         for name, record in sorted(volume.listdir("/Users").items()):
             if name.lower() in _SYSTEM_PROFILES:
                 continue
@@ -99,7 +98,6 @@ class ArtifactPlanEntry:
     family: str
     kind: str
     source: str
-    required: bool = True
     companions: tuple[str, ...] = ()
     note: str = ""
 
