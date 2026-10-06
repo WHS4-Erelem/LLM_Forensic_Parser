@@ -178,6 +178,20 @@ write_final_outputs(result, r"D:\CASE\out")   # timeline.csv + recovered_convers
 `--debug-output` 은 **파일로 내보내는 동작만** 바꾼다. 내부 `ParseResult` / `records` / `events` / `conversations` 는 기본 실행에서도 그대로 사용하며 판정 결과는 같다.
 CSV 는 모두 `utf-8-sig` 이며 Excel 수식으로 해석될 수 있는 cell 은 앞에 `'` 를 붙여 무력화한다.
 
+#### `coverage.csv` 에 들어가는 Artifact 범위
+
+`coverage.csv` 는 **읽기를 시도한 Artifact 마다 1행**을 만든다. 현재 읽는 것은 프로필마다 다음 7종이다.
+
+```
+history · local_storage · session_storage · cache · preferences · shared_proto_db · sessions
+```
+
+파일이 없으면 그 행이 `NOT_PRESENT` 로 남는다 — 즉 "행이 없다" 와 "파일이 없다" 는 다른 뜻이다.
+`constants.py` 의 `ARTIFACT_TYPES` 는 `artifact_type` 필드에 쓸 수 있는 **schema 어휘**이고 읽는 대상 목록이 아니다.
+그래서 어휘에만 있는 `cookies` · `indexeddb` · `favicons` · `local_state` · `ntfs` 는 **리더가 없어 행이 생기지 않는다**
+(디스크에 `Default/Network/Cookies` · `Default/IndexedDB` 가 있어도 같다 — 실제 BitLocker 이미지에서 확인).
+읽는 7종과 그 순서는 `test_explicit_mode_unchanged` 가 고정하고 있다.
+
 ### `timeline.csv` — 사용자가 언제 무엇을 했는가
 
 Event 1건 = 1 row, 시각순 정렬. 컬럼 이름·순서는 **팀 공통 CSV 형식**이며,
