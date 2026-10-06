@@ -3048,8 +3048,13 @@ def unique_candidates(candidates: Sequence[CandidateEvent]) -> list[CandidateEve
 
 
 def candidate_artifact_paths(candidate: CandidateEvent) -> list[str]:
-    return sorted({safe_nonconversation_text(f.provenance.original_artifact_path, max_length=2000)
-                   for f in candidate.facts if f.provenance.original_artifact_path})
+    paths: set[str] = set()
+    for _, facts in artifact_display_groups(candidate):
+        representative = artifact_display_representative(facts)
+        path = representative.provenance.original_artifact_path
+        if path:
+            paths.add(safe_nonconversation_text(path, max_length=2000))
+    return sorted(paths)
 
 
 def pointer_order(location: str) -> tuple[int, ...]:
@@ -3362,10 +3367,109 @@ def usn_artifact_detail_key(fact: ObservedFact) -> tuple[str, ...] | None:
             fact.provenance.source_image, fact.provenance.original_artifact_path)
 
 
+def prefetch_display_executable(fact: ObservedFact) -> str:
+    """Identify the executable from observed PF names or an explicit .exe value."""
+    names = [basename(fact.provenance.original_artifact_path)]
+    if fact.target_path:
+        names.append(basename(fact.target_path))
+    executables: set[str] = set()
+    for name in names:
+        match = re.fullmatch(r"(.+\.exe)-[A-Za-z0-9]+\.pf", name, re.I)
+        if match:
+            executables.add(match.group(1).lower())
+        elif not name.lower().endswith(".pf"):
+            return ""
+    if fact.value.lower().endswith(".exe"):
+        executables.add(basename(fact.value).lower())
+    return next(iter(executables)) if len(executables) == 1 else ""
+
+
+def artifact_display_group_key(candidate: CandidateEvent, fact: ObservedFact) -> tuple[str, ...] | None:
+    """Conservative display equivalence; never an evidence-independence decision."""
+    source = fact.provenance.original_artifact_path
+    if not source:
+        return None
+    common = (candidate.action, candidate.event_type, candidate.rule_id,
+              fact.fact_type, fact.family, fact.direct_tag,
+              fact.conversation_ref, fact.message_ref, fact.provenance.source_image)
+    if fact.fact_type == "application_prefetch":
+        executable = prefetch_display_executable(fact)
+        if not executable:
+            return None
+        # Hash-specific PF names identify repeated supporting files. Keep their
+        # directory/volume, executable and any additional semantic value apart.
+        value = fact.value
+        if value.lower() in {basename(source).lower(), basename(fact.target_path).lower(), executable}:
+            value = ""
+        return ("Prefetch", *common, executable,
+                lower_path(str(PureWindowsPath(source).parent)),
+                lower_path(str(PureWindowsPath(fact.target_path).parent)) if fact.target_path else "",
+                value, fact.key)
+    if basename(source).lower().endswith(".log") and "\\server-logs\\" in lower_path(source):
+        if fact.fact_type in {
+            "server_log_artifact", "server_inference", "model_load_log",
+            "account_login_log", "account_logout_log", "account_switch_log",
+            "account_reauthentication", "normal_exit_log", "forced_exit_log",
+        }:
+            location = fact.provenance.evidence_location
+            # Only line-number differences are ignored. MFT/other locators can
+            # describe different source records and must retain their scope.
+            scope = "line" if re.fullmatch(r"line \d+", location) else location
+            return ("Server Log", *common, lower_path(source),
+                    fact.provenance.lineage_key, lower_path(fact.target_path),
+                    fact.value, fact.key, scope)
+    if (artifact_display_name(fact) == "Runtime" and not fact.direct_tag
+            and fact.fact_type in {"http_server_runtime", "pid_lock_runtime",
+                                   "ui_final_state_flush", "ui_conversation_cleared"}):
+        # Other supporting state is compressed only for the same source locator.
+        return ("Runtime", *common, lower_path(source), fact.provenance.lineage_key,
+                fact.provenance.evidence_location, lower_path(fact.target_path),
+                fact.value, fact.key)
+    return None
+
+
+def artifact_display_groups(candidate: CandidateEvent) -> list[tuple[tuple[str, ...] | None, list[ObservedFact]]]:
+    groups: dict[tuple[str, ...], list[ObservedFact]] = defaultdict(list)
+    individual: list[tuple[tuple[str, ...] | None, list[ObservedFact]]] = []
+    for fact in candidate.facts:
+        key = artifact_display_group_key(candidate, fact)
+        if key is None:
+            individual.append((None, [fact]))
+        else:
+            groups[key].append(fact)
+    return individual + list(groups.items())
+
+
+def artifact_display_representative(facts: Sequence[ObservedFact]) -> ObservedFact:
+    return min(facts, key=lambda fact: (
+        fact.provenance.original_artifact_path, fact.provenance.evidence_location,
+        fact.target_path, fact.value, fact.key, fact.conversation_ref, fact.message_ref,
+    ))
+
+
+def grouped_artifact_detail(key: tuple[str, ...], facts: Sequence[ObservedFact]) -> str:
+    representative = artifact_display_representative(facts)
+    if key[0] == "Prefetch":
+        executable = prefetch_display_executable(representative)
+        display = "LM Studio.exe" if executable == "lm studio.exe" else executable
+        detail = "[Prefetch] 실행 파일=" + safe_nonconversation_text(display, max_length=500)
+        detail += ", 대표 파일=" + safe_nonconversation_text(basename(representative.provenance.original_artifact_path), max_length=500)
+        location = artifact_location_detail(representative.provenance.evidence_location)
+        if location:
+            detail += ", " + location.replace("위치=", "대표 위치=", 1)
+    else:
+        detail = fact_artifact_detail(representative).replace(", 위치=", ", 대표 위치=", 1)
+    return detail + f", 동일 근거={len(facts)}건"
+
+
 def candidate_artifact_details(candidate: CandidateEvent) -> str:
     segments: set[str] = set()
     usn_groups: dict[tuple[str, ...], list[ObservedFact]] = defaultdict(list)
-    for fact in candidate.facts:
+    for display_key, facts in artifact_display_groups(candidate):
+        if display_key is not None and len(facts) > 1:
+            segments.add(grouped_artifact_detail(display_key, facts))
+            continue
+        fact = facts[0]
         key = usn_artifact_detail_key(fact)
         if key is None:
             segments.add(fact_artifact_detail(fact))
@@ -5247,6 +5351,272 @@ class FinalContractTests(FixtureCase):
         parser.report_analysis(ctx, stream)
         self.assertIn('[fatal] test_fatal', stream.getvalue())
         self.assertIn('[non-fatal] test_partial', stream.getvalue())
+
+
+class ArtifactNormalizationTests(FixtureCase):
+    @staticmethod
+    def baseline_paths(candidate):
+        return sorted({parser.safe_nonconversation_text(f.provenance.original_artifact_path, max_length=2000)
+                       for f in candidate.facts if f.provenance.original_artifact_path})
+
+    @staticmethod
+    def baseline_details(candidate):
+        # Freeze the 225-test baseline, including its existing USN aggregation.
+        segments = set()
+        groups = defaultdict(list)
+        for fact in candidate.facts:
+            key = parser.usn_artifact_detail_key(fact)
+            if key is None:
+                segments.add(parser.fact_artifact_detail(fact))
+            else:
+                groups[key].append(fact)
+        details = list(segments)
+        for facts in groups.values():
+            detail = min(parser.fact_artifact_detail(f) for f in facts)
+            if len(facts) > 1:
+                detail += f", 동일 근거={len(facts)}건"
+            details.append(detail)
+        details.sort()
+        if candidate.timestamp and candidate.timestamp.semantics == "download_started" and details:
+            for index, detail in enumerate(details):
+                if detail.startswith("[Download Record] "):
+                    details[index] = detail + ", 시각 출처=다운로드 시작"
+                    break
+        return " | ".join(details)
+
+    @staticmethod
+    def prefetch_facts():
+        facts = []
+        for index, suffix in enumerate(("AAAAAAAA", "BBBBBBBB", "CCCCCCCC")):
+            path = rf"volume0:\Windows\Prefetch\LM STUDIO.EXE-{suffix}.pf"
+            facts.append(parser.ObservedFact(
+                "application_prefetch", "windows_os", parser.Provenance("SYNTHETIC.dd", path, "", f"MFT {10 + index}#1"),
+                parser.basename(path), direct_tag="lmstudio_prefetch_execution", target_path=path,
+            ))
+        return facts
+
+    @staticmethod
+    def log_facts():
+        path = r"volume0:\Users\TEST\.lmstudio\server-logs\events.log"
+        return [parser.ObservedFact(
+            "model_load_log", "lmstudio_log", parser.Provenance("SYNTHETIC.dd", path, "", f"line {line}"),
+            "TEST/model-A", direct_tag="explicit_model_load_log", conversation_ref="TEST-CONVERSATION",
+        ) for line in (101, 112, 354)]
+
+    @staticmethod
+    def context(facts, action="application_launch"):
+        ctx = parser.AnalysisContext(Path("SYNTHETIC.dd"), source_image="SYNTHETIC.dd")
+        ctx.facts.extend(facts)
+        parser.add_candidate(ctx, action, facts, ["observed synthetic evidence"], "synthetic context",
+                             forced="suspected", timestamp=parser.iso_from_datetime("2026-10-02T00:00:00Z", "log_event"))
+        return ctx, ctx.candidates[0]
+
+    def baseline_rows(self, ctx):
+        with patch.object(parser, "candidate_artifact_paths", side_effect=self.baseline_paths), \
+                patch.object(parser, "candidate_artifact_details", side_effect=self.baseline_details):
+            return parser.timeline_rows(ctx), parser.conversation_rows(ctx)
+
+    def test_three_prefetch_files_have_one_display_and_keep_three_facts(self):
+        ctx, candidate = self.context(self.prefetch_facts())
+        before = copy.deepcopy(ctx)
+        original_facts = candidate.facts
+        paths = parser.candidate_artifact_paths(candidate)
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual([self.prefetch_facts()[0].provenance.original_artifact_path], paths)
+        self.assertTrue(details.startswith("[Prefetch] 실행 파일=LM Studio.exe, 대표 파일="))
+        self.assertIn("LM STUDIO.EXE-AAAAAAAA.pf", details)
+        self.assertIn("동일 근거=3건", details)
+        self.assertEqual(1, len(details.split(" | ")))
+        self.assertEqual(3, len(candidate.facts))
+        self.assertIs(original_facts, candidate.facts)
+        self.assertEqual(before, ctx)
+
+    def test_three_server_log_lines_have_one_deterministic_detail(self):
+        ctx, candidate = self.context(self.log_facts())
+        before = copy.deepcopy(ctx)
+        details = parser.candidate_artifact_details(candidate)
+        self.assertIn("[Server Log]", details)
+        self.assertIn("모델=TEST/model-A", details)
+        self.assertIn("대표 위치=line 101", details)
+        self.assertIn("동일 근거=3건", details)
+        self.assertEqual(1, len(details.split(" | ")))
+        self.assertEqual(3, len(candidate.facts))
+        self.assertEqual(before, ctx)
+
+    def test_different_server_log_event_types_stay_separate(self):
+        facts = self.log_facts()
+        facts[1] = replace(facts[1], fact_type="normal_exit_log", value="normal_exit_log", direct_tag="explicit_normal_exit_log")
+        _, candidate = self.context(facts)
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(2, len(details.split(" | ")))
+        self.assertIn("동일 근거=2건", details)
+        self.assertIn("이벤트=정상 종료", details)
+
+    def test_different_conversations_stay_separate(self):
+        facts = self.log_facts()
+        facts[1] = replace(facts[1], conversation_ref="OTHER-CONVERSATION")
+        _, candidate = self.context(facts)
+        self.assertEqual(2, len(parser.candidate_artifact_details(candidate).split(" | ")))
+
+    def test_different_models_and_messages_stay_separate(self):
+        facts = self.log_facts()
+        facts[1] = replace(facts[1], value="TEST/model-B")
+        facts[2] = replace(facts[2], key="OTHER-MESSAGE", message_ref="OTHER-MESSAGE")
+        _, candidate = self.context(facts)
+        self.assertEqual(3, len(parser.candidate_artifact_details(candidate).split(" | ")))
+        self.assertNotIn("동일 근거=", parser.candidate_artifact_details(candidate))
+
+    def test_different_log_source_files_stay_separate(self):
+        facts = self.log_facts()
+        facts[1] = replace(facts[1], provenance=replace(facts[1].provenance, original_artifact_path=facts[1].provenance.original_artifact_path.replace("events.log", "other.log")))
+        _, candidate = self.context(facts)
+        self.assertEqual(2, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(2, len(parser.candidate_artifact_details(candidate).split(" | ")))
+
+    def test_different_images_and_prefetch_directories_stay_separate(self):
+        facts = self.prefetch_facts()
+        facts[1] = replace(facts[1], provenance=replace(facts[1].provenance, source_image="OTHER.dd"))
+        facts[2] = replace(facts[2], provenance=replace(facts[2].provenance, original_artifact_path=facts[2].provenance.original_artifact_path.replace("volume0", "volume1")), target_path=facts[2].target_path.replace("volume0", "volume1"))
+        _, candidate = self.context(facts)
+        self.assertEqual(3, len(parser.candidate_artifact_paths(candidate)))
+        self.assertNotIn("동일 근거=", parser.candidate_artifact_details(candidate))
+
+    def test_different_prefetch_executables_stay_separate(self):
+        facts = self.prefetch_facts()
+        facts[1] = replace(facts[1], value="OTHER.EXE-BBBBBBBB.pf", provenance=replace(facts[1].provenance, original_artifact_path=facts[1].provenance.original_artifact_path.replace("LM STUDIO.EXE", "OTHER.EXE")), target_path=facts[1].target_path.replace("LM STUDIO.EXE", "OTHER.EXE"))
+        _, candidate = self.context(facts)
+        self.assertEqual(2, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(2, len(parser.candidate_artifact_details(candidate).split(" | ")))
+
+    def test_different_families_and_direct_tags_stay_separate(self):
+        facts = self.prefetch_facts()
+        facts[1] = replace(facts[1], family="filesystem")
+        facts[2] = replace(facts[2], direct_tag="")
+        _, candidate = self.context(facts)
+        self.assertEqual(3, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(3, len(parser.candidate_artifact_details(candidate).split(" | ")))
+
+    def test_conversation_attachment_and_usn_roles_all_remain(self):
+        facts = [
+            parser.ObservedFact("user_message", "conversation_state", parser.Provenance("SYNTHETIC.dd", "TEST.conversation.json", "", "/messages/0"), "TEST"),
+            parser.ObservedFact("image_metadata", "attachment", parser.Provenance("SYNTHETIC.dd", "TEST.metadata.json"), "TEST.png"),
+            UsnArtifactDetailsTests().usn_fact(0x100),
+        ]
+        _, candidate = self.context(facts, "image_upload")
+        details = parser.candidate_artifact_details(candidate)
+        for label in ("Conversation", "Attachment Metadata", "$UsnJrnl"):
+            self.assertIn(f"[{label}]", details)
+        self.assertEqual(3, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(3, len(details.split(" | ")))
+
+    def test_download_record_gguf_and_ads_roles_all_remain(self):
+        facts = [
+            parser.ObservedFact("download_completed_record", "model_state", parser.Provenance("SYNTHETIC.dd", "download-jobs-info.json", "", "/jobs/0"), "TEST.gguf"),
+            parser.ObservedFact("final_gguf", "final_file", parser.Provenance("SYNTHETIC.dd", "models/TEST.gguf"), "TEST.gguf"),
+            parser.ObservedFact("zone_identifier", "final_file", parser.Provenance("SYNTHETIC.dd", "models/TEST.gguf:Zone.Identifier"), target_path="models/TEST.gguf"),
+        ]
+        _, candidate = self.context(facts, "model_download")
+        details = parser.candidate_artifact_details(candidate)
+        for label in ("Download Record", "GGUF", "Zone.Identifier"):
+            self.assertIn(f"[{label}]", details)
+        self.assertEqual(3, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(3, len(details.split(" | ")))
+
+    def test_existing_663_usn_group_is_byte_identical(self):
+        _, candidate = UsnArtifactDetailsTests().edit_context()
+        self.assertEqual(self.baseline_details(candidate), parser.candidate_artifact_details(candidate))
+        self.assertEqual(self.baseline_paths(candidate), parser.candidate_artifact_paths(candidate))
+        self.assertEqual(664, len(candidate.facts))
+
+    def test_shuffled_fact_order_keeps_both_artifact_displays(self):
+        import random
+        facts = self.prefetch_facts() + self.log_facts()
+        _, candidate = self.context(facts)
+        expected = (parser.candidate_artifact_paths(candidate), parser.candidate_artifact_details(candidate))
+        for seed in range(5):
+            shuffled = list(facts)
+            random.Random(seed).shuffle(shuffled)
+            other = replace(candidate, facts=shuffled)
+            self.assertEqual(expected, (parser.candidate_artifact_paths(other), parser.candidate_artifact_details(other)))
+
+    def test_verdict_timestamp_behavior_and_internal_evidence_unchanged(self):
+        ctx, candidate = self.context(self.prefetch_facts() + self.log_facts())
+        before = copy.deepcopy(ctx)
+        old_rows, _ = self.baseline_rows(ctx)
+        new_rows = parser.timeline_rows(ctx)
+        self.assertEqual([r[:5] for r in old_rows], [r[:5] for r in new_rows])
+        self.assertEqual(6, len(candidate.facts))
+        self.assertEqual(before, ctx)
+        self.assertNotEqual(old_rows[0][5:], new_rows[0][5:])
+
+    def test_recovered_csv_byte_identical_and_timeline_contract(self):
+        ctx = self.analyze_files({CONV: conversation(message(), message("assistant"))})
+        launch_ctx, _ = self.context(self.prefetch_facts() + self.log_facts())
+        ctx.candidates.extend(launch_ctx.candidates)
+        ctx.facts.extend(launch_ctx.facts)
+        before = copy.deepcopy(ctx)
+        old_rows, recovered = self.baseline_rows(ctx)
+        with tempfile.TemporaryDirectory(prefix="SYNTHETIC_ARTIFACT_DISPLAY_") as temporary:
+            root = Path(temporary)
+            parser.write_csv(root / "before.csv", parser.CONVERSATION_HEADER, recovered)
+            parser.write_csv(root / "after.csv", parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+            self.assertEqual((root / "before.csv").read_bytes(), (root / "after.csv").read_bytes())
+            parser.write_csv(root / "timeline.csv", parser.TIMELINE_HEADER, parser.timeline_rows(ctx))
+            raw = (root / "timeline.csv").read_bytes()
+            self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+            rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+            self.assertEqual(parser.TIMELINE_HEADER, rows[0])
+            self.assertTrue(all(len(row) == 7 for row in rows))
+            self.assertTrue(all(cell for row in rows[1:] for cell in row))
+        self.assertEqual([r[:5] for r in old_rows], [r[:5] for r in parser.timeline_rows(ctx)])
+        self.assertEqual(before, ctx)
+
+    def test_singleton_displays_keep_baseline_wording(self):
+        for fact in (self.prefetch_facts()[0], self.log_facts()[0]):
+            _, candidate = self.context([fact])
+            self.assertEqual(self.baseline_details(candidate), parser.candidate_artifact_details(candidate))
+            self.assertEqual(self.baseline_paths(candidate), parser.candidate_artifact_paths(candidate))
+
+    def test_repeated_runtime_support_keeps_fact_count(self):
+        fact = parser.ObservedFact("http_server_runtime", "filesystem", parser.Provenance("SYNTHETIC.dd", "http-server.json"), "http-server state")
+        _, candidate = self.context([fact, replace(fact), replace(fact)])
+        self.assertIn("동일 근거=3건", parser.candidate_artifact_details(candidate))
+        self.assertEqual(3, len(candidate.facts))
+        self.assertEqual(1, len(parser.candidate_artifact_paths(candidate)))
+
+    def test_unknown_prefetch_semantics_are_not_guessed(self):
+        facts = [parser.ObservedFact("application_prefetch", "windows_os", parser.Provenance("SYNTHETIC.dd", name)) for name in ("A.pf", "B.pf", "C.pf")]
+        _, candidate = self.context(facts)
+        self.assertEqual(3, len(parser.candidate_artifact_paths(candidate)))
+        self.assertNotIn("동일 근거=", parser.candidate_artifact_details(candidate))
+
+    def test_no_path_count_limit_or_combined_detail_truncation(self):
+        facts = [replace(self.log_facts()[0], value=f"model-{index}-" + "x" * 200) for index in range(20)]
+        for index, fact in enumerate(facts):
+            facts[index] = replace(fact, provenance=replace(fact.provenance, original_artifact_path=fact.provenance.original_artifact_path.replace("events.log", f"event-{index}.log")))
+        _, candidate = self.context(facts)
+        details = parser.candidate_artifact_details(candidate)
+        self.assertEqual(20, len(parser.candidate_artifact_paths(candidate)))
+        self.assertEqual(20, len(details.split(" | ")))
+        self.assertGreater(len(details), 4000)
+
+    def test_display_does_not_expose_internal_grouping_keys(self):
+        _, candidate = self.context(self.prefetch_facts() + self.log_facts())
+        details = parser.candidate_artifact_details(candidate)
+        for forbidden in (candidate.rule_id, "application_prefetch", "model_load_log", "windows_os", "lmstudio_log", "confidence=", "Direct Evidence="):
+            self.assertNotIn(forbidden, details)
+
+    def test_all_21_rule_fixtures_preserve_non_artifact_columns(self):
+        for action, (positive, negative, _) in RULE_FIXTURES.items():
+            for files in (positive, negative):
+                with self.subTest(action=action):
+                    ctx = self.analyze_files(files)
+                    before = copy.deepcopy(ctx)
+                    old_rows, recovered = self.baseline_rows(ctx)
+                    self.assertEqual([r[:5] for r in old_rows], [r[:5] for r in parser.timeline_rows(ctx)])
+                    self.assertEqual(recovered, parser.conversation_rows(ctx))
+                    self.assertEqual(before, ctx)
 
 
 class WindowsLiveTests(unittest.TestCase):
