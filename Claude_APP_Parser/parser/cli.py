@@ -1,24 +1,35 @@
 """명령행 인터페이스.
 
   python -m parser --input <image.E01|image.dd|디렉터리> --out-dir <결과폴더>
+  python -m parser --input-type live --out-dir <결과폴더>     (실행 중인 이 PC 를 직접 분석)
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 
-from . import __version__, banner, output, pipeline
+from . import __version__, banner, locate, output, pipeline
+from .bitlocker import KEY_ENV
 from .errors import ClError
 
 
 def build_parser():
     p = argparse.ArgumentParser(
         prog="parser",
-        description="Claude Desktop 아티팩트 파서 (E01/RAW 디스크 이미지 -> JSON/CSV)")
-    p.add_argument("--input", "-i", required=True,
-                   help="E01(분할 포함)/RAW .dd/.raw 이미지 또는 추출 디렉터리")
-    p.add_argument("--input-type", choices=("auto", "image", "dir"), default="auto")
+        description="Claude Desktop 아티팩트 파서 (E01/RAW 디스크 이미지 · 실행 중인 PC -> JSON/CSV)")
+    p.add_argument("--input", "-i",
+                   help="E01(분할 포함)/RAW .dd/.raw 이미지, 추출 디렉터리, 또는 (live) 볼륨 루트. "
+                        "live 에서 생략하면 시스템 드라이브")
+    p.add_argument("--input-type", choices=("auto", "image", "dir", "live"), default="auto",
+                   help="auto=파일은 이미지, 폴더는 추출 트리 / "
+                        "live=실행 중인 이 PC 를 직접 분석 (자동 선택되지 않음, 명시해야 함)")
+    p.add_argument("--key-material", default=os.environ.get(KEY_ENV),
+                   help="BitLocker 볼륨 키 (이미지 입력): recovery:<48자리> | passphrase:<암호> | "
+                        "bek:<.BEK 경로> | fvek:<hex>. clear key·일시 중단 볼륨은 키 없이 열린다. "
+                        "환경변수 %s 로 줘도 된다 (명령행 기록에 남기지 않을 때). "
+                        "키 값은 로그·결과 파일에 남기지 않는다" % KEY_ENV)
     p.add_argument("--out-dir", "-o", default="cl_out", help="결과 출력 폴더")
     p.add_argument("--format", choices=("json", "csv", "both"), default="csv",
                    help="csv=timeline.csv + recovered_conversations.csv (기본) / "
@@ -68,13 +79,42 @@ def _utf8_console():
             pass
 
 
+def _inside_live_evidence(out_dir, live_root):
+    """출력 폴더가 라이브 탐색 경로(SCAN_ROOTS) 안이면 True — 결과를 증거 안에 쓰지 않는다."""
+    out = os.path.normcase(os.path.abspath(out_dir))
+    root = os.path.normcase(os.path.abspath(live_root))
+    try:
+        rel = os.path.relpath(out, root)
+    except ValueError:                       # 다른 드라이브
+        return False
+    if rel.startswith(".."):
+        return False
+    segs = [s for s in re.split(r"[\\/]", rel.lower()) if s and s != "."]
+    for pattern in locate.SCAN_ROOTS:
+        pat = pattern.lower().split("/")
+        if len(segs) >= len(pat) and all(re.fullmatch(re.escape(p).replace(r"\*", ".*"), s)
+                                         for p, s in zip(pat, segs)):
+            return True
+    return False
+
+
 def main(argv=None):
     _utf8_console()
-    args = build_parser().parse_args(argv)
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not args.input:
+        if args.input_type != "live":
+            ap.error("--input 이 필요합니다 (--input-type live 일 때만 생략 가능)")
+        args.input = os.environ.get("SystemDrive", "C:") + os.sep
     kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip())
 
     if not args.no_banner and not args.quiet:
         print(banner.render())
+
+    if args.input_type == "live" and _inside_live_evidence(args.out_dir, args.input):
+        print("출력 폴더가 분석 대상(Claude 저장 경로) 안에 있습니다 — 다른 곳을 지정하세요: %s"
+              % os.path.abspath(args.out_dir), file=sys.stderr)
+        return 2
 
     existing = [f for f in OUTPUT_FILES if os.path.exists(os.path.join(args.out_dir, f))]
     if existing and not args.overwrite:
@@ -86,7 +126,8 @@ def main(argv=None):
         result = pipeline.run(args.input, input_type=args.input_type, kinds=kinds,
                               max_excerpt=args.max_excerpt, usn=not args.no_usn,
                               verbose=args.verbose,
-                              usn_max_bytes=args.usn_max_bytes)
+                              usn_max_bytes=args.usn_max_bytes,
+                              key_material=args.key_material)
     except ClError as exc:
         payload = {"status": "failed", **exc.to_dict()}
         print(json.dumps(payload, ensure_ascii=False, indent=2), file=sys.stderr)
@@ -106,6 +147,13 @@ def main(argv=None):
     if not args.quiet:
         s = result["summary"]
         print("입력      : %s" % result["input"]["image_id"])
+        if result["input"].get("image_type") == "live":
+            print("라이브    : %s, 수집 %s, 관리자 권한 %s"
+                  % (result["input"]["os"], result["input"]["collected_at_utc"],
+                     {True: "예", False: "아니오"}.get(result["input"]["elevated"], "확인 불가")))
+        for vd in (result["filesystem"].get("volumes") or []):
+            if vd.get("encryption"):
+                print("BitLocker : 파티션 %d 해제 (%s)" % (vd["index"], vd["unlock_method"]))
         print("스캔 파일 : %d, Claude 경로 %d건, 파싱 대상 %d건"
               % (result["scan"]["files_scanned"],
                  result["scan"]["claude_paths_found"],

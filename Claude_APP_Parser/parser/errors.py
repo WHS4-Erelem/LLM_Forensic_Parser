@@ -34,6 +34,19 @@ class UnsupportedFormatError(ClError):
     code = "UNSUPPORTED_FORMAT"
 
 
+class VolumeLockedError(ClError):
+    """BitLocker 볼륨을 풀지 못함 (키 없음·키 틀림·dissect.fve 없음). 빈 결과로 숨기지 않는다.
+
+    코드 이름은 팀 ChatGPT Desktop 파서와 같다 (통합기가 같은 오류로 묶을 수 있게).
+    """
+    code = "VOLUME_LOCKED"
+
+
+class LiveAccessError(ClError):
+    """라이브 분석 대상 볼륨 루트를 읽을 수 없음."""
+    code = "LIVE_ACCESS_FAILED"
+
+
 class FilesystemError(ClError):
     """파일시스템 구조 판독 실패."""
     code = "FILESYSTEM_ERROR"
