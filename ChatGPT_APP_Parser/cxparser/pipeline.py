@@ -1,6 +1,8 @@
 """전체 파이프라인: 이미지 입력 -> 아티팩트 탐색 -> 파싱 -> 정규화 -> 타임라인."""
 
 import os
+import re
+import subprocess
 import time
 
 from . import derive, locate, timeline, usn as usn_mod
@@ -15,7 +17,7 @@ from .artifacts import sqlitedb as sqlite_art
 from .artifacts import webcache_conv as webcache_art
 from .errors import CxError, UnsupportedFormatError
 from .model import RecordBuilder
-from .vfs import DirectoryVfs, TskImageVfs
+from .vfs import DirectoryVfs, LiveVfs, TskImageVfs
 
 PARSERS = {
     "rollout": rollout_art.parse,
@@ -33,18 +35,51 @@ DEFAULT_KINDS = ("rollout", "rollout_loose", "session_index", "global_state", "a
                  "sqlite", "prefetch", "recent_lnk", "webcache")
 
 
+def _pid_of(process_uuid):
+    """logs_2.sqlite 의 process_uuid 'pid:6884:8a5…' → 6884. 다른 형식이면 None."""
+    m = re.match(r"pid:(\d+):", str(process_uuid or ""))
+    return int(m.group(1)) if m else None
+
+
+def _running_codex_pids():
+    """지금 실행 중인 Codex/ChatGPT 프로세스의 pid 집합. Windows 의 tasklist 를 쓴다 — 그 밖의 환경이나 조회 실패는 빈 집합
+    (종료 행을 그대로 둔다). pid 재사용에 대비해 실행 파일 이름도 확인한다."""
+    if os.name != "nt":
+        return set()
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, timeout=30).stdout.decode("ascii", "ignore")
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in out.splitlines():
+        cols = [c.strip('"') for c in line.split('","')]
+        if len(cols) > 1 and cols[0].lower().startswith(("codex", "chatgpt")) and cols[1].isdigit():
+            pids.add(int(cols[1]))
+    return pids
+
+
+# 파싱 대상 파일 하나의 크기 상한. 파일을 통째로 메모리에 읽으므로 상한은 두되, 오래 쓴 PC 의 대화 DB
+# (thread_history_1.sqlite 가 두 달 사용에 94MB)가 걸리지 않게 넉넉히 잡는다. CLI --max-file-mb 로 바꾼다.
+DEFAULT_MAX_FILE_BYTES = 1024 * 1024 * 1024
+
+
 class Result(dict):
     pass
 
 
 def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
-        max_file_bytes=64 * 1024 * 1024, usn=True, usn_max_bytes=None, key_material=None):
+        max_file_bytes=DEFAULT_MAX_FILE_BYTES, usn=True, usn_max_bytes=None, key_material=None):
     started = time.time()
     warnings = []
     errors = []
 
     # --- 1. 입력 열기 -------------------------------------------------
-    if input_type == "dir" or (input_type == "auto" and os.path.isdir(input_path)):
+    if input_type == "live":
+        vfs = LiveVfs(input_path)
+        image_desc = vfs.describe_input()
+        img = None
+        fs_desc = vfs.describe()
+    elif input_type == "dir" or (input_type == "auto" and os.path.isdir(input_path)):
         vfs = DirectoryVfs(input_path)
         image_desc = {
             "image_id": os.path.abspath(input_path),
@@ -95,6 +130,13 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         if kind in kinds:
             targets.append((kind, vfile, meta))
 
+    denied = getattr(vfs, "denied", None)
+    if denied:
+        denied = sorted(denied, key=lambda p: (p.count("/"), p))           # 얕은 경로(영향이 큰 것) 먼저
+        warnings.append("권한이 없어 읽지 못한 탐색 폴더 %d곳: %s%s — 관리자 권한으로 실행하면 포함된다 "
+                        "(Windows/Prefetch 가 빠지면 Prefetch 기반 실행 기록이 없다)"
+                        % (len(denied), ", ".join(denied[:6]), " 외 %d곳" % (len(denied) - 6) if len(denied) > 6 else ""))
+
     if not inventory:
         # 음성 대조(negative control) 이미지에서는 "없음" 이 정상 결과다 — 오류가 아니라 0건 + 경고로 끝낸다.
         # 진짜 입력 오류(이미지 안 열림, NTFS 없음)는 그 전 단계에서 CxError 로 이미 걸러진다.
@@ -113,7 +155,8 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     for kind, vfile, _meta in sorted(targets, key=lambda t: t[1].path):
         if vfile.size > max_file_bytes:
             errors.append({"code": "FILE_TOO_LARGE", "path": vfile.path,
-                           "size": vfile.size, "limit": max_file_bytes})
+                           "size": vfile.size, "limit": max_file_bytes,
+                           "message": "파싱 대상 파일이 크기 상한을 넘어 건너뜀 — --max-file-mb 로 상한을 올릴 수 있다"})
             continue
         parser = PARSERS[kind]
         try:
@@ -135,6 +178,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                                  "mft_record": vfile.mft_record})
         except CxError as exc:
             errors.append({"path": vfile.path, **exc.to_dict()})
+        except OSError as exc:            # 라이브 분석: 실행 중인 앱이 잠근 파일, 권한 없는 파일 — 그 파일만 건너뛴다
+            errors.append({"path": vfile.path, "code": "READ_FAILED",
+                           "message": "%s: %s" % (type(exc).__name__, exc)})
         except Exception as exc:  # noqa: BLE001
             errors.append({"path": vfile.path, "code": "UNEXPECTED",
                            "message": "%s: %s" % (type(exc).__name__, exc)})
@@ -169,6 +215,16 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     # --- 3c. 파생 규칙: 관찰 레코드끼리 대조해 로그인·계정 전환·첨부 업로드를 올린다 --------
     records.extend(derive.derive(records, rb))
 
+    # --- 3d. 라이브 분석: 지금 실행 중인 앱 프로세스는 "로그가 끝났다 = 종료" 가 성립하지 않는다 --------
+    if input_type == "live":
+        running = _running_codex_pids()
+        still = [r for r in records if r["event"]["event_id"] == "E08-02"
+                 and _pid_of((r.get("details") or {}).get("process_uuid")) in running]
+        if still:
+            records = [r for r in records if r not in still]
+            warnings.append("수집 시점에 Codex 프로세스가 실행 중(pid %s) — 그 프로세스의 종료 행은 만들지 않았다"
+                            % ", ".join(str(_pid_of(r["details"]["process_uuid"])) for r in still))
+
     tl = timeline.build(records)
     status_counts = {}
     for r in records:
@@ -176,7 +232,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.15",
+        "tool": {"name": "cxparser", "version": "0.3.22",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

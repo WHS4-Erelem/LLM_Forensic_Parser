@@ -60,7 +60,7 @@ def _target_info(vfile, win_path):
     f = _open_target(vfile, win_path)
     if f is None:
         host_stat = getattr(vfile._source, "host_stat", None)
-        m = host_stat(win_path[2:]) if host_stat and win_path and len(win_path) > 2 else None
+        m = host_stat(win_path) if host_stat and win_path and len(win_path) > 2 else None   # 드라이브 문자는 host_stat 이 처리
         if not m:
             return None, None, None
         head = bytes.fromhex(m.get("head_hex") or "")
