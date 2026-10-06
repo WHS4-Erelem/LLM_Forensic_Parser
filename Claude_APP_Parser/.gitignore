@@ -10,3 +10,7 @@ result.json
 *.dd
 *.raw
 *.001
+# 가상환경
+.venv*/
+# 테스트용으로 내려받는 BitLocker 볼륨 (dissect.fve, AGPL-3.0 데이터)
+tests/_data/bde/

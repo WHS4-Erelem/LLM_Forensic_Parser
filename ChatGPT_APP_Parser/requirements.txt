@@ -1,3 +1,5 @@
 pytsk3==20260715
 # Windows 휠은 Python 3.10~3.12 만 제공 (3.13+ 는 소스 빌드 필요)
 libewf-python==20240506
+# BitLocker 볼륨 해제 (없으면 BitLocker 이미지만 VOLUME_LOCKED 로 거절, 나머지는 그대로 동작)
+dissect.fve==4.6

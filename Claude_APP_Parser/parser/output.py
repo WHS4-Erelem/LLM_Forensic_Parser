@@ -87,9 +87,13 @@ def _one_line(v, limit=300):
 
 
 def _winpath(r):
-    """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...'"""
-    p = ((r.get("evidence") or {}).get("location") or {}).get("path") or ""
-    return "C:" + p.replace("/", "\\") if p else ""
+    """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...'
+
+    라이브 분석은 실제로 읽은 위치를 쓴다 (D:\\ 를 분석했으면 D:\\Users\\…).
+    """
+    loc = (r.get("evidence") or {}).get("location") or {}
+    p = loc.get("path") or ""
+    return (loc.get("live_root") or "C:") + p.replace("/", "\\") if p else ""
 
 
 def _behavior_details(r, titles):
@@ -118,6 +122,7 @@ def _artifact_details(r, titles):
           ("volume", "ntfs@%s" % loc["partition_offset_bytes"]
            if loc.get("partition_offset_bytes") is not None else None),
           ("삭제 엔트리", "True" if loc.get("allocated") is False else None),
+          ("수집", "live" if loc.get("time_source") else None),
           ("규칙", r["event"]["event_id"]),
           ("패키지", PACKAGE_NAME)]
     return "[%s] " % tag + ", ".join("%s=%s" % (k, _one_line(v, 120))

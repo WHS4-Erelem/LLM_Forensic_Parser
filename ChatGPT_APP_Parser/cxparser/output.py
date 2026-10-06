@@ -32,8 +32,9 @@ _ROLE = {"user": "user", "assistant": "assistant",
 _TAG = {"rollout_jsonl": "Rollout", "codex_global_state": "GlobalState", "codex_sqlite": "SQLite",
         "prefetch": "Prefetch", "recent_lnk": "Recent", "webcache": "WebCache", "package_dir": "PackageDir",
         "session_index_jsonl": "SessionIndex", "auth_json": "Auth", "usn_journal": "USN"}
-# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위)
-_CORE_KEYS = ("text", "prompt_text", "title", "model_slug", "file_name", "key", "log_body")
+# Behavior_details 의 '<흔적 성격>_<내용>' 에서 <내용> 으로 쓸 값 (우선순위).
+# file_name 이 title 보다 앞: 채팅 모드 첨부 업로드 레코드는 대화 제목도 갖고 있어, 제목이 앞서면 파일명이 가려지고 첨부 여러 개가 같은 행이 된다
+_CORE_KEYS = ("text", "prompt_text", "file_name", "title", "model_slug", "key", "log_body")
 
 
 def write_json(path, payload):
@@ -77,9 +78,15 @@ def _one_line(v, limit=300):
 
 def _winpath(r):
     """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...' (공유본 표기).
-    ponytail: 드라이브 문자는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
-    p = ((r.get("evidence") or {}).get("location") or {}).get("path") or ""
-    return "C:" + p.replace("/", "\\") if p else ""
+    라이브 분석은 실제 드라이브 문자를 안다(location.drive). 드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
+    ponytail: 이미지·추출 폴더는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
+    loc = (r.get("evidence") or {}).get("location") or {}
+    p, drive = loc.get("path") or "", loc.get("drive")
+    if not p:
+        return ""
+    if drive == "":
+        return p
+    return (drive or "C:") + p.replace("/", "\\")
 
 
 def _behavior_details(r, titles):

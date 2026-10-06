@@ -1,7 +1,8 @@
 # Claude Desktop 아티팩트 파서
 
 Windows 디스크 이미지(E01 / RAW)에서 Claude Desktop 의 사용자 행위와 대화를 복원한다.
-이미지를 마운트하지 않고 읽기 전용으로만 연다.
+이미지를 마운트하지 않고 읽기 전용으로만 연다. BitLocker 로 암호화된 볼륨은 키를 받아
+풀어서 읽고, 이미지 없이 실행 중인 Windows PC 를 직접 분석(라이브)할 수도 있다.
 
 설치 형태 세 가지를 모두 찾는다.
 
@@ -29,6 +30,7 @@ python -m pip install -r requirements.txt
 | `libewf-python` | E01 열기, 분할 세그먼트 검증 | RAW 이미지만 분석할 수 있다 |
 | `ccl-chromium-reader` | IndexedDB 정식 파싱 | 멈추지 않지만 대화의 발화자와 전송 시각을 복원하지 못한다 |
 | `zstandard` | HTTP 캐시 응답 압축 해제 | 멈추지 않지만 캐시의 압축 구간 안을 보지 못한다 |
+| `dissect.fve` | BitLocker 볼륨 해제 (`pycryptodome` 이 함께 설치된다) | BitLocker 파티션만 `VOLUME_LOCKED` 로 멈춘다. 일반 이미지·라이브 입력은 그대로 동작한다 |
 
 ## 실행
 
@@ -43,10 +45,11 @@ python run_parser.py --input "D:\case\image.E01" --out-dir "D:\case\out" --forma
 
 | 옵션 | 역할 |
 | --- | --- |
-| `--input`, `-i` | E01(분할 포함) / RAW `.dd` `.raw` 이미지 또는 추출 디렉터리 |
+| `--input`, `-i` | E01(분할 포함) / RAW `.dd` `.raw` 이미지, 추출 디렉터리, 또는 (라이브) 볼륨 루트 |
 | `--out-dir`, `-o` | 결과 폴더 (기본 `cl_out`) |
 | `--format` | `csv` CSV 2종 (기본) / `json` 전체 레코드와 근거 / `both` |
-| `--input-type` | `auto`(기본) / `image` / `dir` |
+| `--input-type` | `auto`(기본) / `image` / `dir` / `live` (라이브는 자동 선택되지 않는다) |
+| `--key-material` | BitLocker 키: `recovery:<48자리>` / `passphrase:<암호>` / `bek:<.BEK 경로>` / `fvek:<hex>`. 환경변수 `ERELM_KEY_MATERIAL` 로도 받는다 |
 | `--kinds` | 파싱할 아티팩트 종류 제한 (쉼표 구분, 기본은 전체) |
 | `--max-excerpt` | 근거 발췌 최대 길이 (기본 500자) |
 | `--no-usn` | `$UsnJrnl:$J` 분석 생략 |
@@ -59,6 +62,48 @@ python run_parser.py --input "D:\case\image.E01" --out-dir "D:\case\out" --forma
 
 기본이 덮어쓰기 거부인 것은 이전 실행 결과와 새 결과가 한 폴더에 섞이는 것을 막기
 위해서다. 같은 폴더에 다시 내려면 `--overwrite` 를 준다.
+
+### BitLocker 이미지
+
+```
+set ERELM_KEY_MATERIAL=recovery:123456-123456-123456-123456-123456-123456-123456-123456
+python run_parser.py --input "D:\case\image.E01" --out-dir "D:\case\out"
+```
+
+파티션 선두의 `-FVE-FS-` 로 BitLocker 를 알아보고 `dissect.fve` 로 푼 뒤, 복호화된
+볼륨을 일반 NTFS 와 같은 경로로 읽는다 (MFT·삭제 엔트리·`$UsnJrnl` 포함). 키 형식과
+환경변수 이름은 팀의 다른 파서(Claude Web · ChatGPT)와 같다.
+
+| 볼륨 상태 | 결과 |
+| --- | --- |
+| clear key (보호 일시 중단 등) · 복호화 완료 | 키 없이 열린다 |
+| 복구 키 · 암호 · BEK · FVEK 를 줌 | 그 키로 연다 |
+| 키가 없거나 틀림 | `VOLUME_LOCKED` (종료코드 2). 볼륨의 키 보호자 목록을 함께 출력한다 |
+| 평문 볼륨 + 잠긴 볼륨 | `VOLUME_LOCKED`. 복구 파티션 같은 평문 볼륨만 읽고 "아티팩트 없음" 으로 끝내지 않는다 |
+
+키는 명령행 기록에 남지 않게 환경변수로 주는 것을 권한다. 키 값은 콘솔·로그·결과
+파일 어디에도 쓰지 않고, 어떤 방법으로 풀었는지(`unlock_method`)만 `result.json`
+의 `filesystem.volumes` 에 남긴다. 무차별 대입이나 우회는 하지 않는다.
+
+### 라이브 분석 (실행 중인 PC)
+
+```
+python run_parser.py --input-type live --out-dir "D:\out"
+```
+
+이미지를 뜨지 않고 지금 이 PC 의 `C:\`(시스템 드라이브)에서 Claude Desktop 저장 경로를
+찾아 읽는다. 다른 드라이브나 마운트 폴더는 `--input D:\` 로 준다.
+
+- 이미지 분석과 **같은 탐색 경로**(설치 형태 세 가지 + 앱 로그 + 프리패치)만 본다.
+  디스크 전체를 훑지 않는다. 판정 규칙도 이미지와 같다.
+- 원본은 **읽기 전용**으로만 연다. 복사본이나 임시 파일을 원본 경로에 만들지 않고,
+  출력 폴더가 탐색 경로 안이면 실행을 거부한다.
+- 실행 중인 앱이 잡고 있는 파일(HTTP 캐시 등)도 다른 프로세스와 공유하는 읽기로 연다.
+  그래도 못 읽은 파일은 `filesystem.read_failures` 와 경고로 남긴다.
+- 관리자 권한이 아니면 `C:\Windows\Prefetch` 와 `C:\Program Files\WindowsApps` 를 볼 수
+  없다. 열지 못한 폴더는 `filesystem.denied` 에 남는다.
+- 파일 시각·MFT 번호는 `os.stat` 값이고, 그 출처를 근거의 `time_source` 에 적는다.
+  `Artifact_details` 에는 `수집=live` 가 붙는다.
 
 ## 출력
 
@@ -154,6 +199,23 @@ user_messages        그중 사용자가 입력한 것
 결과가 적게 나오는 것과 파서가 실패한 것은 다르며, 후자는 `result.json` 의 `errors` 와
 `warnings` 에 남는다.
 
+## 테스트
+
+```
+python -m unittest discover -s tests -v
+```
+
+| 파일 | 확인하는 것 |
+| --- | --- |
+| `tests/test_bitlocker.py` | 해제 방식별(복구 키·암호·BEK·clear key·복호화 완료) 열기, 키 없음·틀린 키·형식 오류의 잠김 처리, 키 값 비노출, 평문 이미지 결과 불변 |
+| `tests/test_live.py` | 라이브 결과가 이미지 입력과 같은 행위·시각·판정인지, 원본 불변, 탐색 범위, 증거 안 출력 거부, 실행 중인 앱이 잡은 파일 읽기, 독점 잠금 파일 보고 |
+
+BitLocker 시험은 처음 실행할 때 `dissect.fve` 저장소의 BitLocker 테스트 볼륨(고정
+커밋, AGPL-3.0 데이터라 저장소에는 넣지 않음)을 `tests/_data/bde/` 로 내려받는다.
+그 볼륨은 데이터 영역이 비어 있어서, `tests/_data/claude_ntfs.img.gz`(합성 Claude
+아티팩트, `tests/make_ntfs_fixture.sh` 로 생성)를 그 볼륨의 키로 암호화해 채운 뒤
+분석한다 (`tests/bde_fixture.py`). 오프라인이면 해당 시험만 건너뛴다.
+
 ## 알려진 한계
 
 | 항목 | 내용 |
@@ -166,6 +228,10 @@ user_messages        그중 사용자가 입력한 것
 | 다운로드 폴더 | 파일 다운로드는 Claude 경로 밖에서 일어나 현재 탐색 범위가 아니다 |
 | 다른 제품 | Claude Code(CLI), Claude Web, 이름만 겹치는 다른 앱의 경로는 제외하고 건수를 경고로 남긴다 |
 | NTFS 압축 | 압축 속성이 켜진 `$DATA` 는 해제하지 않는다 |
+| BitLocker | AES-XTS(Windows 10 이후 기본)는 빠른 복호화 경로를 쓰고, 그 외 방식은 `dissect.fve` 기본 경로라 느리다. 실제 BitLocker 시나리오 이미지(68.7GB, clear key)에서 Claude 아티팩트 152개 전부를 독립 구현(`dissect.fve` 기본 복호화 + `dissect.ntfs`)과 해시 대조해 일치를 확인했다 |
+| 초기화 크기(VDL) | 미리 할당된 파일(캐시 `data_N` 등)은 초기화 크기 뒤를 NTFS 규칙대로 0 으로 읽는다. 그 뒤에 디스크에 남은 옛 바이트(잔존 데이터)는 파일 내용으로 보지 않으며 현재 분석하지 않는다 |
+| 라이브 분석 재현성 | 실행 중인 시스템을 읽으므로 같은 결과를 다시 만들 수 없고, 읽는 동안 앱이 파일을 바꿀 수 있다. 증거 보존이 필요하면 이미지를 뜬다 |
+| 라이브 분석 범위 | 삭제 파일과 `$UsnJrnl:$J` 는 다루지 않는다 (볼륨을 원시로 열지 않는다). MFT 변경 시각은 얻을 수 없어 비워 둔다. 마지막 접근 시각은 운영체제 설정에 따라 갱신될 수 있다 |
 
 ## 구조
 
