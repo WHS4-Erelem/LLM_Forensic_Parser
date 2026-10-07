@@ -80,7 +80,7 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 
 규칙
 - 파서는 손대지 않는다. 실행 방법은 `parsers.json` 레지스트리에만 적는다.
-- 파서가 확장자를 검사해 거절하는 경우에만 레지스트리 `inputs` 에 지원 확장자를 선언한다 (현재 claude_desktop·gemini_web·lmstudio). 선언이 없으면 검사하지 않는다. 담당자가 파서의 허용 목록을 넓히면 이 선언도 같이 갱신한다.
+- 파서가 확장자를 검사해 거절하는 경우에만 레지스트리 `inputs` 에 지원 확장자를 선언한다 (현재 gemini_web·lmstudio. claude_desktop 은 확장자가 아니라 파일 시그니처로 판별하므로 선언하지 않는다). 선언이 없으면 검사하지 않는다. 담당자가 파서의 허용 목록을 넓히면 이 선언도 같이 갱신한다.
 - 입력 이미지: E01 분할(.E01~)과 raw 분할(.001, .002 …)은 첫 세그먼트 경로만 주면 나머지를 모아 결번을 검사한다. `.dd`/`.raw`/`.img` 단일 파일도 된다.
 - `[Runner]` 가 `OK events=0 messages=0` 이면 콘솔에 0건 표시가 붙고 보고서의 `artifacts_found` 가 false 다. 흔적이 없는 것인지 파서가 입력을 못 읽은 것인지는 `<파서명>\run.log` 로 구분한다.
 - `artifact_path` 는 파서 표기 그대로 두고, 검색·중복 판별은 `artifact_path_normalized` 로 한다 (드라이브 문자 추정 안 함).
