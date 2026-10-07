@@ -78,8 +78,9 @@ def _one_line(v, limit=300):
 
 def _winpath(r):
     """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...' (공유본 표기).
-    라이브 분석은 실제 드라이브 문자를 안다(location.drive). 드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
-    ponytail: 이미지·추출 폴더는 C: 로 가정 — 파티션→문자 매핑은 이미지에 없음 (필요 시 details.partition_index 로 구분)"""
+    드라이브 문자는 location.drive — 이미지는 볼륨별로 SYSTEM\\MountedDevices 에서(0.3.24), 라이브는 실제 문자.
+    드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
+    ponytail: location.drive 가 없으면(추출 폴더, 하이브 없는 이미지, 문자 없는 파티션) C: 로 가정"""
     loc = (r.get("evidence") or {}).get("location") or {}
     p, drive = loc.get("path") or "", loc.get("drive")
     if not p:
