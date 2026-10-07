@@ -28,10 +28,11 @@ class VfsFile:
     def __init__(self, path, size, source, *, mft_record=None, sequence=None,
                  allocated=True, si_times=None, fn_times=None, volume_index=None,
                  volume_offset=None, native_path=None, parse_errors=None,
-                 path_source=None):
+                 path_source=None, drive=None):
         self.path = path                    # '/Users/x/.codex/...' (소스 내부 경로)
         self.size = size
         self._source = source
+        self.drive = drive                  # 이미지: 이 볼륨의 드라이브 문자 (SYSTEM\MountedDevices 로 확인된 경우만)
         self.mft_record = mft_record
         self.sequence = sequence
         self.allocated = allocated
@@ -64,7 +65,8 @@ class VfsFile:
             loc["partition_offset_bytes"] = self.volume_offset
         if self.native_path:
             loc["native_path"] = self.native_path
-        drive = getattr(self._source, "drive", None)     # 라이브 분석만: 실제 드라이브 문자 ('' = 드라이브 문자가 없는 시스템)
+        # 실제 드라이브 문자: 이미지는 볼륨별(MountedDevices), 라이브는 소스 전체 ('' = 드라이브 문자가 없는 시스템)
+        drive = self.drive if self.drive is not None else getattr(self._source, "drive", None)
         if drive is not None:
             loc["drive"] = drive
         if self.si_times:
@@ -89,7 +91,7 @@ class TskImageVfs:
         try:
             vs = pytsk3.Volume_Info(img)
             bs = vs.info.block_size
-            scheme = {1: "MBR", 8: "GPT"}.get(int(vs.info.vstype), str(vs.info.vstype))
+            scheme = {int(pytsk3.TSK_VS_TYPE_DOS): "MBR", int(pytsk3.TSK_VS_TYPE_GPT): "GPT"}.get(int(vs.info.vstype), str(vs.info.vstype))   # GPT 는 0x10 (0.3.24 까지 8 로 적어 '16' 으로 나왔다)
             parts = [(p.start * bs, p.len * bs, p.desc.decode("utf-8", "replace"), scheme)
                      for p in vs if int(p.flags) & int(pytsk3.TSK_VS_PART_FLAG_ALLOC)]
         except TSK_ERRORS:
@@ -131,6 +133,11 @@ class TskImageVfs:
                 "이미지에서 판독 가능한 NTFS 볼륨을 찾지 못했습니다",
                 partitions=[{"offset_bytes": p[0], "type": p[2]} for p in parts],
                 skipped=self.skipped)
+        from . import mounted_devices      # 볼륨 → 드라이브 문자 (vd['drive']). 못 찾으면 출력은 종전대로 C: 가정
+        try:
+            self.drive_letters = mounted_devices.assign(img, parts[0][3], bs if parts[0][3] != "NONE" else 512, self.volumes)
+        except Exception as exc:  # noqa: BLE001 — 드라이브 문자 판정 실패는 분석을 멈출 이유가 아니다
+            self.drive_letters = {"status": "드라이브 문자 판정 실패 (%s) — C: 로 가정" % str(exc)[:100]}
 
     def iter_files(self):
         for vd, fs in self.volumes:
@@ -200,7 +207,7 @@ class TskImageVfs:
                      allocated=name_alloc and meta_alloc,
                      si_times=_si_times(meta), fn_times=fn.get("times"),
                      volume_index=vd["index"], volume_offset=vd["offset_bytes"],
-                     parse_errors=errors, path_source=path_source)
+                     parse_errors=errors, path_source=path_source, drive=vd.get("drive"))
         vf._fs = fs
         return vf
 
@@ -219,6 +226,7 @@ class TskImageVfs:
         return {
             "reader": "The Sleuth Kit %s (pytsk3)" % pytsk3.TSK_VERSION_STR,
             "volumes": [vd for vd, _fs in self.volumes],
+            "drive_letters": self.drive_letters,
             "skipped_partitions": self.skipped,
             "scan_roots": list(SCAN_ROOTS),
             "scan_note": ("SCAN_ROOTS 하위 디렉터리 열거(할당/삭제 이름) + 부모가 그 하위인 "
