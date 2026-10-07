@@ -27,7 +27,7 @@ from ..discovery import _join_source_path
 #   timeline.csv                → "사용자가 언제 무엇을 했는가"  (팀 행위 분류 체계에 있는 Event 1건 = 1 row, 시각순)
 #   recovered_conversations.csv → "사용자가 LLM 과 어떤 대화를 했는가" (복구된 메시지 1건 = 1 row)
 # 새 판정을 만들지 않고, 복구되지 않은 내용을 채우지 않는다. 메시지 수와 행 수는 정확히 일치한다.
-# timeline.csv 행 수는 Event 수와 다를 수 있다 — CSV_NON_TEAM_ACTIONS 는 최종 행을 만들지 않는다 (아래 참조).
+# timeline.csv 행 수는 Event 수와 다를 수 있다 — 팀 행위 목록 밖 action 은 최종 행을 만들지 않는다 (아래 참조).
 # 시각은 KST(+09:00) 표기이며 원본 raw·UTC 는 events.csv / JSON 에 그대로 남아 있다.
 
 # 컬럼 이름·순서는 팀 공통 CSV 형식에 맞춘다. "Behavior_details " / "Artifact_details " / "message order" 의
@@ -43,7 +43,8 @@ CSV_RECOVERED_CONVERSATION_COLUMNS = (
 CSV_FINAL_MODEL = "chatgpt-web"  # 최종 CSV 표기. 내부 SERVICE("chatgpt_web") 는 그대로 둔다.
 
 # action(내부 Rule 코드) → 최종 CSV 의 사람이 읽는 행위 이름. 최종 CSV 표기에만 쓰고 Rule·판정은 바꾸지 않는다.
-# 의미를 코드에서 확인한 action 만 넣는다. 없는 action 은 내부 코드 문자열을 그대로 출력한다 (잘못 번역하지 않는다).
+# 의미를 코드에서 확인한 action 만 넣는다 (잘못 번역하지 않는다). 여기 없는 action 은 최종 timeline 행을
+# 만들지 않는다 — csv_final_user_behavior() 참조. 탐지·Event·근거는 그대로 남는다.
 CSV_USER_BEHAVIOR_LABELS = {
     "LOGIN": "로그인",
     "LOGOUT": "로그아웃",
@@ -57,8 +58,12 @@ CSV_USER_BEHAVIOR_LABELS = {
     "CONVERSATION_DELETE": "기존 대화 삭제",  # 팀 분류 체계의 이름 (Rule 이 보는 것은 개별 대화 1건의 삭제다)
     "PROMPT_DRAFT": "사용자 프롬프트 입력/전송",  # 팀 행위 분류 체계: 초안은 별도 행위가 아니라 전송 미확인(의심) 으로 표기 (2026-09-23)
     "PROMPT_SEND": "사용자 프롬프트 입력/전송",
+    # FILE_UPLOAD 는 csv_final_upload_behavior() 가 첨부 MIME 으로 문서/이미지를 가릴 때만 최종 행위가 된다.
+    # 아래 값은 종류를 가리지 못한 업로드의 내부 표기이며 최종 CSV 에는 쓰지 않는다 (FILE_DOWNLOAD 와 같다).
     "FILE_UPLOAD": "파일 업로드",
     "FILE_UPLOAD_DELETE": "업로드한 파일 삭제",
+    # FILE_DOWNLOAD 는 csv_final_download_behavior() 가 evidence 로 문서/생성 이미지를 가릴 때만
+    # 최종 행위가 된다. 아래 값은 종류를 가리지 못한 다운로드의 내부 표기이며 최종 CSV 에는 쓰지 않는다.
     "FILE_DOWNLOAD": "파일 다운로드",
     "IMAGE_GENERATION_REQUEST": "이미지 생성 요청",
     "SHARE_LINK": "공유 링크 생성",
@@ -92,14 +97,121 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
 #   CONVERSATION_ACCESS            대화 열람 — 회의에서 개별 삭제 확정 ("무려 29개나, 얘도 그냥 지우는 걸로")
 #   PROFILE_ACCESS                 프로필 화면 접근 — 분석표에 없는 파서 고유 행위
 #   CONVERSATION_REMOVED_FROM_LIST 대화 목록에서 사라짐 — 기존 대화 삭제 판정의 보조 근거로만 남긴다
-#   FILE_UPLOAD / FILE_UPLOAD_DELETE  분석표는 종류별(이미지/문서)로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
-# label 이 아예 없는 action 은 여기 들어오지 않는다. 내부 코드가 그대로 출력되어 통합기가 시끄럽게 알리는 쪽이
-# 조용히 사라지는 것보다 안전하다 (새 Rule 을 추가하고 이름을 정하지 않은 경우).
+#   FILE_UPLOAD                    파일 업로드 — 첨부 MIME 으로 문서/이미지 업로드를 가려 낸다
+#                                  (csv_final_upload_behavior). 상위 이름 자체는 분석표에 없어 여기 남는다.
+#   FILE_UPLOAD_DELETE             업로드한 파일 삭제 — 분석표는 종류별로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
+# label 이 아예 없는 action 은 이 집합에 들어오지 않지만 최종 timeline 에서 빠지는 결과는 같다
+# (csv_final_user_behavior() 가 팀 목록 대조 하나로 판단한다). 내부 action 코드를 User_behavior 로
+# 내보내는 fallback 은 두지 않는다 — 팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다 (2026-10-01 확정).
+# 이름을 정하지 않은 새 Rule 이 조용히 묻히는 것은 test 로 막는다
+# (test_every_shipped_detector_action_has_a_team_label: 배포된 action 전부에 팀 목록 라벨이 있어야 한다).
 CSV_NON_TEAM_ACTIONS = frozenset(action for action, label in CSV_USER_BEHAVIOR_LABELS.items()
                                  if label not in CSV_TEAM_USER_BEHAVIORS)
 
 # action_status → 팀 형식. Parser 가 만드는 값은 이 둘뿐이라 매핑에 없으면 원문을 그대로 둔다.
 CSV_VERDICT_LABELS = {"DETECTED": "확정", "CANDIDATE": "의심"}
+
+
+# --- 다운로드: 종류가 evidence 로 확인될 때만 최종 행위로 올린다 (2026-10-05 팀 결정) ---
+# generic "파일 다운로드" 는 최종 timeline 에 내지 않는다. 확장자만으로 승격하지 않는다 —
+# ChatGPT 가 파일을 내려 주는 경로(backend-api/estuary/content 등) 에서 시작했는지와 MIME 을 함께 본다.
+# 판별되지 않는 다운로드는 FILE_DOWNLOAD Event·Evidence 로 그대로 남고 최종 행만 만들지 않는다.
+CSV_DOCUMENT_MIME_PREFIXES = (
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.",   # docx / xlsx / pptx
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument.",
+    "application/rtf",
+)
+# ChatGPT 가 생성·보관한 파일을 내려 주는 경로. blob: URL 은 브라우저 내부 객체라 출처를 말해 주지 않는다.
+CSV_CHATGPT_FILE_URL_MARKERS = ("backend-api/estuary/content", "backend-api/files/")
+CSV_DOWNLOAD_DOCUMENT = "문서 다운로드"
+CSV_DOWNLOAD_GENERATED_IMAGE = "생성 이미지 다운로드"
+
+
+def _download_observed(event: Event) -> dict[str, Any]:
+    """다운로드 Event 의 관찰값 (Reader 가 History downloads 에서 읽은 그대로)."""
+    for item in list(event.primary_evidence) + list(event.supporting_evidence):
+        observed = item.observed if isinstance(item.observed, dict) else {}
+        if observed.get("filename") or observed.get("download_url") or observed.get("mime_type"):
+            return observed
+    return {}
+
+
+def _from_chatgpt_file_endpoint(observed: dict[str, Any]) -> bool:
+    url = str(observed.get("download_url") or "")
+    return any(marker in url for marker in CSV_CHATGPT_FILE_URL_MARKERS)
+
+
+def csv_final_download_behavior(event: Event) -> str | None:
+    """FILE_DOWNLOAD 의 최종 User_behavior. 종류를 확인하지 못하면 None (최종 행 없음).
+
+    - 문서: MIME 이 문서 형식이고 ChatGPT 파일 제공 경로에서 시작한 다운로드
+    - 생성 이미지: 이미지 MIME + ChatGPT 파일 제공 경로 + 같은 대화에서 이미지 생성 요청이 확인된 경우
+      (확장자·파일명만으로는 올리지 않는다. blob: URL 은 출처 근거가 되지 않는다.)
+    """
+    observed = _download_observed(event)
+    mime = str(observed.get("mime_type") or "").lower()
+    if not _from_chatgpt_file_endpoint(observed):
+        return None
+    if any(mime.startswith(prefix) for prefix in CSV_DOCUMENT_MIME_PREFIXES):
+        return CSV_DOWNLOAD_DOCUMENT
+    if mime.startswith("image/") and observed.get("generated_image_conversation_id"):
+        return CSV_DOWNLOAD_GENERATED_IMAGE
+    return None
+
+
+# --- 업로드: 종류가 evidence 로 확인될 때만 최종 행위로 올린다 (다운로드와 같은 설계) ---
+# 분석표는 업로드를 종류별(이미지 업로드 / 문서 업로드)로 쓰는데 Rule 은 상위 이름 FILE_UPLOAD 하나만 낸다.
+# 첨부 MIME 은 Cache 대화 응답의 user 메시지에 이미 들어 있어 (Reader 가 읽어 둔 observed["mime_type"]),
+# 그 값만으로 종류를 가린다. 탐지 Rule·Evidence 는 건드리지 않는다 — 최종 표기만 정한다.
+# MIME 으로 가려지지 않으면 None (최종 행 없음). 확장자·파일명으로 추측해 올리지 않는다.
+CSV_UPLOAD_DOCUMENT = "문서 업로드"
+CSV_UPLOAD_IMAGE = "이미지 업로드"
+
+
+def _upload_observed(event: Event) -> dict[str, Any]:
+    """업로드 Event 의 관찰값 (Reader 가 Cache user 메시지 첨부에서 읽은 그대로)."""
+    for item in list(event.primary_evidence) + list(event.supporting_evidence):
+        observed = item.observed if isinstance(item.observed, dict) else {}
+        if observed.get("mime_type"):
+            return observed
+    return {}
+
+
+def csv_final_upload_behavior(event: Event) -> str | None:
+    """FILE_UPLOAD 의 최종 User_behavior. 종류를 확인하지 못하면 None (최종 행 없음).
+
+    - 문서: 첨부 MIME 이 문서 형식 (다운로드 쪽과 같은 CSV_DOCUMENT_MIME_PREFIXES 목록)
+    - 이미지: 첨부 MIME 이 image/*
+    그 밖의 MIME(예: text/x-python)·MIME 없음 은 올리지 않는다 — FILE_UPLOAD Event·Evidence 로 그대로 남는다.
+    """
+    mime = str(_upload_observed(event).get("mime_type") or "").lower()
+    if any(mime.startswith(prefix) for prefix in CSV_DOCUMENT_MIME_PREFIXES):
+        return CSV_UPLOAD_DOCUMENT
+    if mime.startswith("image/"):
+        return CSV_UPLOAD_IMAGE
+    return None
+
+
+def csv_final_user_behavior(action: str, event: Event | None = None) -> str | None:
+    """최종 timeline.csv 의 User_behavior. 팀 목록에 없는 action(라벨이 없는 경우까지) 은 None.
+
+    None 은 "이 Event 로 최종 timeline 행을 만들지 않는다" 는 뜻이다. 탐지를 멈추거나 근거를 지우는 것이
+    아니라서 Event·Evidence·Coverage 는 events.csv / result.json 에 그대로 남는다.
+    FILE_DOWNLOAD 는 종류가 evidence 로 확인될 때만 문서/생성 이미지 다운로드로 나간다.
+    FILE_UPLOAD 도 같게 — 첨부 MIME 으로 문서/이미지 업로드를 가릴 때만 나간다.
+    """
+    if action == "FILE_DOWNLOAD":
+        label = csv_final_download_behavior(event) if event is not None else None
+        return label if label in CSV_TEAM_USER_BEHAVIORS else None
+    if action == "FILE_UPLOAD":
+        label = csv_final_upload_behavior(event) if event is not None else None
+        return label if label in CSV_TEAM_USER_BEHAVIORS else None
+    label = CSV_USER_BEHAVIOR_LABELS.get(action)
+    return label if label in CSV_TEAM_USER_BEHAVIORS else None
 
 
 def csv_final_timestamp(kst: str | None) -> str | None:
@@ -178,8 +290,11 @@ CSV_BEHAVIOR_REASONS = {
 # 같은 행위를 서로 다른 아티팩트에서 찾는 Rule 이 있으면 Rule 마다 근거 문장이 달라야 한다 — 관찰하지 않은 근거를
 # 적지 않기 위한 것이다. (LOGIN 은 인증 URL 방문(CHATGPT_LOGIN_001) 과 계정 세션 목록의 lastLoggedInAt
 # (CHATGPT_ACCOUNT_SESSION_001) 두 경로로 나온다. Rule 이름 자체는 최종 CSV 에 적지 않는다.)
+# 세션 목록(Local Storage) 근거의 LOGIN — URL 이 없어 핵심 내용을 세션 개수로 적는다
+CSV_ACCOUNT_SESSION_RULE_ID = "CHATGPT_ACCOUNT_SESSION_001"
+
 CSV_BEHAVIOR_REASONS_BY_RULE = {
-    "CHATGPT_ACCOUNT_SESSION_001": "세션 목록의 최근 로그인 기록",
+    CSV_ACCOUNT_SESSION_RULE_ID: "세션 목록의 최근 로그인 기록",
 }
 # 핵심 내용으로 쓸 observed key (앞에 있는 것 우선). 어느 것도 없으면 관찰된 대화 ID 를 본다.
 CSV_BEHAVIOR_CORE_KEYS = {
@@ -287,6 +402,11 @@ def _behavior_core(event: Event, prompt_texts: dict[str, str]) -> str | None:
         selected = _observed_value(event, "clear_data")
         return (f"{PREFERENCES_CLEAR_DATA_KEY}.cache=true"
                 if isinstance(selected, dict) and selected.get("cache") is True else None)
+    if event.rule_id == CSV_ACCOUNT_SESSION_RULE_ID:
+        # 세션 목록 근거의 LOGIN 에는 URL 이 없다. 관찰값 중 사람이 바로 읽을 수 있는 것은 세션 개수뿐이고,
+        # 계정 식별자 해시·토큰 길이는 최종 CSV 에 내지 않는다 (계정 정보 노출 금지).
+        count = _observed_value(event, "session_count")
+        return f"세션 {count}개" if isinstance(count, int) else None
     transition = CSV_BEHAVIOR_TRANSITIONS.get(event.action)
     if transition is not None:
         for item in _evidence_items(event):
@@ -381,7 +501,7 @@ def _timeline_row(event: Event, prompt_texts: dict[str, str] | None = None) -> d
     return _fill_empty({
         "Model": CSV_FINAL_MODEL,
         "Timestamp": csv_final_timestamp(event.timestamp_kst),  # 없으면 "-" — 시각을 만들어 내지 않는다
-        "User_behavior": CSV_USER_BEHAVIOR_LABELS.get(event.action, event.action),
+        "User_behavior": csv_final_user_behavior(event.action, event),  # 팀 목록 밖이면 None — 내부 코드를 내지 않는다
         "Behavior_details ": _behavior_details(event, prompt_texts or {}),
         "Verdict": "의심" if event.action == "PROMPT_DRAFT" else CSV_VERDICT_LABELS.get(event.action_status, event.action_status),
         "Artifact_path": location,

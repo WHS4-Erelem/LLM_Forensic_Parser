@@ -15,7 +15,7 @@ WHS 대학 팀 프로젝트 *"LLM 대화 내용 추출 및 사용자 행위 분�
 |---|---|
 | Python | **3.12 / 3.13** (둘 다 전체 테스트 통과 확인) |
 | 필수 | 없음 — 표준 라이브러리만으로 폴더 입력 분석이 동작한다 |
-| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `libewf-python`(E01) |
+| 선택 | `pytsk3`(이미지 입력) · `brotli`(Cache 대화 복구) · `cramjam`(LevelDB `.ldb`) · `dissect.fve==4.6`+`dissect.ntfs==3.16`(BitLocker 볼륨) · `libewf-python`(E01) |
 
 ```
 pip install -r requirements.txt
@@ -55,6 +55,92 @@ python -B -m unittest discover -s tests
 - 종료 코드: `0` 분석 완료(결과 0건 포함) / `2` 잘못된 인자·입력 / `1` 예상하지 못한 오류.
 - 폴더 입력은 `Users/<user>/AppData/Local/Google/Chrome/User Data/` 의 `Default`·`Profile <숫자>`(Chrome Stable)를 자동 탐색한다. 못 찾으면 `CHROME_PROFILE_NOT_FOUND` warning + exit 0.
 
+## 2-2. 입력 Mode 세 가지
+
+`--image` · `--dir` · `--live` 는 **상호배타**다 (하나만 준다). 어느 모드든 이후의 Chrome Profile 탐색 ·
+Artifact Reader · 판정 Rule · 대화 복구 · 최종 CSV 는 같은 코드를 쓴다.
+
+```
+# Image Mode : DD/RAW · E01 디스크 이미지 (읽기 전용)
+python -m chatgpt_parser.cli --image <IMAGE> --csv-dir out_csv
+
+# Folder Mode : 마운트·수집한 폴더
+python -m chatgpt_parser.cli --dir <ROOT> --csv-dir out_csv
+
+# Live Mode : 지금 이 Windows PC 에서 자동 수집
+python -m chatgpt_parser.cli --live --csv-dir out_csv
+```
+
+### Folder Mode
+
+History 파일 하나를 고르는 방식이 **아니다**. Chrome User Data 를 찾아 들어갈 수 있는 **Root 폴더**를 준다
+(예: 수집본의 최상위). Parser 가 그 아래에서
+`Users/<user>/AppData/Local/Google/Chrome/User Data/` 의 `Default` · `Profile <숫자>` 를 스스로 찾는다.
+사용자 이름·Profile 개수를 미리 알 필요가 없다. 특정 History 하나만 보려면 `--history` 로 지정한다.
+
+### Live Mode
+
+파일·폴더를 고르지 않는다. 실행 중인 Windows PC 에서 ChatGPT Web 분석에 필요한 Chrome Artifact 를 스스로 찾는다.
+
+```
+현재 Windows 사용자 폴더 탐색 → Chrome User Data 탐색 → Default / Profile N 탐색
+→ 필요한 Artifact 만 읽기 전용으로 Working Copy → 기존 Folder 분석 로직 재사용
+```
+
+- **원본 Artifact 를 수정·삭제·덮어쓰지 않는다** (읽기로만 연다).
+- Chrome 이 실행 중이면 일부 파일이 잠겨 수집에 실패할 수 있다. **파일 하나가 실패해도 분석을 멈추지 않고**
+  실패 건수를 warning 으로 알린다.
+- `--live-work-dir` 를 **생략하면** 임시 폴더에 Working Copy 를 만들고 분석이 끝나면 지운다.
+  **지정하면** 그 폴더에 Working Copy 를 남긴다 (수집 결과를 보관하거나 다시 분석할 때).
+
+## 2-3. BitLocker 볼륨 (Image Mode)
+
+이미지 안의 파티션이 BitLocker 로 암호화돼 있으면 선두의 `-FVE-FS-` 로 알아보고, `dissect.fve` 로 풀어서
+그 **복호화 스트림을 `dissect.ntfs` 의 NTFS 로 직접 연다.** **원본 이미지는 읽기만 하고 복호화본을 따로 저장하지 않는다.**
+clear key · 일시 중단(suspended) 상태의 볼륨은 키 없이 열린다 (clear key 가 있으면 항상 clear key 가 먼저다).
+키가 없거나 맞지 않으면 그 파티션만 `IMAGE_BITLOCKER_LOCKED` 로 남기고 다른 파티션을 계속 확인한다
+(무차별 대입·우회는 하지 않는다).
+
+```
+BitLocker 파티션 → dissect.fve BDE → clear key 자동 해제 → bde.open()
+                 → dissect.ntfs NTFS(복호화 stream) → DissectNtfsFilesystem → ImageSource → 기존 분석 경로
+
+비암호화 NTFS    → pytsk3 Volume_Info / FS_Info → TskFilesystem → ImageSource → 기존 분석 경로
+```
+
+**복호화 볼륨에만 `dissect.ntfs` 를 쓴다** — DD/RAW·E01 의 비암호화 NTFS 는 기존 `pytsk3` 경로 그대로다.
+두 경로가 `ImageSource` 에 같은 계약(`stat` / `listdir` / `read`)을 주므로 Discovery·Reader·Rule 은 공통이다.
+복호화 스트림과 NTFS 객체는 `ImageSource.close()` 까지 참조가 유지된다 (중간에 GC 되면 읽기가 끊긴다).
+
+지원하는 키 형식:
+
+```
+recovery:<48자리 복구 키>
+passphrase:<암호>
+bek:<.BEK 파일 경로>
+fvek:<hex>
+```
+
+> **키 전달 주의.** `--key-material` 은 명령행 인자라 셸 기록이나 **상위 통합 실행기의 `run.log`
+> (실행 명령 문자열을 그대로 기록한다)** 에 남을 수 있다. 그래서 통합 실행처럼 로그가 남는 경로에서는
+> 환경변수 **`ERELM_KEY_MATERIAL`** 로 주는 것을 권장한다. **실제 복구 키를
+> `integration/parsers.json` 의 `args` 에 적지 말 것.**
+>
+> ```
+> # PowerShell (값은 예시 자리표시자다 — 실제 키를 문서·설정 파일에 남기지 않는다)
+> $env:ERELM_KEY_MATERIAL = "recovery:<48-digit-recovery-key>"
+> python -m chatgpt_parser.cli --image <IMAGE> --csv-dir out_csv
+> ```
+>
+> Parser 는 키 값을 stdout · stderr · warning · 예외 메시지 · `result.json` · CSV 어디에도 쓰지 않는다
+> (키 종류와 보호자 목록만 남긴다).
+
+검증 상태: BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출 · clear key 해제 후 복호화 스트림이
+`dissect.ntfs` 로 넘어가는 배선 · 복호화 볼륨이 `pytsk3` 를 거치지 않는 것 · 비암호화 NTFS 가 기존
+`pytsk3` 경로를 유지하는 것은 **단위 테스트로 확인했다.**
+**실제 암호화 이미지로 여는 실증(E2E) 검증은 테스트용 암호화 이미지가 있어야 하며 아직 수행하지 않았다
+(`NOT TESTED / BLOCKED_NO_ENCRYPTED_IMAGE`). 별도 환경에서 재검증이 필요하다.**
+
 ## 2-1. Python 통합 (팀 Controller 에서 호출)
 
 ```python
@@ -91,6 +177,20 @@ write_final_outputs(result, r"D:\CASE\out")   # timeline.csv + recovered_convers
 `result.json` 은 `--out <경로>` 를 줬을 때만 만들어진다.
 `--debug-output` 은 **파일로 내보내는 동작만** 바꾼다. 내부 `ParseResult` / `records` / `events` / `conversations` 는 기본 실행에서도 그대로 사용하며 판정 결과는 같다.
 CSV 는 모두 `utf-8-sig` 이며 Excel 수식으로 해석될 수 있는 cell 은 앞에 `'` 를 붙여 무력화한다.
+
+#### `coverage.csv` 에 들어가는 Artifact 범위
+
+`coverage.csv` 는 **읽기를 시도한 Artifact 마다 1행**을 만든다. 현재 읽는 것은 프로필마다 다음 7종이다.
+
+```
+history · local_storage · session_storage · cache · preferences · shared_proto_db · sessions
+```
+
+파일이 없으면 그 행이 `NOT_PRESENT` 로 남는다 — 즉 "행이 없다" 와 "파일이 없다" 는 다른 뜻이다.
+`constants.py` 의 `ARTIFACT_TYPES` 는 `artifact_type` 필드에 쓸 수 있는 **schema 어휘**이고 읽는 대상 목록이 아니다.
+그래서 어휘에만 있는 `cookies` · `indexeddb` · `favicons` · `local_state` · `ntfs` 는 **리더가 없어 행이 생기지 않는다**
+(디스크에 `Default/Network/Cookies` · `Default/IndexedDB` 가 있어도 같다 — 실제 BitLocker 이미지에서 확인).
+읽는 7종과 그 순서는 `test_explicit_mode_unchanged` 가 고정하고 있다.
 
 ### `timeline.csv` — 사용자가 언제 무엇을 했는가
 

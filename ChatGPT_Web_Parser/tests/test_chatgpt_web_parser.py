@@ -6349,7 +6349,7 @@ class FinalCsvExportTest(unittest.TestCase):
         header, rows = self.read_csv("timeline.csv")
         self.assertEqual([dict(zip(header, row))["Verdict"] for row in rows], ["확정", "의심"])
 
-    def test_timeline_user_behavior_uses_korean_label_or_keeps_action(self):
+    def test_timeline_user_behavior_uses_team_label_and_drops_unknown_action(self):
         result = make_result()
         known, unknown = make_event(), make_event(event_id="event:2")
         known.action, unknown.action = "ACCOUNT_SWITCH", "SOME_FUTURE_ACTION"
@@ -6357,7 +6357,8 @@ class FinalCsvExportTest(unittest.TestCase):
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
         behaviors = [dict(zip(header, row))["User_behavior"] for row in rows]
-        self.assertEqual(behaviors, ["계정 전환", "SOME_FUTURE_ACTION"])  # 모르는 action 은 번역하지 않는다
+        # 모르는 action 은 번역하지도, 내부 코드로 내보내지도 않는다 — 행 자체를 만들지 않는다 (2026-10-01 팀 확정).
+        self.assertEqual(behaviors, ["계정 전환"])
 
     def test_timeline_builds_artifact_path_and_behavior_details(self):
         result = make_result()
@@ -6617,14 +6618,37 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
                          frozenset(action for action, label in _final_csv.CSV_USER_BEHAVIOR_LABELS.items()
                                    if label not in _final_csv.CSV_TEAM_USER_BEHAVIORS))
 
-    def test_label_less_action_is_not_silently_dropped(self):
-        """라벨이 없는 action 은 제외 대상이 아니다 — 내부 코드가 그대로 나가 통합기가 알려 준다.
+    # 2026-10-01 팀 확정: 라벨이 없는 action 도 최종 timeline 에서 빼고, 내부 action 코드를 User_behavior 로
+    # 내보내는 fallback 은 두지 않는다 (팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다).
+    # 대신 "조용히 사라짐" 은 아래 test_every_shipped_detector_action_has_a_team_label 이 배포 전에 막는다.
+    def test_label_less_action_makes_no_timeline_row(self):
+        """라벨이 없는 새 action 은 최종 timeline 행을 만들지 않는다."""
+        self.assertIsNone(_final_csv.csv_final_user_behavior("CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertEqual(self.behaviors_for(["CHATGPT_NEW_ACTION_WITHOUT_LABEL"]), [])
 
-        조용히 사라지는 쪽이 위험하다 (새 Rule 을 넣고 행위명을 정하지 않은 경우).
-        """
-        self.assertNotIn("CHATGPT_NEW_ACTION_WITHOUT_LABEL", _final_csv.CSV_NON_TEAM_ACTIONS)
-        self.assertEqual(self.behaviors_for(["CHATGPT_NEW_ACTION_WITHOUT_LABEL"]),
+    def test_label_less_action_is_still_kept_in_event_and_debug_output(self):
+        """같은 action 이 Event·debug events.csv 에는 그대로 남는다 — 개발자가 확인할 수 있어야 한다."""
+        result = make_result()
+        result.events = [make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL")]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        event_header, event_rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows],
                          ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+        self.assertEqual([event.action for event in result.events], ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+
+    def test_no_internal_action_code_fallback_in_user_behavior(self):
+        """행 생성기를 직접 불러도 내부 action 코드가 User_behavior 로 나오지 않는다 (fallback 제거)."""
+        row = _final_csv._timeline_row(make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertNotEqual(row["User_behavior"], "CHATGPT_NEW_ACTION_WITHOUT_LABEL")
+        self.assertNotIn(row["User_behavior"], set(_final_csv.CSV_USER_BEHAVIOR_LABELS))
+
+    def test_every_timeline_user_behavior_is_a_team_behavior(self):
+        """라벨 표의 모든 action 을 한 번에 내보내도 최종 User_behavior 는 팀 목록의 부분집합이다."""
+        actions = sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) | {"CHATGPT_NEW_ACTION_WITHOUT_LABEL"})
+        behaviors = set(self.behaviors_for(actions))
+        self.assertTrue(behaviors)
+        self.assertEqual(sorted(behaviors - self.team_behaviors_from_file()), [])
 
     def test_file_upload_is_detected_and_kept_in_debug_but_not_in_timeline(self):
         """FILE_UPLOAD · FILE_UPLOAD_DELETE 는 Event 로 남고 debug events.csv 에도 있다 — 최종 timeline 행만 없다."""
@@ -6637,16 +6661,148 @@ class TimelineUserBehaviorPolicyTest(unittest.TestCase):
         self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows],
                          ["FILE_UPLOAD", "FILE_UPLOAD_DELETE"])
 
-    def test_file_download_stays_in_timeline(self):
-        """같은 파일 계열이라도 '파일 다운로드' 는 팀 목록에 있어 그대로 남는다 (제외가 번지지 않는다)."""
-        self.assertEqual(self.behaviors_for(["FILE_UPLOAD", "FILE_DOWNLOAD", "FILE_UPLOAD_DELETE"]),
-                         ["파일 다운로드"])
+    @staticmethod
+    def _download_event(event_id, observed):
+        """History downloads 관찰값을 가진 FILE_DOWNLOAD Event."""
+        return make_event(event_id=event_id, action="FILE_DOWNLOAD",
+                          primary_evidence=[make_evidence(observed=observed)], supporting_evidence=[])
+
+    def _download_behaviors(self, events):
+        result = make_result()
+        result.events = list(events)
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    DOC_OBSERVED = {"filename": "whs_download_doc_001.docx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0001"}
+    CODE_OBSERVED = {"filename": "whs_download_code_001.py", "mime_type": "text/x-python",
+                     "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0002"}
+    BLOB_PNG_OBSERVED = {"filename": "ChatGPT Image 2026.png", "mime_type": "image/png",
+                         "download_url": "blob:https://chatgpt.com/a059f0f3"}
+    GENERATED_IMAGE_OBSERVED = {"filename": "ChatGPT Image 2026.png", "mime_type": "image/png",
+                                "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0003",
+                                "generated_image_conversation_id": "conv-0001"}
+
+    def test_document_download_is_promoted_to_the_team_name(self):
+        """Office 문서 MIME + ChatGPT 파일 제공 경로 → 팀 공식 이름 '문서 다운로드'."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:doc", self.DOC_OBSERVED)]),
+                         ["문서 다운로드"])
+
+    def test_code_file_download_is_not_a_document(self):
+        """코드 파일은 팀 '문서 다운로드' 실험 범위라고 볼 근거가 없어 최종 timeline 에 내지 않는다."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:code", self.CODE_OBSERVED)]), [])
+
+    def test_image_download_without_generation_evidence_is_excluded(self):
+        """확장자·파일명만으로 '생성 이미지 다운로드' 로 올리지 않는다 (blob: 은 출처 근거가 아니다)."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:png", self.BLOB_PNG_OBSERVED)]), [])
+
+    def test_generated_image_download_needs_a_generation_link(self):
+        """생성 이미지와 연결되는 근거가 있을 때만 '생성 이미지 다운로드' 로 올린다."""
+        self.assertEqual(
+            self._download_behaviors([self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
+            ["생성 이미지 다운로드"])
+
+    # --- FILE_UPLOAD 최종 분류 (첨부 MIME 으로 문서/이미지 업로드를 가린다) ---
+    @staticmethod
+    def _upload_event(event_id, observed):
+        """Cache user 메시지 첨부 관찰값을 가진 FILE_UPLOAD Event."""
+        return make_event(event_id=event_id, action="FILE_UPLOAD",
+                          primary_evidence=[make_evidence(observed=observed)], supporting_evidence=[])
+
+    def _upload_behaviors(self, events):
+        result = make_result()
+        result.events = list(events)
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    PDF_UPLOAD_OBSERVED = {"file_name": "에레렘_LLMHub_장애로그_20261001.pdf", "mime_type": "application/pdf",
+                           "conversation_id": "conv-0001"}
+    PNG_UPLOAD_OBSERVED = {"file_name": "MRK_ELELEM_LLMHUB_DASHBOARD.png", "mime_type": "image/png",
+                           "conversation_id": "conv-0001"}
+    JPEG_UPLOAD_OBSERVED = {"file_name": "whs_upload_photo_001.jpg", "mime_type": "image/jpeg",
+                            "conversation_id": "conv-0001"}
+    UNKNOWN_UPLOAD_OBSERVED = {"file_name": "whs_upload_unknown_001.bin",
+                               "mime_type": "application/octet-stream", "conversation_id": "conv-0001"}
+
+    def test_pdf_upload_is_promoted_to_document_upload(self):
+        """CASE 1 — application/pdf 첨부 → 팀 공식 이름 '문서 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED)]),
+                         ["문서 업로드"])
+
+    def test_png_upload_is_promoted_to_image_upload(self):
+        """CASE 2 — image/png 첨부 → '이미지 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_jpeg_upload_is_promoted_to_image_upload(self):
+        """CASE 3 — image/* 대분류로 가린다 (image/jpeg)."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:jpeg", self.JPEG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_unknown_upload_mime_is_not_forced_into_a_category(self):
+        """CASE 4 — 근거 없는 MIME 은 문서/이미지로 만들지 않는다. MIME 이 아예 없는 경우도 같다."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                                 self._upload_event("event:nomime", {})]), [])
+        self.assertIsNone(_final_csv.csv_final_user_behavior("FILE_UPLOAD"))  # event 없이 호출해도 승격 없음
+
+    def test_upload_classification_does_not_change_download_classification(self):
+        """CASE 5 — 기존 FILE_DOWNLOAD 분류 결과가 그대로다 (문서만 승격, 코드·blob 이미지는 제외)."""
+        self.assertEqual(
+            self._download_behaviors([self._download_event("event:doc", self.DOC_OBSERVED),
+                                      self._download_event("event:code", self.CODE_OBSERVED),
+                                      self._download_event("event:png", self.BLOB_PNG_OBSERVED),
+                                      self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
+            ["문서 다운로드", "생성 이미지 다운로드"])
+
+    def test_upload_rows_keep_the_timeline_header_and_one_row_per_file(self):
+        """CASE 6 — timeline.csv 열 구조·형식은 그대로이고, 파일 1개 = 행 1개 granularity 를 유지한다."""
+        result = make_result()
+        result.events = [self._upload_event("event:pdf-1", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:pdf-2", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        self.assertEqual(header, list(p.CSV_TIMELINE_COLUMNS))
+        self.assertEqual([dict(zip(header, row))["User_behavior"] for row in rows],
+                         ["문서 업로드", "문서 업로드", "이미지 업로드"])
+        self.assertEqual([dict(zip(header, row))["Model"] for row in rows], ["chatgpt-web"] * 3)
+
+    def test_generic_file_upload_never_reaches_the_final_timeline(self):
+        """어떤 조합에서도 최종 timeline 에 '파일 업로드' 는 나오지 않는다."""
+        behaviors = self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED),
+                                            self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                            self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)])
+        self.assertNotIn("파일 업로드", behaviors)
+        self.assertEqual(behaviors, ["문서 업로드", "이미지 업로드"])
+
+    def test_generic_file_download_never_reaches_the_final_timeline(self):
+        """어떤 조합에서도 최종 timeline 에 '파일 다운로드' 는 나오지 않는다 (2026-10-05 팀 결정)."""
+        events = [self._download_event("event:doc", self.DOC_OBSERVED),
+                  self._download_event("event:code", self.CODE_OBSERVED),
+                  self._download_event("event:png", self.BLOB_PNG_OBSERVED)]
+        behaviors = self._download_behaviors(events)
+        self.assertNotIn("파일 다운로드", behaviors)
+        self.assertEqual(behaviors, ["문서 다운로드"])
+
+    def test_excluded_downloads_stay_in_debug_events(self):
+        """최종에서 빠진 다운로드도 Event·근거는 events.csv 에 그대로 남는다."""
+        result = make_result()
+        result.events = [self._download_event("event:code", self.CODE_OBSERVED),
+                         self._download_event("event:png", self.BLOB_PNG_OBSERVED)]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        header, rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(header, row))["action"] for row in rows],
+                         ["FILE_DOWNLOAD", "FILE_DOWNLOAD"])
 
     def test_every_shipped_detector_action_has_a_team_label(self):
         """배포된 Rule 이 만드는 action 은 모두 라벨 표에 있어야 한다.
 
-        라벨이 없으면 내부 코드가 최종 CSV 로 그대로 나간다 (위 test 가 보장하는 '조용히 사라지지 않음' 의
-        대가다). 이 test 가 있으면 그 상황이 배포까지 가지 않는다 — 새 Rule 을 추가하는 시점에 막힌다.
+        라벨이 없으면 그 행위는 최종 timeline 에 나가지 않는다. 조용히 빠지는 일이 배포까지 가지 않도록
+        새 Rule 을 추가하는 시점에 이 test 가 막는다 (라벨 + 발견 근거 문장 둘 다 필요하다).
         """
         source = Path(_final_csv.__file__).resolve().parent.parent / "detectors"
         actions = {match for path in sorted(source.glob("*.py"))
@@ -6723,7 +6879,7 @@ class FinalCsvHumanReadableTest(unittest.TestCase):
                                                            observed={"key_kind": "account_switch_sessions",
                                                                      "session_count": 1})],
                            supporting_evidence=[])
-        self.assertEqual(self.row_for(event)["Behavior_details "], "세션 목록의 최근 로그인 기록")
+        self.assertEqual(self.row_for(event)["Behavior_details "], "세션 목록의 최근 로그인 기록_세션 1개")
         url_event = make_event(action="LOGIN", rule_id="CHATGPT_LOGIN_001", supporting_evidence=[])
         self.assertEqual(self.row_for(url_event)["Behavior_details "],
                          "로그인 URL 방문 흔적_https://chatgpt.com/auth/logout")
@@ -6739,6 +6895,82 @@ class FinalCsvHumanReadableTest(unittest.TestCase):
     INTERNAL_TOKENS = ("DIRECT", "SUPPORTING", "INFERRED", "rule_id", "confidence", "rule_verification",
                        "evidence_level", "signal_count", "Evidence Family", "Rule=")
 
+    # action 이 실제로 읽는 관찰 키(CSV_BEHAVIOR_CORE_KEYS)를 채워 '근거_내용' 형식을 확인한다.
+    # 관찰값이 전혀 없을 때 근거만 남는 것은 _behavior_core 의 설계된 동작이라 여기서 강제하지 않는다.
+    _CORE_SAMPLE_VALUES = {
+        'url': 'https://chatgpt.com/c/sample', 'title': '샘플 대화',
+        'client_conversation_id': 'conv-0001', 'removed_conversation_id': 'conv-0002',
+        'message_id': 'msg-0001', 'filename': 'sample.docx',
+        'target_path': 'C:/Users/u/Downloads/sample.docx', 'file_name': 'sample.png',
+        'conversation_id': 'conv-0003', 'url_conversation_id': 'conv-0004',
+    }
+
+    def _event_with_core_values(self, action):
+        """그 action 의 핵심 키를 채운 Event (CACHE_DELETE·전환형 action 은 전용 관찰값)."""
+        if action in self._CONDITIONAL_ACTION_EVIDENCE:   # FILE_DOWNLOAD: 문서 근거가 있어야 최종 행이 된다
+            observed = dict(self._CONDITIONAL_ACTION_EVIDENCE[action])
+        elif action == 'CACHE_DELETE':
+            observed = {'clear_data': {'cache': True, 'browsing_history': False}}
+        elif action in _final_csv.CSV_BEHAVIOR_TRANSITIONS:
+            before, after = _final_csv.CSV_BEHAVIOR_TRANSITIONS[action]
+            observed = {before: 'before-value', after: 'after-value'}
+        else:
+            keys = tuple(_final_csv.CSV_BEHAVIOR_CORE_KEYS.get(action, ())) + _final_csv.CSV_BEHAVIOR_ID_KEYS
+            observed = {}
+            for key in keys:
+                if key in self._CORE_SAMPLE_VALUES:
+                    observed[key] = self._CORE_SAMPLE_VALUES[key]
+                    break
+        if not observed:
+            return None
+        return make_event(action=action, primary_evidence=[make_evidence(observed=observed)],
+                          supporting_evidence=[])
+
+    def test_behavior_details_keeps_the_reason_and_core_shape(self):
+        """최종 Behavior_details 는 '<발견 근거>_<핵심 내용>' 이다 (근거만 남는 행을 막는다).
+
+        URL·파일명 안의 '_' 때문에 split 로 세지 않고, 포맷터가 쓴 근거 문장을 기준으로 앞뒤를 가른다.
+        """
+        reasons = (set(_final_csv.CSV_BEHAVIOR_REASONS.values())
+                   | set(_final_csv.CSV_BEHAVIOR_REASONS_BY_RULE.values()))
+        checked = 0
+        for action in sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) - _final_csv.CSV_NON_TEAM_ACTIONS):
+            event = self._event_with_core_values(action)
+            if event is None:          # 핵심 키가 정의되지 않은 action 은 대상이 아니다
+                continue
+            with self.subTest(action=action):
+                details = self.row_for(event)['Behavior_details ']
+                self.assertTrue(details and details != p.CSV_EMPTY_CELL, action)
+                reason = next((c for c in reasons if details.startswith(c)), None)
+                self.assertIsNotNone(reason, '%s: 근거 문장으로 시작하지 않는다 (%r)' % (action, details))
+                rest = details[len(reason):]
+                self.assertTrue(rest.startswith('_'), '%s: 근거 뒤에 _ 가 없다 (%r)' % (action, details))
+                self.assertTrue(rest[1:].strip(), '%s: 핵심 내용이 비어 있다 (%r)' % (action, details))
+                checked += 1
+        self.assertGreater(checked, 5, '형식을 확인한 action 이 너무 적다')
+
+    def test_session_based_login_has_a_core_value(self):
+        """세션 목록 근거의 LOGIN 도 핵심 내용(세션 개수)을 적는다 — 근거만 남기지 않는다."""
+        event = make_event(action="LOGIN", rule_id=_final_csv.CSV_ACCOUNT_SESSION_RULE_ID,
+                           primary_evidence=[make_evidence(artifact_type="local_storage",
+                                                           observed={"session_count": 1, "session_index": 0})],
+                           supporting_evidence=[])
+        details = self.row_for(event)["Behavior_details "]
+        self.assertEqual(details, "세션 목록의 최근 로그인 기록_세션 1개")
+
+    def test_session_login_details_never_show_account_identifiers(self):
+        """계정 식별자 해시·세션 토큰 길이는 최종 CSV 에 내지 않는다."""
+        event = make_event(action="LOGIN", rule_id=_final_csv.CSV_ACCOUNT_SESSION_RULE_ID,
+                           primary_evidence=[make_evidence(
+                               artifact_type="local_storage",
+                               observed={"session_count": 2, "user_id_sha256_prefix": "0000000000000000",
+                                         "session_token_length": 3740, "session_token_present": True})],
+                           supporting_evidence=[])
+        row = self.row_for(event)
+        self.assertEqual(row["Behavior_details "], "세션 목록의 최근 로그인 기록_세션 2개")
+        for token in ("0000000000000000", "3740"):
+            self.assertNotIn(token, row["Behavior_details "])
+
     def test_behavior_details_has_no_internal_tokens(self):
         result = make_result()
         result.events = [make_event(event_id=f"event:{index}", action=action)
@@ -6747,10 +6979,24 @@ class FinalCsvHumanReadableTest(unittest.TestCase):
             for token in self.INTERNAL_TOKENS:
                 self.assertNotIn(token, row["Behavior_details "])
 
+    # FILE_DOWNLOAD 는 근거로 종류가 확인될 때만 최종 행이 되므로 문서 근거를 갖춘 Event 로 만든다
+    _CONDITIONAL_ACTION_EVIDENCE = {
+        "FILE_DOWNLOAD": {"filename": "doc.docx",
+                          "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                          "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0001"},
+    }
+
+    def _event_for_action(self, action):
+        observed = self._CONDITIONAL_ACTION_EVIDENCE.get(action)
+        if observed is None:
+            return make_event(action=action)
+        return make_event(action=action, primary_evidence=[make_evidence(observed=observed)],
+                          supporting_evidence=[])
+
     def test_behavior_details_does_not_start_with_the_internal_action_code(self):
         for action in sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) - _final_csv.CSV_NON_TEAM_ACTIONS):
             with self.subTest(action=action):
-                row = self.row_for(make_event(action=action))
+                row = self.row_for(self._event_for_action(action))
                 self.assertNotIn(action, row["Behavior_details "])
                 self.assertNotIn(action, row["Artifact_details "])
 
