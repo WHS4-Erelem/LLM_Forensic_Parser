@@ -57,8 +57,6 @@
     {
       "name": "claude_desktop",
       "model": "claude-desktop",
-      "inputs": [".e01", ".dd", ".001"],
-      "_inputs_note": "aifp_parse.py ALLOWED_SUFFIXES 기준. 담당자가 .001 등을 허용하면 여기도 갱신",
       "python": ".venv312/Scripts/python.exe",
       "cwd": "../Claude_APP_Parser",
       "args": [
