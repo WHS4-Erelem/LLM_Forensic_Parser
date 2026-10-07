@@ -101,11 +101,10 @@ PROJECT_ACTIONS = (
 # Timeline User_behavior values are restricted to the team's integration/user_behaviors.txt names.
 # Service-specific/raw helper labels stay in JSON/Behavior_details and never leak into timeline.csv.
 TEAM_BEHAVIORS = set(PROJECT_ACTIONS) | {
-    "서비스 접속", "파일 다운로드",
+    "파일 다운로드",
 }
 # Artifact families inspected for each action. Used only for optional coverage/debug output.
 ACTION_COVERAGE_ARTIFACTS = {
-    "서비스 접속": {"Chrome History"},
     "로그인": {"Chrome History", "Chrome Cookies", "Chrome Preferences"},
     "로그아웃": {"Chrome History", "Chrome Local Storage", "Chrome Session Storage"},
     "계정 전환": {"Chrome History", "Chrome Preferences", "Chrome Local Storage"},
