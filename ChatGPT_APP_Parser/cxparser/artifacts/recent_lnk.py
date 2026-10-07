@@ -10,7 +10,8 @@
 규칙
   대상 파일명이 'Codex 이미지 …' 면 E06-02 생성 이미지 다운로드 (확인) — 앱 고유 명명.
   그 밖에는 대상 파일이 바로가기와 같은 시각(±15초)에 새로 생겼을 때만 저장 후보(추정):
-    문서(확장자 또는 머리 바이트가 PDF·Office·텍스트) → E05-05 문서 다운로드 / 이미지·미확인 → E05-06 파일 다운로드.
+    문서(확장자 또는 머리 바이트가 PDF·Office·텍스트) → E05-05 문서 다운로드 / 이미지 → E06-02 생성 이미지 다운로드(추정, 앱 명명 규칙 아님) /
+    종류 미확인 → E05-05 문서 다운로드 + 사유 (팀 행위 분류 체계 2026-10-08: '파일 다운로드' 삭제, 종류를 알 수 없으면 문서 다운로드 + Behavior_details 에 사유).
   기존 문서를 열어서 생긴 바로가기(대상 생성 시각이 훨씬 이전)는 관찰(NA-00).
   어느 앱이 저장했는지는 바로가기에 없어, derive 에서 앱 실행 구간·Codex 대화의 파일명 언급으로 판정을 조정한다.
 """
@@ -81,6 +82,16 @@ def _secs(iso):
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
+def classify(ext, kind):
+    """저장된 파일의 (확장자, 머리 바이트 종류) → (이벤트, 행위 문구, 종류 설명).
+    문서 → E05-05, 이미지 → E06-02(추정), 그 밖(종류 미확인) → E05-05 + '종류 미확인' 사유 (팀 규칙 2026-10-08)."""
+    if ext in DOC_EXT or kind == "document":
+        return "E05-05", "문서 저장(새 파일)", "문서"
+    if ext in IMAGE_EXT or kind == "image":
+        return "E06-02", "이미지 저장(새 파일)", "이미지 (앱 명명 규칙 'Codex 이미지 …' 아님)"
+    return "E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 팀 규칙에 따라 문서 다운로드로 표기"
+
+
 def parse(vfile, image_desc, rb, max_excerpt=500):
     name = vfile.path.rsplit("/", 1)[-1]
     target = target_path(vfile.read())
@@ -108,14 +119,12 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                               rationale="바로가기보다 훨씬 전에 만들어진 파일을 연 흔적 — 저장(다운로드)이 아님"),
             model.evidence(image_desc, vfile, locator="lnk_target=%s" % target), status="ok",
             details={**common, "target_created_utc": tgt_created, "candidate_event": None})]
-    is_doc = ext in DOC_EXT or kind == "document"
-    is_img = ext in IMAGE_EXT or kind == "image"
-    eid = "E05-05" if is_doc else "E05-06"
+    eid, action, kind_note = classify(ext, kind)
     how = ("확장자 %s" % ext) if ext else ("머리 바이트로 %s 판별" % ({"document": "문서(PDF/Office)", "image": "이미지"}.get(kind, "종류 미확인")) if kind else "확장자 없음, 대상 미확인")
-    note = ("대상 파일이 바로가기와 같은 시각에 새로 생김 (생성 %s, %s)" % (tgt_created[:19], how)) if tgt_created else "대상 파일의 생성 시각은 확인하지 못함 (%s)" % how
+    note = ("대상 파일이 바로가기와 같은 시각에 새로 생김 (생성 %s, %s; %s)" % (tgt_created[:19], how, kind_note)) if tgt_created else "대상 파일의 생성 시각은 확인하지 못함 (%s; %s)" % (how, kind_note)
     return [model.Record(
         rb.next_id(), eid, events.name(eid), ts,
-        model.user_action(action="문서 저장(새 파일)" if is_doc else ("이미지 저장(새 파일)" if is_img else "파일 저장(새 파일)"), confidence=model.CONF_INFERRED,
+        model.user_action(action=action, confidence=model.CONF_INFERRED,
                           rationale=("최근 항목 바로가기 + %s — Codex 가 파일을 내려 저장한 흔적으로 추정. "
                                      "어느 앱이 저장했는지는 바로가기에 없어 앱 실행 구간·대화 언급과 대조한다 (derive)") % note),
         model.evidence(image_desc, vfile, locator="lnk_target=%s" % target), status="ok", notes=[note],
@@ -127,4 +136,8 @@ if __name__ == "__main__":  # python -m cxparser.artifacts.recent_lnk — 경로
     assert target_path(blob) == "C:\\Users\\a\\Desktop\\간단한_학습_계획서.docx", target_path(blob)
     assert target_path("C:\\Users\\a\\Downloads\\2019] 알기사 필기1(191224-수정)(4)".encode("utf-16le")) == "C:\\Users\\a\\Downloads\\2019] 알기사 필기1(191224-수정)(4)"
     assert target_path(b"no path here") is None
+    assert classify(".pdf", None)[0] == "E05-05" and classify("", "document")[0] == "E05-05"
+    assert classify(".png", None)[0] == "E06-02" and classify("", "image")[0] == "E06-02"
+    assert classify("", "unknown") == ("E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 팀 규칙에 따라 문서 다운로드로 표기")
+    assert classify(".zip", None)[0] == "E05-05" and "E05-06" not in events.EVENTS      # '파일 다운로드' 는 더 이상 내지 않는다
     print("recent_lnk self-check ok")

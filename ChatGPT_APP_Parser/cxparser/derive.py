@@ -156,7 +156,8 @@ def _demote_saves_outside_sessions(records):
         _det(r).get("text"), _det(r).get("prompt_text"), r["user_action"].get("observed_artifact"),
         (r.get("evidence") or {}).get("excerpt")) if v)
     for r in records:
-        if r["event"]["event_id"] in ("E05-05", "E05-06") and _det(r).get("artifact") == "recent_lnk" and _utc(r):
+        if (r["event"]["event_id"] in ("E05-05", "E06-02") and _det(r).get("artifact") == "recent_lnk" and _utc(r)
+                and r["user_action"].get("confidence") != model.CONF_CONFIRMED):   # 앱 명명 'Codex 이미지 …' (확인) 은 조정하지 않는다
             t = _secs(_utc(r))
             fname = str(_det(r).get("file_name") or "")
             stem = (fname.rsplit(".", 1)[0] if "." in fname and len(fname.rsplit(".", 1)[-1]) <= 5 else fname).lower()
