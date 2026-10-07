@@ -134,7 +134,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 
 0.3.11 (2026-10-03, Autopsy thin adapter PoC — PL 'DFIR 생태계 확장' 문서 기준): 폴더 입력에서 호스트 DFIR 도구가 넘긴 메타데이터를 근거로 쓴다. 추출 폴더 루트에 `_host_metadata.json`(경로별 MFT 시각·레코드 번호, 꺼내지 않은 폴더·바로가기 대상 파일의 시각·크기·첫 8바이트)이 있으면 `DirectoryVfs` 가 읽어 설치(패키지 폴더 생성 시각)·다운로드(바로가기 대상 생성 시각)·MFT 근거를 이미지 입력과 같게 만든다 — 이미지를 다시 읽지 않는다(`vfs.py`, `recent_lnk.py`, `package_install.py`, 약 60줄). 파일이 없으면 이전 폴더 입력과 출력이 동일. 버그 수정: 같은 경로의 **삭제된 옛 `-wal`/캐시 조각이 현존 파일을 덮어쓰던 문제**(이미지 입력에서 logs_2.sqlite 가 옛 WAL 과 짝지어져 최신 트랜잭션이 빠짐) — 현존 파일 우선. 삭제 제외 이미지에서 마지막 프로세스 구간이 14:09:05~14:14:51 → 14:09:34~14:15:23 로 바뀌고(WAL 반영), 정답지 대조는 12/2/5 그대로.
 
-0.3.10 (2026-09-29, PL QA 프레임 적용 — Digital Corpora NPS 이미지로 robustness 확인): Codex 아티팩트가 하나도 없는 이미지는 오류(exit 2)가 아니라 0행 timeline/recovered CSV + 경고(exit 0)로 끝난다. 통합 실행기가 negative control 이미지를 '파서 실패'로 집계하던 문제 해소. 이미지 자체를 못 여는 경우(IMAGE_OPEN_FAILED, UNSUPPORTED_FORMAT)는 그대로 exit 2.
+0.3.10 (2026-09-29, PL QA 프레임 적용 — Digital Corpora NPS 이미지로 robustness 확인): Codex 아티팩트가 하나도 없는 이미지는 오류(exit 2)가 아니라 0행 timeline/recovered CSV + 경고(exit 0)로 끝난다. ARTINEX 통합 실행기가 negative control 이미지를 '파서 실패'로 집계하던 문제 해소. 이미지 자체를 못 여는 경우(IMAGE_OPEN_FAILED, UNSUPPORTED_FORMAT)는 그대로 exit 2.
 
 0.3.9 (2026-09-28, 삭제 제외 시나리오 raw 분할 이미지로 검증 — 정답 19건 중 12 일치): 애플리케이션 설치 = `Program Files\WindowsApps\OpenAI.Codex_…` 패키지 폴더의 MFT 생성 시각(`package_install.py`, 확인; 실험 시트의 설치 시각은 첫 실행 시각이라 40분 차이). 최근 항목 저장 규칙이 확장자 없는 대상도 머리 바이트(%PDF, PK, PNG…)로 종류를 판별하고, 문서가 아니면 E05-06 파일 다운로드, 이름 뒤 `(4)` 중복 번호는 떼고 대화 언급과 대조. 검증으로 확인된 이 앱의 한계: 임시 채팅(에이전트 모드는 흔적 없음)·공유 링크·계정 이름 변경(로그·파일 변화 없음)·강제 종료(종료 로그 없음; lockfile·Preferences 는 정상 종료 뒤에도 남아 8월 지문 재현 안 됨)·계정 전환(USN 미커버 + auth.json 삭제됨).
 0.3.8 (2026-09-23, 팀원 E01 '삭제 제외 시나리오' 검증): 에이전트 모드 모델 변경 = rollout `turn_context.model` 이 직전 turn 과 달라지는 지점(확인). 이미지 생성 요청 = rollout custom_tool_call 입력에 imagegen/image_gen 도구 탐색·호출(확인). 첨부 업로드 파싱은 `## 파일명: 경로` 줄만 (경로 `/`·`\` 모두). 최근 항목 문서 저장은 Codex 대화·도구 호출에 파일명이 언급될 때만 추정, 아니면 미확정 (다른 앱 다운로드 오귀속 방지 — Claude Desktop PDF 표본).
@@ -271,7 +271,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 이 저장소에는 파서 소스만 있다. 개발 때 쓰던 단위 테스트(`tests/`), 테스트 이미지 생성 도구(`tools/`),
 분석표 대조 결과(`verification/`)는 포함되어 있지 않다. 0절의 "합성 테스트 43건"은 그 테스트의 결과다.
 
-저장소 안에서 할 수 있는 검증은 통합 실행기의 정답지 대조다 (`integration/` 에서 실행, 정답 시트가 있는 실험 이미지 전용).
+저장소 안에서 할 수 있는 검증은 ARTINEX 통합 실행기의 정답지 대조다 (`integration/` 에서 실행, 정답 시트가 있는 실험 이미지 전용).
 
 ```powershell
 python llm_forensic.py -i <이미지> -o out --only chatgpt_desktop

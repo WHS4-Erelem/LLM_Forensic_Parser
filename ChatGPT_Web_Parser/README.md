@@ -121,7 +121,7 @@ bek:<.BEK 파일 경로>
 fvek:<hex>
 ```
 
-> **키 전달 주의.** `--key-material` 은 명령행 인자라 셸 기록이나 **상위 통합 실행기의 `run.log`
+> **키 전달 주의.** `--key-material` 은 명령행 인자라 셸 기록이나 **상위 ARTINEX 통합 실행기의 `run.log`
 > (실행 명령 문자열을 그대로 기록한다)** 에 남을 수 있다. 그래서 통합 실행처럼 로그가 남는 경로에서는
 > 환경변수 **`ERELM_KEY_MATERIAL`** 로 주는 것을 권장한다. **실제 복구 키를
 > `integration/parsers.json` 의 `args` 에 적지 말 것.**

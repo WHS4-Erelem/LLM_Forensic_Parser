@@ -1,5 +1,6 @@
-# LLM 파서 통합 실행기
+# ARTINEX 통합 실행기
 
+ARTINEX 는 LLM 서비스 6종 파서를 하나로 묶은 통합 포렌식 파서의 이름이고, 이 폴더는 그 통합 실행기다.
 이미지 하나를 주면 파서 6개를 순서대로 실행하고, 결과 CSV 계약(헤더·판정·시각·빈 셀 `-`)을 검사한 뒤
 SQLite 에 적재하고 병합 `timeline.csv` / `recovered_conversations.csv` 와 실행 요약 `integration_report.json` 을 만든다.
 
@@ -12,8 +13,9 @@ python llm_forensic.py --self-test
 
 결과: `out\<evidence_id>\`
 - `<파서명>\` 파서별 원본 결과(그대로 보존, 같은 이미지로 재실행하면 그 파서 폴더만 새 결과로 교체) + `run.log`(파서 버전·python·명령·시작 시각·stdout/stderr·종료코드)
-  - 통합 대상은 계약 CSV 2개(`timeline.csv`, `recovered_conversations.csv`)와 `run.log` 만이다. `result.json`, `cx_result.json`, `gemini_results.json` 같은 그 외 파일은 파서 담당자가 남기는 고유 부산물(원본 레코드·규칙 판정 상세)로, 파서마다 있거나 없고 형식도 다르다. 통합기는 읽지 않는다 (예외: 레지스트리 `volume_json` 으로 지정한 파서의 JSON 에서 볼륨 오프셋만 꺼낸다).
-- `timeline.csv`, `recovered_conversations.csv` 병합본 — 팀 7열/10열은 헤더·값 모두 파서가 쓴 그대로, 그 뒤에 provenance 열
+  - 통합 대상은 계약 CSV 2개(`timeline.csv`, `recovered_conversations.csv`)와 `run.log` 만이다. `result.json`, `cx_result.json`, `gemini_results.json` 같은 그 외 파일은 파서 담당자가 남기는 고유 부산물(원본 레코드·규칙 판정 상세)로, 파서마다 있거나 없고 형식도 다르다. 통합기는 읽지 않는다. (`parsers.json` 의 `volume_json` 항목은 예약된 설정으로, 현재 코드는 읽지 않는다.)
+- `timeline.csv`, `recovered_conversations.csv` 병합본 — 팀 7열/10열은 헤더·값 모두 파서가 쓴 그대로, 그 뒤에 provenance 열.
+  단 병합 CSV 로 쓸 때만 빈 값은 `-` 로, `=` `+` `-` `@` 로 시작하는 셀은 앞에 `'` 를 붙인다 (엑셀 수식 주입 방지). `unified.db` 에는 원본 값 그대로 들어 있다
 - `unified.db` — evidence / runs / events / messages
 - `integration_report.json` — 파서별 상태(`success` / `failed` / `contract_violation` / `normalization_error` / `db_error`), 적재 행 수, 오류 목록
 - `evidence_manifest.json` — 세그먼트별 `{file, size_bytes, sha256}` 매니페스트 + 전체 `evidence_sha256`. 분석 종료 후 같은 명령으로 다시 계산해 대조한다
@@ -32,7 +34,7 @@ provenance 열 (병합 CSV·DB 공통, 원본 열을 덮어쓰지 않고 덧붙�
 | `timestamp`, `artifact_path` | 파서가 쓴 원본 값 (timestamp_raw, artifact_path_raw) |
 | `timestamp_utc` | (DB 만) 원본 KST 표기를 UTC ISO 로 환산한 정규화 시각. 병합 CSV 정렬에 쓴다 |
 | `artifact_path_normalized` | 경로마다 드라이브·볼륨·이미지 접두어 제거, `\` 구분, 소문자 — 검색·중복 판별용. 여러 경로는 `\|` (앞뒤 공백 무관)로 나눠 각각 정규화한 뒤 ` \| ` 로 잇는다. NTFS ADS 스트림 표기(`:Zone.Identifier`, `:$J`)는 원문 그대로 |
-| `volume_ref` | 파서가 준 볼륨 식별자 (`ntfs@오프셋`, `volume0`), 없으면 `-` |
+| `volume_ref` | 증거가 발견된 드라이브 문자. `C:\...` 경로는 `C:`. 파서가 `volumeN:` / `이미지::NTFS@오프셋/` 으로만 부르는 볼륨이나 볼륨 표기 없는 루트 기준 경로(`Users/...`)는 같은 파서 결과 안에 그 볼륨의 `Users\`·`Windows\` 경로가 있을 때 시스템 볼륨으로 보고 `C:`, 그 외(복구·데이터 파티션, 경로 없음)는 `-` |
 | `source_parser`, `parser_version`, `source_file`, `parse_time_utc` | 어느 파서의 어느 파일에서, 어떤 코드 버전(소스 해시 포함, 줄바꿈 CRLF/LF 차이는 무시)으로, 언제(UTC, 예 `2026-09-21T19:22:46Z`) 나왔는지 |
 | `evidence_id`, `evidence_sha256` | 어떤 증거 이미지인지. `evidence_sha256` 은 세그먼트 전체(E01 분할·raw 분할 모두)를 순서대로 이어 계산한 SHA-256 (무결성 대조용). `evidence_id` 는 첫 64MiB 지문(`evidence_quick_fingerprint`)의 앞 16자로, 폴더명 식별자일 뿐 무결성 값이 아니다. `--quick` 이면 `evidence_sha256`='-' |
 
@@ -84,8 +86,8 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 - 입력 이미지: E01 분할(.E01~)과 raw 분할(.001, .002 …)은 첫 세그먼트 경로만 주면 나머지를 모아 결번을 검사한다. `.dd`/`.raw`/`.img` 단일 파일도 된다.
 - `[Runner]` 가 `OK events=0 messages=0` 이면 콘솔에 0건 표시가 붙고 보고서의 `artifacts_found` 가 false 다. 흔적이 없는 것인지 파서가 입력을 못 읽은 것인지는 `<파서명>\run.log` 로 구분한다.
 - `artifact_path` 는 파서 표기 그대로 두고, 검색·중복 판별은 `artifact_path_normalized` 로 한다 (드라이브 문자 추정 안 함).
-- `volume_ref` 는 파서가 준 값만 옮긴다. 우선순위: Artifact_details 의 `volume=` / `partition_offset=` 키 → 경로의 `NTFS@오프셋`·`volumeN` → 레지스트리 `volume_json`(실행 단위 JSON) → `-`.
-  현재 chatgpt_desktop·gemini_web 은 행 단위, chatgpt_web 은 실행 단위, lmstudio 는 경로(volume0), claude_desktop·claude_web 은 미제공(`-`).
+- `volume_ref` 는 `Artifact_path` 만 보고 정한다. 드라이브 문자 경로는 그 문자, `volumeN:`(lmstudio)·`::NTFS@오프셋/`(gemini_web) 볼륨과 볼륨 표기 없는 루트 기준 경로(chatgpt_web)는 그 볼륨에 `Users\`·`Windows\` 경로가 하나라도 있으면 `C:` 로 판정한다 (LM Studio 의 `volume0` 은 "파서가 열 수 있었던 첫 NTFS" 라 System Reserved·BitLocker 구성에서는 C: 가 아닐 수 있어 번호를 그대로 믿지 않는다).
+  `Artifact_details` 의 `volume=ntfs@오프셋` 과 레지스트리 `volume_json` 은 읽지 않는다.
 - 헤더·열 수·Verdict·Timestamp·빈 셀 계약을 어긴 파서 결과는 고쳐 받지 않고 그 파서 결과 전체를 적재하지 않은 채 `contract_violation` 으로 보고한다 (위 오류 유형 표).
 - 종료코드 0 전부 성공 / 1 일부 실패·위반 / 2 입력 실패 / 3 통합 DB·병합 출력 오류.
 

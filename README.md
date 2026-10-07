@@ -1,7 +1,8 @@
-# LLM_Forensic_Parser
+# ARTINEX
 
 Windows 디스크 이미지(E01 / raw)에서 LLM 서비스 6종의 사용 흔적을 찾아
-**사용자 행위 타임라인**과 **복구된 대화 내용**을 뽑아내는 포렌식 파서 모음과, 그 6개를 한 번에 돌리는 통합 실행기.
+**사용자 행위 타임라인**과 **복구된 대화 내용**을 뽑아내는 포렌식 파서 모음과, 그 6개를 한 번에 돌리는 ARTINEX 통합 실행기.
+ARTINEX 는 이 통합 파서 전체의 이름이다 (저장소: `LLM_Forensic_Parser`).
 
 WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」 산출물.
 
@@ -15,7 +16,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 | `Claude_Web_Parser` | claude.ai (Chrome) | `python -m claude_web_forensics` | Python 3.12 · dissect · ccl-chromium-reader |
 | `Gemini_Web_Parser` | gemini.google.com (Chrome) | `gemini_parser.py` | Python 3.10+ · pytsk3 · libewf-python |
 | `LMstudio_parser` | LM Studio (로컬 LLM) | `lmstudio_parser.py` | Python 3.12 · dissect |
-| `integration` | 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 공용 `.venv312`) |
+| `integration` | ARTINEX 통합 실행기 — 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 공용 `.venv312`) |
 
 파서마다 자세한 사용법과 판정 규칙은 각 폴더의 README 에 있다.
 
@@ -28,7 +29,7 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 - `Verdict` 는 `확정` 또는 `의심`, 시각은 `YYYY-MM-DD HH:MM:SS.ffffff KST`, 빈 값은 `-`
 - `User_behavior` 는 팀 행위 분류 체계 `integration/user_behaviors.txt` 의 이름만 쓴다 (서비스명 없이). 목록 밖 이름은 통합기가 경고로 보고한다
 
-## 빠른 시작 (통합 실행)
+## 빠른 시작 (ARTINEX 통합 실행)
 
 [uv](https://docs.astral.sh/uv/) 가 필요하다.
 
