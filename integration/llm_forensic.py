@@ -306,12 +306,46 @@ def normalize_path(raw):
     return " | ".join(x for x in parts if x) or EMPTY
 
 
-def volume_ref(path):
-    """Artifact_path 에 명시된 volumeN 만 볼륨 식별자로 쓴다. 드라이브 경로는 '-'."""
-    m = re.match(r"^(volume\d+):", str(path), re.I)
+_VOL_KEY = re.compile(r"^(?:.*?::(NTFS@\d+)[\\/]|(volume\d+):|([A-Za-z]):[\\/])", re.I)
+_SYSTEM_DIRS = {"users", "windows"}                   # 이 폴더가 있는 볼륨 = Windows 시스템 볼륨 (C:)
+
+
+def _volume_key(one):
+    """경로 한 개 → (볼륨 키, 볼륨 루트 기준 첫 폴더). 키: 'C:' / 'volume0' / 'ntfs@227540992',
+    볼륨 표기 없는 루트 기준 경로('Users/x/History')는 '' (한 파서 결과 안에서 같은 볼륨으로 본다), 빈 값·'-' 는 None."""
+    s = one.strip()
+    if not s or s == EMPTY:
+        return None, None
+    m = _VOL_KEY.match(s)
     if m:
-        return m.group(1).lower()
-    return EMPTY
+        key, rest = (m.group(3).upper() + ":" if m.group(3) else (m.group(1) or m.group(2)).lower()), s[m.end():]
+    else:
+        key, rest = "", s
+    return key, rest.replace("/", "\\").lstrip("\\").split("\\", 1)[0].lower()
+
+
+def system_volume_keys(paths):
+    """파서 결과 전체에서 Users\\ 또는 Windows\\ 경로를 가진 볼륨 키 집합. 파서가 volume0 / NTFS@오프셋 으로만 부르는 볼륨도
+    그 안에 Users 가 있으면 시스템 볼륨이다 (번호는 파서가 열 수 있었던 NTFS 순서라 0 이 곧 C: 는 아니다)."""
+    keys = set()
+    for raw in paths:
+        for one in _PATH_SPLIT.split(str(raw)):
+            key, first = _volume_key(one)
+            if key is not None and first in _SYSTEM_DIRS:
+                keys.add(key)
+    return keys
+
+
+def volume_ref(raw, system_keys=()):
+    """드라이브 문자 경로는 그 문자(C:). volumeN / NTFS@오프셋 볼륨은 같은 결과 안에 Users·Windows 경로가 있어 시스템 볼륨으로
+    판정될 때만 C:, 그 외(복구·데이터 파티션, 경로 없음)는 '-'. 여러 경로는 서로 다른 값만 ' | ' 로 잇는다."""
+    refs = []
+    for one in _PATH_SPLIT.split(str(raw)):
+        key, _ = _volume_key(one)
+        ref = key if key and key.endswith(":") else ("C:" if key is not None and key in system_keys else None)
+        if ref and ref not in refs:
+            refs.append(ref)
+    return " | ".join(refs) or EMPTY
 
 
 def kst_to_utc(ts):
@@ -398,9 +432,7 @@ def normalize(run, evidence):
                 continue
             derived = {}
             for target, src, fn in (("timestamp_utc", "timestamp", lambda: kst_to_utc(r["timestamp"])),
-                                    ("artifact_path_normalized", "artifact_path", lambda: normalize_path(r["artifact_path"])),
-                                    ("volume_ref", "artifact_path",
-                                     lambda: volume_ref(r["artifact_path"]))):
+                                    ("artifact_path_normalized", "artifact_path", lambda: normalize_path(r["artifact_path"]))):
                 try:
                     derived[target] = fn()
                 except Exception as exc:               # 통합 쪽 계산 실패 — 파서 값은 고치지 않고 오류로만 남긴다
@@ -414,6 +446,10 @@ def normalize(run, evidence):
             raw = dict(zip(columns, values))           # row_hash 는 파서 원본 헤더·값 기준 (이전 버전과 같은 값)
             row_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
             out[kind].append({**r, **prov, **derived, "source_file": name, "row_hash": row_hash})
+    keys = system_volume_keys(x["artifact_path"] for rows in out.values() for x in rows)   # 볼륨 판정은 이 파서 결과 전체를 보고
+    for rows in out.values():
+        for x in rows:
+            x["volume_ref"] = volume_ref(x["artifact_path"], keys)
     return out["timeline"], out["conversations"], errors + warnings, source_rows
 
 
@@ -805,8 +841,17 @@ def self_test():
     assert normalize_path(r"volume0:\$Extend\$UsnJrnl:$J | volume0:\A\B.exe") == r"$extend\$usnjrnl:$J | a\b.exe"
     assert normalize_path(r"C:\A\f.txt::$DATA") == r"a\f.txt::$DATA"
     assert normalize_path("-") == EMPTY and normalize_path("") == EMPTY
-    assert volume_ref("img.E01::NTFS@227540992/Users") == EMPTY
-    assert volume_ref("volume0:\\Users") == "volume0" and volume_ref("C:\\Users") == EMPTY
+    # volume_ref: 드라이브 문자는 그대로, volumeN / NTFS@오프셋 은 그 볼륨에 Users·Windows 가 있을 때만 C:, 아니면 '-'
+    assert volume_ref("C:\\Users\\A") == "C:" and volume_ref("d:/Data/x") == "D:" and volume_ref("-") == EMPTY
+    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J") == EMPTY                    # 혼자서는 어느 볼륨인지 모른다
+    sys_keys = system_volume_keys(["volume0:\\Users\\A\\x", "volume1:\\Recovery\\WindowsRE", "img.E01::NTFS@227540992/Windows/Prefetch/a.pf"])
+    assert sys_keys == {"volume0", "ntfs@227540992"}, sys_keys
+    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J", sys_keys) == "C:" and volume_ref("volume1:\\Recovery\\x", sys_keys) == EMPTY
+    assert volume_ref("D:/img.E01::NTFS@227540992/Users/llmtest/History", sys_keys) == "C:"   # 이미지 경로의 D: 는 볼륨이 아니다
+    assert volume_ref("volume0:\\Users\\A\\y | C:\\Users\\A\\z", sys_keys) == "C:" and volume_ref("C:\\a | D:\\b") == "C: | D:"
+    rel_keys = system_volume_keys(["Users/llmtest/AppData/Local/Google/Chrome/User Data/Default/History", "-"])   # 볼륨 표기 없는 루트 기준 경로 (chatgpt_web)
+    assert rel_keys == {""} and volume_ref("Users/llmtest/x", rel_keys) == "C:" and volume_ref("-", rel_keys) == EMPTY
+    assert volume_ref("Recovery/WindowsRE/x", system_volume_keys(["Recovery/WindowsRE/x"])) == EMPTY
     assert kst_to_utc("2026-09-15 13:20:41.807000 KST") == "2026-09-15T04:20:41.807000Z"
     assert kst_to_utc("-") is None and kst_to_utc("2026-09-15 13:20:41 KST") is None
     assert _safe("=1") == "'=1" and _safe("") == EMPTY and _safe("-") == EMPTY
@@ -1026,7 +1071,7 @@ def _self_test_end_to_end(td, image, evidence_id):
     tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}
-    assert {r["volume_ref"] for r in tl} == {EMPTY, "volume0"}
+    assert {r["volume_ref"] for r in tl} == {"C:"}                             # C:\ · volume0:\Users · NTFS@7/Users 모두 C:
     assert all(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", r["parse_time_utc"]) for r in tl)
     with open(os.path.join(case, "recovered_conversations.csv"), encoding="utf-8-sig", newline="") as fh:
         assert next(csv.reader(fh)) == CONV_COLUMNS + EXTRA_COLUMNS
