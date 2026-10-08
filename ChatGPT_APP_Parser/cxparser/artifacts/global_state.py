@@ -4,7 +4,7 @@
   prompt-history.chatgpt-global                       -> E04-01 프롬프트 전송(평문 배열)
     (실제 표본: "prompt-history": {"global": [...], "chatgpt-global": [...]} 중첩 dict.
      점 표기 단일 키 형태도 함께 허용)
-  chatgpt-last-selected-model-v1 {slug, versionId}    -> E09-01 모델 변경
+  chatgpt-last-selected-model-v1 {slug, versionId}    -> NA-00 관찰 (선택 모델 상태값. E09-01 은 rollout·웹 캐시의 변화로만)
   client-thread-bindings-v1.local-chatgpt:<UUID>      -> E07-02/03 공유 링크·대화 공유
   sidebar-onboarding-checklist-state-by-account-id-v2 -> 이 PC 에서 로그인한 계정 UUID 열거
 키 중첩 위치는 단정하지 않고 JSON 트리 전체에서 탐색한다.
@@ -87,27 +87,29 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                          "prompt_text": mask_text(text) if text else None,
                          "raw_item_type": type(item).__name__}))
 
-    # --- 마지막 선택 모델 (E09-01) -----------------------------------
+    # --- 마지막 선택 모델 — 관찰(NA-00). E09-01 로 올리지 않는다 -----------------------------------
+    # 검증(2026-10-06, image2 'LLM 내부정보 유출' E01): 모델을 바꾸지 않은 시나리오에서도 이 키가 있어
+    # '모델 변경 의심(시각 없음)' 오탐이 났다. 이 키는 "지금 선택된 모델" 상태값이라 바꿨다는 근거가 못 된다.
+    # 모델 변경은 바뀐 지점이 보이는 아티팩트로만 판정한다: 에이전트 모드 rollout 의 turn_context.model 변화,
+    # 채팅 모드 웹 캐시의 default_model_slug 변화. 여기서는 선택 모델 slug 를 관찰로 남겨 그 판정의 보조 근거로 둔다.
     for ptr, val in find_key(data, K_LAST_MODEL):
         slug = val.get("slug") if isinstance(val, dict) else val
         version = val.get("versionId") if isinstance(val, dict) else None
         records.append(model.Record(
-            rb.next_id(), "E09-01", events.name("E09-01"),
+            rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(
                 null_reason=("모델 선택 키 자체에 시각이 없음 — 파일 MFT 시각은 "
                              "evidence.location 참조(행위 시각으로 대체하지 않음)")),
             model.user_action(
-                action="모델 변경(마지막 선택 모델 기록)",
-                confidence=model.CONF_INFERRED,
-                rationale=("전역 상태 파일의 %s 키 — 분석표 E09-01 "
-                           "(선택 모델명 평문)" % K_LAST_MODEL)),
+                observed="마지막 선택 모델 %s" % (slug or "-"),
+                rationale=("전역 상태 파일의 %s 키 — '지금 선택된 모델' 상태값. 바꾼 시각·이전 모델이 없어 "
+                           "모델 변경(E09-01)의 근거로 쓰지 않는다 (변경은 rollout·웹 캐시의 모델 변화로 판정)") % K_LAST_MODEL),
             model.evidence(image_desc, vfile, locator="json_pointer=%s" % ptr,
                            excerpt=excerpt(json.dumps(val, ensure_ascii=False),
                                            max_excerpt),
                            artifact_sha256=sha),
             status="ok",
-            notes=["이 키는 '마지막 선택' 상태값 — 변경 시각·이전 모델은 알 수 없음"],
-            details={"artifact": "codex_global_state", "key": K_LAST_MODEL,
+            details={"artifact": "codex_global_state", "key": K_LAST_MODEL, "candidate_event": "E09-01",
                      "model_slug": slug, "version_id": version}))
 
     # --- 스레드 바인딩 (공유 후보 관찰 — E07-02/03 로 단정하지 않음) --------
