@@ -902,7 +902,14 @@ class MainWindow(QWidget):
         picks.addLayout(pick_buttons)
         body.addWidget(soft)
 
-        self.cb_quick = QCheckBox("--quick (세그먼트 SHA-256 생략 — 무결성 대조 불가)")
+        self.cb_quick = QCheckBox("--quick 빠른 분석 (전체·세그먼트 무결성 해시 계산 생략)")
+        # 문구는 integration/llm_forensic.py 의 evidence_manager(quick=) 실제 동작을 그대로 옮긴다.
+        self.cb_quick.setToolTip(
+            "Quick Mode 는 아티팩트 분석이나 Parser 를 생략하지 않습니다.\n"
+            "전체 Evidence 의 SHA-256·MD5·SHA-1 과 세그먼트별 SHA-256 계산을 생략하며,\n"
+            "RAW sidecar 해시와의 무결성 대조도 수행하지 않습니다.\n"
+            "Evidence ID 생성을 위한 첫 세그먼트 앞 64 MiB quick fingerprint 는 계산합니다.\n"
+            "Parser 분석·계약 검사·Unified DB·병합 결과 생성은 일반 모드와 동일하게 수행됩니다.")
         self.cb_quick.toggled.connect(self._revalidate)
         body.addWidget(self.cb_quick)
         body.addStretch(1)
@@ -1371,7 +1378,7 @@ class MainWindow(QWidget):
                                                   "llm_forensic.py 확인됨" if ok_runner else "Runner 를 찾을 수 없음")
         self.validation_rows["readonly"].set_status(
             "success", "증거는 읽기만 하고 결과는 결과 폴더에만 생성" if not self.cb_quick.isChecked()
-            else "읽기 전용 · --quick 으로 해시 생략")
+            else "읽기 전용 · --quick 으로 무결성 해시 계산 생략 (Parser 분석은 동일)")
         self._ready = ok_image and bool(kind) and ok_out and not conflict and ok_parsers and ok_runner
         self._out_conflict = conflict
         self._update_run_button()

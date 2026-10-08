@@ -277,7 +277,7 @@ class ResultBundle:
             ("형식", (ev.get("kind") or "기록 없음").upper(), False),
             ("크기", "%.1f GB (%s B)" % (size / 2 ** 30, format(size, ",")) if size else "기록 없음", False),
             ("세그먼트", ", ".join(ev.get("segments") or []) or "기록 없음", True),
-            ("SHA-256", ev.get("evidence_sha256") or "기록 없음", True),
+            ("SHA-256", self._integrity_hash(ev.get("evidence_sha256")), True),
             ("Quick Fingerprint", ev.get("evidence_quick_fingerprint") or "기록 없음", True),
             ("Run ID", report.get("run_id") or "기록 없음", True),
             ("분석 모드", report.get("mode") or "기록 없음", False),
@@ -285,8 +285,18 @@ class ResultBundle:
             ("종료 코드", str(report.get("exit_code")) if report.get("exit_code") is not None else "기록 없음", False),
         ]
         if report.get("quick"):
-            items.append(("무결성 주의", "--quick 실행 — 전체 SHA-256 미계산", False))
+            items.append(("실행 모드", "--quick — 전체 Evidence SHA-256·MD5·SHA-1 과 세그먼트별 SHA-256 계산, "
+                                       "RAW sidecar 무결성 대조를 생략함 (오류 아님). "
+                                       "Parser 분석·계약 검사·병합 결과 생성은 동일하게 수행됨", False))
         return items
+
+    def _integrity_hash(self, value):
+        """evidence_sha256 표시. --quick 이면 '-' 가 정상 결과라서 오류로 보이지 않게 사유를 덧붙인다."""
+        if value and value != EMPTY:
+            return value
+        if (self.report or {}).get("quick"):
+            return "- (--quick 로 계산 생략 — 오류 아님)"
+        return value or "기록 없음"
 
     def metrics(self, service=None):
         """Overview 지표. 결과 파일에서 셀 수 있는 값만 담는다."""
@@ -446,7 +456,9 @@ class ResultBundle:
         report = self.report or {}
         notes = []
         if report.get("quick"):
-            notes.append("--quick 실행: evidence_sha256 를 계산하지 않았으므로 무결성 대조가 불가합니다.")
+            notes.append("--quick 실행: 전체 Evidence 의 SHA-256·MD5·SHA-1 과 세그먼트별 SHA-256 을 계산하지 않아 "
+                         "무결성 대조를 수행하지 않았습니다 (Evidence ID 용 quick fingerprint 는 계산됨). "
+                         "Parser 분석과 결과 생성은 생략되지 않았습니다.")
         if report.get("mode") == "only":
             notes.append("선택 실행(--only %s): 선택하지 않은 파서의 결과는 이번 실행에서 생성되지 않았습니다."
                          % ", ".join(report.get("only") or []))
