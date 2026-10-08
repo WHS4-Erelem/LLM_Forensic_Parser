@@ -5,8 +5,28 @@ GUI 는 새 포렌식 Parser 가 아니며, 판정·Finding 을 만들지 않는
 통합 Runner 가 만든 `timeline.csv` / `recovered_conversations.csv` / `integration_report.json` 에서 읽은 것이다.
 
 ```
-E01 / DD  →  PyQt6 GUI  →  integration/llm_forensic.py  →  파서 6개  →  공통 Schema
+E01 / DD  →  PyQt6 GUI  →  integration/llm_forensic.py  →  parsers.json 에 등록된 파서  →  공통 Schema
           →  timeline.csv · recovered_conversations.csv · unified.db · integration_report.json  →  GUI 표시
+```
+
+GUI 는 **통합 Runner 하나만** 실행한다. 개별 파서를 직접 실행하지 않고, 파서 실행 명령을 GUI 에 적어 두지도
+않는다 — 파서 목록과 실행 방법의 source of truth 는 `integration/parsers.json` 이다. 새 파서가 등록되면
+GUI 를 고치지 않아도 선택 목록에 나타난다.
+
+**플러그인 기능은 포함하지 않는다.** 저장소에 `Autopsy_Addon/` 이 있어도 GUI 는 그것을 import·실행하지 않고
+버튼·메뉴도 만들지 않는다 (`gui/tests/test_gui_integration.py::PluginIsolationTest` 가 이를 지킨다).
+
+### 결과 폴더는 `<출력 폴더>\<evidence_id>`
+
+통합 Runner 는 결과를 사용자가 고른 출력 폴더 **바로 아래가 아니라** `<out>\<evidence_id>\` 에 만든다
+(`evidence_id` = 첫 세그먼트 앞 64 MiB SHA-256 의 앞 16자). GUI 는 이 경로를 계산하지 않고
+Runner 의 `[Report]` 출력 경로에서 얻는다. 그 줄을 놓친 경우에만 출력 폴더를 훑어 결과 폴더를 찾는다.
+
+```
+<out>\<evidence_id>\
+├─ timeline.csv · recovered_conversations.csv      ← 병합 결과 (팀 열 + provenance 열)
+├─ unified.db · integration_report.json · evidence_manifest.json
+└─ <parser_name>\                                  ← 파서별 원본 결과 + run.log
 ```
 
 ## 실행
@@ -44,6 +64,34 @@ Errors / Artifacts 표도 같은 패널을 쓴다.
 | `gui/result_loader.py` | 결과 폴더 읽기 전용 로더 (CSV·보고서 → 지표·세션·아티팩트·오류) |
 | `gui/case_manager.py` | `case_info.json` 저장·읽기 |
 | `gui/styles.qss` | Light DFIR 테마 (Teal accent) |
+| `gui/tests/test_gui_integration.py` | GUI ↔ 통합 계약 회귀 테스트 (CLI 인자 · console 파싱 · 결과 로딩 · 플러그인 격리) |
+
+테스트는 GUI 와 같은 해석기(PyQt6 가 있는 Python 3.13)로 돌린다. 파서용 `.venv312` 에는 PyQt6 가 없다.
+
+```powershell
+$env:QT_QPA_PLATFORM = "offscreen"
+python -B -m unittest discover -s gui/tests
+```
+
+## 통합 Runner 계약 (GUI 가 맞추는 대상)
+
+| 항목 | 내용 |
+|---|---|
+| 실행 | `python -u integration/llm_forensic.py -i <IMAGE> -o <OUT> --registry <parsers.json> [--only a,b] [--quick]` |
+| 파서 선택 | GUI 체크박스 → `--only` (전체 선택이면 `--only` 를 붙이지 않는다) |
+| `--quick` | **전체·세그먼트 무결성 해시 계산만 생략**한다. 파서·아티팩트를 생략하지 않는다. 이때 `evidence_sha256` 이 `-` 로 남는 것은 정상이며 GUI 는 오류로 표시하지 않는다 |
+| 종료코드 | `0` 전부 성공 / `1` 일부 파서 실패·계약 위반 / `2` 입력 실패 / `3` 통합 DB·병합 출력 오류 |
+| `exit=1` | **전체 실패가 아니다.** 정상 파서의 `timeline.csv` 등이 존재하므로 GUI 는 결과 화면을 열고, 실패 파서만 Errors & Limitations 에 보여 준다 |
+| `exit=2/3` | 병합 CSV 가 없어도 `integration_report.json` 이 있으면 결과 화면을 열어 오류를 보여 준다 |
+| console | `[Evidence]` · `[Runner]` · `[DB]` · `[Timeline]` · `[Report]` · `[Summary]`. `[DB] FAILED` 는 파서를 하나도 실행하지 못한 상태라 화면에 바로 표시한다 |
+| 파서 상태 | report 의 `success` / `failed` / `contract_violation` / `normalization_error` / `db_error` / `output_error` 를 그대로 쓴다. GUI 가 없는 상태를 만들지 않는다 |
+| warning | `UNKNOWN_USER_BEHAVIOR` 같은 warning 은 경고다 — warning 하나로 파서를 Failed 로 바꾸지 않는다 |
+| `--only` 재실행 | 같은 `evidence_id` 의 이전 결과가 병합본에 남을 수 있다. report 의 `preserved_from_previous_runs` 를 읽어 "이전 실행에서 남은 행" 으로 표시하고, 이번 실행 성공으로 세지 않는다 |
+
+### 기존 결과 불러오기
+
+사용자가 고른 폴더가 `<out>\<evidence_id>` 자체여도, 여러 `<evidence_id>` 를 가진 `<out>` 이어도 모두 열린다
+(`find_result_dirs`). 기존 결과는 **읽기만** 한다.
 
 ## 포렌식 안전
 

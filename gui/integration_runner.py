@@ -25,6 +25,9 @@ _RUNNER = re.compile(r"^\[Runner\]\s+(?P<name>\S+)\s*(?P<rest>.*)$")
 _RESULT = re.compile(r"^\s*(?P<label>OK|FAILED|CONTRACT_VIOLATION|NORMALIZATION_ERROR|DB_ERROR|OUTPUT_ERROR)\b")
 _REPORT = re.compile(r"^\[Report\]\s+(?P<path>.+)$")
 _TIMELINE = re.compile(r"^\[Timeline\]\s+(?P<path>.+?)\s+\d+행\s*$")
+# [DB] 는 경로·초기화 안내와 치명적 실패를 같은 접두사로 낸다. 실패면 파서를 하나도 실행하지 않고
+# 종료코드 3 으로 끝나므로(llm_forensic.py), 보고서를 읽기 전에 화면에서 바로 보이게 한다.
+_DB_FAILED = re.compile(r"^\[DB\]\s+FAILED\s+(?P<code>\S+)\s*(?P<rest>.*)$")
 _LABEL_TO_STATUS = {"OK": "success", "FAILED": "failed", "CONTRACT_VIOLATION": "contract_violation",
                     "NORMALIZATION_ERROR": "normalization_error", "DB_ERROR": "db_error",
                     "OUTPUT_ERROR": "output_error"}
@@ -127,6 +130,11 @@ class IntegrationRunner(QObject):
             else:
                 self.parserStatus.emit(name, "running")
                 self.stageChanged.emit("%s 분석 중..." % name)
+            return
+        match = _DB_FAILED.match(line)
+        if match:                                         # 통합 DB 를 열지 못함 → 파서를 하나도 실행하지 않는다
+            self.parserStatus.emit("db", "failed")
+            self.stageChanged.emit("통합 DB 오류 (%s) — 파서를 실행하지 못했습니다" % match.group("code"))
             return
         result = _RESULT.match(line)
         if result and self._current_parser:               # 결과만 따로 온 줄
