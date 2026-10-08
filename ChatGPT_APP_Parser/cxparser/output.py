@@ -220,6 +220,38 @@ def _titles(records):
     return titles
 
 
+_DOWNLOAD_FOLD_SEC = 60
+_DOWNLOAD_EVENTS = ("E05-05", "E05-06", "E06-02")
+
+
+def _download_key(r):
+    """파일명 비교 키: 소문자, 확장자와 윈도가 중복 저장에 붙인 '(n)' 을 뗀다 — 바로가기는 확장자 없이 저장된 이름을 갖기도 한다."""
+    name = ((r.get("details") or {}).get("file_name") or "").lower().strip()
+    name = name.rsplit(".", 1)[0] if "." in name and len(name.rsplit(".", 1)[1]) <= 5 else name
+    while name.endswith(")") and "(" in name and name[name.rfind("(") + 1:-1].isdigit():
+        name = name[:name.rfind("(")].rstrip()
+    return name
+
+
+def _fold_downloads(rows, notes):
+    """다운로드(E05-05/E05-06/E06-02): 같은 파일이 채팅 모드 웹 캐시(내려받기 요청 기록, 확인)와 최근 항목 바로가기
+    (저장된 파일, 추정) 양쪽에 남는다. 같은 파일명·60초 안이면 웹 캐시 행 하나만 두고 바로가기를 그 행의 근거로 접는다.
+    검증(2026-10-06, image2): CD_고객안내_승인대기.pdf 가 11:47:34(웹 캐시)·11:47:42(바로가기) 두 행으로 나와 한 행위가 두 건으로 세어졌다."""
+    dl = [r for r in rows if r["event"]["event_id"] in _DOWNLOAD_EVENTS and (r.get("timestamp") or {}).get("utc")]
+    cache = [r for r in dl if (r.get("details") or {}).get("artifact") == "webcache"]
+    drop = set()
+    for lnk in (r for r in dl if (r.get("details") or {}).get("artifact") == "recent_lnk"):
+        key, t = _download_key(lnk), _secs(lnk["timestamp"]["utc"])
+        near = [c for c in cache if key and _download_key(c) == key and abs(_secs(c["timestamp"]["utc"]) - t) <= _DOWNLOAD_FOLD_SEC]
+        if near:
+            c = min(near, key=lambda x: abs(_secs(x["timestamp"]["utc"]) - t))
+            drop.add(lnk["record_id"])
+            created = ((lnk.get("details") or {}).get("target_created_utc") or "")[:19]
+            notes.setdefault(c["record_id"], []).append(
+                "최근 항목 바로가기 %s 와 일치%s" % (to_kst(lnk["timestamp"]["utc"])[11:19], " (저장 파일 생성 %s)" % to_kst(created)[11:19] if created else ""))
+    return [r for r in rows if r["record_id"] not in drop]
+
+
 def write_timeline_csv(path, records):
     """NA-00(관찰)·판단 불가 는 제외 — 확정 이벤트로 승격 금지 규칙. 시각 미상은 맨 뒤."""
     titles = _titles(records)
@@ -228,6 +260,7 @@ def write_timeline_csv(path, records):
     rows, fold_notes = _fold_prompt_history(rows)
     raw_notes = {k: v.split("; ") for k, v in fold_notes.items()}
     rows = _fold_app_runs(rows, raw_notes)
+    rows = _fold_downloads(rows, raw_notes)
     fold_notes = {k: "; ".join(v) for k, v in raw_notes.items()}
     rows.sort(key=lambda r: (r["timestamp"].get("utc") is None,
                              r["timestamp"].get("utc") or "", r["record_id"]))
