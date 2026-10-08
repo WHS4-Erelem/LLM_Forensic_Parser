@@ -336,13 +336,27 @@ def system_volume_keys(paths):
     return keys
 
 
-def volume_ref(raw, system_keys=()):
-    """드라이브 문자 경로는 그 문자(C:). volumeN / NTFS@오프셋 볼륨은 같은 결과 안에 Users·Windows 경로가 있어 시스템 볼륨으로
-    판정될 때만 C:, 그 외(복구·데이터 파티션, 경로 없음)는 '-'. 여러 경로는 서로 다른 값만 ' | ' 로 잇는다."""
+_DETAIL_VOLUME = re.compile(r"\bvolume=(ntfs@\d+)", re.I)   # chatgpt_desktop·gemini_web 이 Artifact_details 에 적는 파티션 오프셋
+
+
+def volume_ref(raw, system_keys=(), details=""):
+    """파서가 드라이브 문자를 준 경로는 그 문자(C:) — 파서 값 그대로, 추정 표기 없음.
+    volumeN / NTFS@오프셋 / 볼륨 표기 없는 루트 기준 경로는 같은 결과 안에 Users·Windows 경로가 있는 볼륨일 때만
+    'C: (추정, <식별자>)' — 식별자는 경로의 volume0 / ntfs@오프셋, 없으면 Artifact_details 의 volume=ntfs@오프셋, 그것도 없으면 'C: (추정)'.
+    그 외(복구·데이터 파티션, 경로 없음)는 '-'. 여러 경로는 서로 다른 값만 ' | ' 로 잇는다.
+    추정값은 통합기가 붙인 것이라 괄호로 드러낸다 (파서가 확인한 C: 와 구분)."""
+    m = _DETAIL_VOLUME.search(str(details or ""))
+    detail_id = m.group(1).lower() if m else None
     refs = []
     for one in _PATH_SPLIT.split(str(raw)):
         key, _ = _volume_key(one)
-        ref = key if key and key.endswith(":") else ("C:" if key is not None and key in system_keys else None)
+        if key and key.endswith(":"):
+            ref = key
+        elif key is not None and key in system_keys:
+            ident = key or detail_id
+            ref = "C: (추정, %s)" % ident if ident else "C: (추정)"
+        else:
+            ref = None
         if ref and ref not in refs:
             refs.append(ref)
     return " | ".join(refs) or EMPTY
@@ -449,7 +463,7 @@ def normalize(run, evidence):
     keys = system_volume_keys(x["artifact_path"] for rows in out.values() for x in rows)   # 볼륨 판정은 이 파서 결과 전체를 보고
     for rows in out.values():
         for x in rows:
-            x["volume_ref"] = volume_ref(x["artifact_path"], keys)
+            x["volume_ref"] = volume_ref(x["artifact_path"], keys, x.get("artifact_details"))   # 대화 CSV 는 details 가 없어 경로만
     return out["timeline"], out["conversations"], errors + warnings, source_rows
 
 
@@ -841,16 +855,19 @@ def self_test():
     assert normalize_path(r"volume0:\$Extend\$UsnJrnl:$J | volume0:\A\B.exe") == r"$extend\$usnjrnl:$J | a\b.exe"
     assert normalize_path(r"C:\A\f.txt::$DATA") == r"a\f.txt::$DATA"
     assert normalize_path("-") == EMPTY and normalize_path("") == EMPTY
-    # volume_ref: 드라이브 문자는 그대로, volumeN / NTFS@오프셋 은 그 볼륨에 Users·Windows 가 있을 때만 C:, 아니면 '-'
+    # volume_ref: 드라이브 문자는 파서 값 그대로, volumeN / NTFS@오프셋 / 볼륨 표기 없는 경로는 Users·Windows 가 있는 볼륨일 때만
+    # 'C: (추정, 식별자)' (식별자: 경로 → Artifact_details 의 volume= → 없음), 아니면 '-'
     assert volume_ref("C:\\Users\\A") == "C:" and volume_ref("d:/Data/x") == "D:" and volume_ref("-") == EMPTY
     assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J") == EMPTY                    # 혼자서는 어느 볼륨인지 모른다
     sys_keys = system_volume_keys(["volume0:\\Users\\A\\x", "volume1:\\Recovery\\WindowsRE", "img.E01::NTFS@227540992/Windows/Prefetch/a.pf"])
     assert sys_keys == {"volume0", "ntfs@227540992"}, sys_keys
-    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J", sys_keys) == "C:" and volume_ref("volume1:\\Recovery\\x", sys_keys) == EMPTY
-    assert volume_ref("D:/img.E01::NTFS@227540992/Users/llmtest/History", sys_keys) == "C:"   # 이미지 경로의 D: 는 볼륨이 아니다
-    assert volume_ref("volume0:\\Users\\A\\y | C:\\Users\\A\\z", sys_keys) == "C:" and volume_ref("C:\\a | D:\\b") == "C: | D:"
+    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J", sys_keys) == "C: (추정, volume0)" and volume_ref("volume1:\\Recovery\\x", sys_keys) == EMPTY
+    assert volume_ref("D:/img.E01::NTFS@227540992/Users/llmtest/History", sys_keys) == "C: (추정, ntfs@227540992)"   # 이미지 경로의 D: 는 볼륨이 아니다
+    assert volume_ref("volume0:\\Users\\A\\y | C:\\Users\\A\\z", sys_keys) == "C: (추정, volume0) | C:" and volume_ref("C:\\a | D:\\b") == "C: | D:"
     rel_keys = system_volume_keys(["Users/llmtest/AppData/Local/Google/Chrome/User Data/Default/History", "-"])   # 볼륨 표기 없는 루트 기준 경로 (chatgpt_web)
-    assert rel_keys == {""} and volume_ref("Users/llmtest/x", rel_keys) == "C:" and volume_ref("-", rel_keys) == EMPTY
+    assert rel_keys == {""} and volume_ref("Users/llmtest/x", rel_keys) == "C: (추정)" and volume_ref("-", rel_keys) == EMPTY
+    assert volume_ref("Users/llmtest/x", rel_keys, "[History] URL=…, volume=ntfs@227540992") == "C: (추정, ntfs@227540992)"   # gemini_web: 식별자는 Artifact_details 에서
+    assert volume_ref("C:\\Users\\A", rel_keys, "volume=ntfs@5") == "C:"                   # 드라이브 문자가 있으면 추정 표기를 붙이지 않는다
     assert volume_ref("Recovery/WindowsRE/x", system_volume_keys(["Recovery/WindowsRE/x"])) == EMPTY
     assert kst_to_utc("2026-09-15 13:20:41.807000 KST") == "2026-09-15T04:20:41.807000Z"
     assert kst_to_utc("-") is None and kst_to_utc("2026-09-15 13:20:41 KST") is None
@@ -1071,7 +1088,7 @@ def _self_test_end_to_end(td, image, evidence_id):
     tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}
-    assert {r["volume_ref"] for r in tl} == {"C:"}                             # C:\ · volume0:\Users · NTFS@7/Users 모두 C:
+    assert {r["volume_ref"] for r in tl} == {"C:", "C: (추정, volume0) | C: (추정, ntfs@7)"}   # C:\ 는 파서 값, volume0·NTFS@7 은 Users 가 있어 추정
     assert all(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", r["parse_time_utc"]) for r in tl)
     with open(os.path.join(case, "recovered_conversations.csv"), encoding="utf-8-sig", newline="") as fh:
         assert next(csv.reader(fh)) == CONV_COLUMNS + EXTRA_COLUMNS

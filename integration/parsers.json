@@ -40,12 +40,6 @@
         "{out}/result.json",
         "--overwrite"
       ],
-      "volume_json": {
-        "file": "result.json",
-        "pointer": "/input/partition",
-        "regex": "byte_offset=(\\d+)",
-        "format": "ntfs@{0}"
-      },
       "outputs": {
         "timeline": "timeline.csv",
         "conversations": "recovered_conversations.csv"
