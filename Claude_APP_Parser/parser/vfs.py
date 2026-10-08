@@ -83,6 +83,7 @@ class TskImageVfs:
     def __init__(self, image, key_material=None):
         img = image.img
         self.volumes = []      # [(volume_desc, FS_Info)]
+        self.scanned_dirs = {}     # iter_files 가 채운다
         self.skipped = []
         self.locked = []       # 풀지 못한 BitLocker 볼륨 (skipped 에도 들어간다)
         self._plain_images = []   # 복호화 이미지 — FS_Info 가 쓰는 동안 살아 있어야 한다
@@ -135,8 +136,10 @@ class TskImageVfs:
                 skipped=self.skipped)
 
     def iter_files(self):
+        self.scanned_dirs = {}     # 볼륨 index -> {(MFT#, seq): 경로} — USN 저널 대조에 쓴다
         for vd, fs in self.volumes:
             dirs = {}      # (MFT#, seq) -> 경로 : 탐색한 디렉터리
+            self.scanned_dirs[vd["index"]] = dirs
             yielded = set()
             for path, entry in _expand_roots(fs):
                 for vf in self._walk(vd, fs, path, entry, dirs):

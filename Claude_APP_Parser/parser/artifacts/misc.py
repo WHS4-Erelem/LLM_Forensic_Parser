@@ -156,11 +156,74 @@ def _beacon_event(title, page):
     return "E03-01", "새로운 대화 생성"
 
 
+def _parse_desktop_config(raw, vfile, image, rb, mtime, max_excerpt):
+    """claude_desktop_config.json — MCP 서버(외부 도구 연결)·앱 기본 설정.
+
+    계정 UUID 는 정해진 자리(preferences 의 ...ByAccount 딕셔너리 키)에서만 읽고 관찰
+    근거로만 남긴다. 본문 전체를 UUID 정규식으로 훑으면 MCP 서버 인자 속 UUID 를 계정으로
+    오인한다.
+    MCP 서버는 이름만 남긴다 — 명령 인자·환경변수에는 토큰·경로가 들어가므로 값을 싣지 않는다.
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8-sig", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return [model.Record(
+            rb.next_id(), "NA-00", events.name("NA-00"),
+            model.timestamp(null_reason="JSON 해석 실패"),
+            model.user_action(observed="claude_desktop_config.json 을 JSON 으로 읽지 못함"),
+            model.evidence(image, vfile, locator="file"), status="partial",
+            details={"artifact": "config", "key": vfile.path.rsplit("/", 1)[-1],
+                     "item_type": "desktop_config"})]
+    if not isinstance(obj, dict):
+        return []
+    prefs = obj.get("preferences") if isinstance(obj.get("preferences"), dict) else {}
+    accounts = sorted({k for key, v in prefs.items()
+                       if key.endswith("ByAccount") and isinstance(v, dict)
+                       for k in v if UUID.fullmatch(str(k))})
+    servers = obj.get("mcpServers") if isinstance(obj.get("mcpServers"), dict) else {}
+    det = {"artifact": "config", "key": "claude_desktop_config.json",
+           "item_type": "desktop_config",
+           "mcp_servers": sorted(servers),
+           "mcp_server_commands": {k: os_basename(v.get("command")) for k, v in servers.items()
+                                   if isinstance(v, dict) and isinstance(v.get("command"), str)},
+           "account_uuids": accounts,
+           "remote_tools_device_name": prefs.get("remoteToolsDeviceName"),
+           "cowork_user_files_path_set": bool(obj.get("coworkUserFilesPath")),
+           "preference_keys": sorted(prefs)[:40]}
+    ts = model.timestamp(utc=mtime, original=mtime, meaning="설정 파일 수정 시각",
+                         source=model.TS_SOURCE_MFT,
+                         null_reason=None if mtime else "파일 시각 없음")
+    summary = "MCP 서버 %d개%s · 기본 설정 %d개" % (
+        len(servers), (" (%s)" % ", ".join(sorted(servers)[:10])) if servers else "", len(prefs))
+    out = [model.Record(
+        rb.next_id(), "NA-00", events.name("NA-00"), ts,
+        model.user_action(observed="claude_desktop_config.json — " + summary,
+                          rationale="외부 도구 연결(MCP)·앱 설정 상태. 팀 행위 분류표에 "
+                                    "대응 행위가 없어 관찰로만 남긴다"),
+        model.evidence(image, vfile, locator="file", excerpt=excerpt(summary, max_excerpt)),
+        details=det)]
+    # 계정 식별자 -> '로그인(의심)' 매핑은 config.json 이 맡는다. 같은 앱 상태에서 나온
+    # 식별자로 로그인 행을 하나 더 만들면 같은 로그인이 두 번 세어진다 (실측: 9초 차이 중복).
+    # 그래서 여기서는 관찰 기록의 근거(account_uuids)로만 남긴다.
+    return out
+
+
+def os_basename(cmd):
+    """MCP 서버 실행 명령의 프로그램 이름만 (경로는 남기지 않는다).
+
+    MCP 설정의 command 는 실행 파일 경로이고 인자는 args 로 따로 있다. 경로에 공백
+    ('Program Files')이 있을 수 있으므로 공백으로 자르지 않는다.
+    """
+    return re.split(r"[\\/]", cmd.strip())[-1] if cmd else None
+
+
 def parse_config(vfile, image, rb, max_excerpt=500):
     """config.json 등 — 계정·조직 UUID, 정상 종료 근거."""
     raw = vfile.read()
     mtime = (vfile.si_times or {}).get("modified")
     name = vfile.path.rsplit("/", 1)[-1]
+    if name.lower() == "claude_desktop_config.json":
+        return _parse_desktop_config(raw, vfile, image, rb, mtime, max_excerpt)
     det = {"artifact": "config", "key": name}
     try:
         obj = json.loads(raw.decode("utf-8", "replace"))
@@ -230,4 +293,5 @@ def parse_prefetch(vfile, image, rb, max_excerpt=500):
         model.user_action("애플리케이션 설치" if setup else "애플리케이션 실행",
                           model.CONF_INFERRED, rationale="윈도 프리패치에 실행 기록"),
         model.evidence(image, vfile, locator="prefetch"),
-        details={"artifact": "prefetch", "file_name": name, "item_type": exe})]
+        details={"artifact": "prefetch", "file_name": name, "item_type": exe,
+                 "lineage": "prefetch:%s" % name.upper()})]

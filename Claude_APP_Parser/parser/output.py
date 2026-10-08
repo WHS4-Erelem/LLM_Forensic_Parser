@@ -43,9 +43,12 @@ _TAG = {"cache_block": "Cache", "idb_leveldb": "IndexedDB", "idb_blob": "Blob",
         "applog_shared": "App Log", "setuplog": "App Log", "prefetch": "Prefetch",
         "usn_journal": "USN"}
 # Behavior_details 에 넣을 핵심 내용을 고르는 순서.
-# identifiers 는 팀 매핑 규칙에 따라 식별자를 이 칸에 적기 위해 앞에 둔다.
-_CORE_KEYS = ("text", "prompt_text", "identifiers", "title", "model",
-              "file_name", "key", "log_body")
+# summary 는 아티팩트가 만든 짧은 라벨(앱 로그 요약, 프리패치 run 라벨)로 맨 앞에 둔다.
+# identifiers 는 팀 매핑 규칙에 따라 식별자를 이 칸에 적기 위해 앞쪽에 둔다.
+# log_body(로그 원문)는 넣지 않는다 — 팀 양식은 원문이 아니라 짧은 요약을 쓴다
+# (원문은 result.json 의 details.log_body·evidence.excerpt 에 그대로 남는다).
+_CORE_KEYS = ("summary", "text", "prompt_text", "identifiers", "title", "model",
+              "file_name", "key")
 
 EMPTY = "-"      # 팀 공통: 값이 없는 셀은 빈칸 대신 "-"
 
@@ -117,7 +120,8 @@ def _artifact_details(r, titles):
           ("계정 UUID", det.get("account_uuid")),
           ("조직 UUID", det.get("org_uuid")),
           ("모델", det.get("model")),
-          ("위치", ev.get("locator")),
+          ("위치", det.get("run_label") or ev.get("locator")),
+          ("병합", det.get("merge_note")),
           ("MFT", loc.get("mft_record")),
           ("volume", "ntfs@%s" % loc["partition_offset_bytes"]
            if loc.get("partition_offset_bytes") is not None else None),
@@ -183,6 +187,10 @@ def write_conversations_csv(path, records):
             continue
         if det.get("origin"):
             role = _ORIGIN_ROLE.get(det["origin"], role)
+        # 발화자가 확인되지 않은 바이트 스캔 조각(role=unknown)은 CSV 에 싣지 않는다.
+        # 팀 양식은 발화자·순서가 확인된 메시지만 담는다. 조각은 result.json 에만 남는다.
+        if role == "unknown":
+            continue
         utc = r["timestamp"].get("utc")
         key = (role, " ".join(det["text"].split()))
         if any(u and utc and abs(_secs(u) - _secs(utc)) <= 2 for u in seen.get(key, ())):

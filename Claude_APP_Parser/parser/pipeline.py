@@ -39,6 +39,63 @@ class Result(dict):
 CORROBORATE_WINDOW = 120        # 초
 
 
+PREFETCH_RUN_WINDOW = 60.0      # 이 안에 연달아 찍힌 같은 실행파일 프리패치는 한 실행으로 본다
+
+
+def _merge_prefetch_runs(records):
+    """한 번의 앱 실행이 하위 프로세스마다 Prefetch 를 남겨 timeline 이 여러 행으로 불어나는 것을
+    한 행으로 합친다(팀 양식). 가장 이른 것을 대표로 남기고, 나머지는 superseded_by 로 가린다.
+
+    서로 떨어진(>PREFETCH_RUN_WINDOW) 실행은 각각 별개의 실행이므로 합치지 않는다.
+    """
+    from datetime import datetime
+
+    def secs(r):
+        u = r["timestamp"].get("utc")
+        return datetime.fromisoformat(u.replace("Z", "+00:00")).timestamp() if u else None
+
+    groups = {}
+    for r in records:
+        det = r.get("details") or {}
+        t = secs(r)
+        if det.get("artifact") != "prefetch" or t is None or det.get("superseded_by"):
+            continue
+        # 같은 실행파일(item_type=EXE)·같은 행위끼리만 묶는다
+        groups.setdefault((r["event"]["event_id"], det.get("item_type")), []).append((t, r))
+
+    merged = 0
+    for items in groups.values():
+        items.sort(key=lambda x: x[0])
+        cluster = []
+        for pair in items + [(None, None)]:
+            if cluster and (pair[0] is None or pair[0] - cluster[-1][0] > PREFETCH_RUN_WINDOW):
+                if len(cluster) >= 2:
+                    merged += _fold_prefetch_cluster(cluster)
+                cluster = []
+            if pair[1] is not None:
+                cluster.append(pair)
+    return merged
+
+
+def _fold_prefetch_cluster(cluster):
+    rep = cluster[0][1]
+    others = [r for _, r in cluster[1:]]
+    n = len(cluster)
+    rep_det = rep["details"]
+    rep_det["summary"] = "prefetch_run=1/%d" % n
+    rep_det["run_label"] = "prefetch_run=1/%d" % n
+    from .output import to_kst
+    times = "; ".join("같은 실행의 다른 프로세스 Prefetch %s"
+                      % (to_kst(r["timestamp"].get("utc"))[11:19]) for r in others)
+    rep_det["merge_note"] = times
+    rep_det["merged_prefetch"] = [r["details"].get("file_name") for r in others]
+    rep["parse"]["notes"].append("prefetch_run_merged=%d" % n)
+    for r in others:
+        r["details"]["superseded_by"] = rep["record_id"]
+        r["parse"]["notes"].append("merged_into_prefetch_run=%s" % rep["record_id"])
+    return len(others)
+
+
 def _corroborate(records):
     """
     독립된 저장소 2곳 이상이 같은 행위를 뒷받침하면 확신도를 '확인' 으로 올린다.
@@ -68,10 +125,19 @@ def _corroborate(records):
             if r["user_action"]["confidence"] == model.CONF_CONFIRMED:
                 continue
             mine = (r.get("details") or {}).get("artifact")
+            lineage = (r.get("details") or {}).get("lineage")
             for t2, r2 in items:
                 if abs(t2 - t) > CORROBORATE_WINDOW:
                     continue
                 if (r2.get("details") or {}).get("artifact") in (None, mine):
+                    continue
+                # 같은 파일에서 나온 흔적(예: 프리패치 파일 시각과 그 파일의 USN 생성 기록)은
+                # 저장소가 달라 보여도 독립 근거가 아니다
+                if lineage and (r2.get("details") or {}).get("lineage") == lineage:
+                    continue
+                # USN 시각은 저널 기록 시각이라 행위 시각과 같다고 단정하지 않는다. 그래서 USN 은
+                # 다른 흔적에 의해 확인될 수는 있어도, 다른 행을 확인으로 올리는 근거가 되지 않는다
+                if (r2.get("details") or {}).get("artifact") == "usn_journal":
                     continue
                 r["user_action"]["confidence"] = model.CONF_CONFIRMED
                 r["user_action"]["rationale"] = (
@@ -417,7 +483,9 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             loc = {"path": "/$Extend/$UsnJrnl:$J", "partition_index": vd["index"],
                    "partition_offset_bytes": vd["offset_bytes"]}
             try:
-                info, recs_usn = usn_mod.read_journal(fs, max_bytes=usn_max_bytes)
+                info, recs_usn = usn_mod.read_journal(
+                    fs, max_bytes=usn_max_bytes,
+                    claude_dirs=getattr(vfs, "scanned_dirs", {}).get(vd["index"]))
             except Exception as exc:  # noqa: BLE001
                 usn_summary.append({**loc, "status": "not_found",
                                     "message": "%s: %s" % (type(exc).__name__, exc)})
@@ -436,6 +504,10 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     folded = _collapse_drafts(records)
     if folded:
         say("입력 초안 타이핑 스냅샷 %d건을 완성 문장으로 접음" % folded)
+
+    runs_merged = _merge_prefetch_runs(records)
+    if runs_merged:
+        say("같은 실행의 프리패치 %d건을 한 행으로 합침" % runs_merged)
 
     say("교차검증 중…")
     corroborated = _corroborate(records)
