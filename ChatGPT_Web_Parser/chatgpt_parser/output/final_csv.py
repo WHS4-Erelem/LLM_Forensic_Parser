@@ -74,7 +74,7 @@ CSV_USER_BEHAVIOR_LABELS = {
     "HISTORY_DELETE": "방문기록 삭제",
     "CACHE_DELETE": "캐시 삭제",
 }
-# 팀 공통 행위 분류 체계 (integration/user_behaviors.txt, 2026-09-30 기준) 의 사본.
+# 팀 공통 행위 분류 체계 (integration/user_behaviors.txt, 2026-10-08 기준) 의 사본.
 # 파서 6개는 통합기와 서로에게 독립이라 그 파일을 읽지 않는다 (경로가 없는 배포에서도 같게 동작해야 한다).
 # 목록이 바뀌면 여기만 고친다. 사본이 원본과 같은지는 test 가 원본 파일과 대조해서 지킨다.
 CSV_TEAM_USER_BEHAVIORS = frozenset({
@@ -82,10 +82,10 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
     "애플리케이션 설치", "애플리케이션 실행", "애플리케이션 삭제", "정상 종료", "강제 종료",
     "새로운 대화 생성", "기존 대화 삭제", "대화 수정", "대화 재시도", "대화 공유", "공유 링크 생성",
     "대화 데이터 Export", "사용자 프롬프트 입력/전송", "사용자 프롬프트 삭제", "임시 채팅 사용",
-    "이미지 업로드", "이미지 업로드 삭제", "문서 업로드", "문서 업로드 삭제", "문서 다운로드", "파일 다운로드",
+    "이미지 업로드", "이미지 업로드 삭제", "문서 업로드", "문서 업로드 삭제", "문서 다운로드",
     "이미지 생성 요청", "생성 이미지 다운로드", "생성 이미지 다운로드 삭제",
     "모델 변경", "모델 다운로드 내역",
-    "서비스 접속", "브라우저 시크릿 모드", "방문기록 삭제", "캐시 삭제",
+    "브라우저 시크릿 모드", "방문기록 삭제", "캐시 삭제",
 })
 # 팀 회의(2026-09-23) 확정: 공유 분석표(「시나리오 이미지 행위 시각」의 사용자 행위 열, = integration/user_behaviors.txt)
 # 에 있는 행위만 최종 timeline.csv 의 User_behavior 로 낸다. 목록 밖 행위는 **탐지를 멈추지 않는다** —
@@ -100,6 +100,8 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
 #   FILE_UPLOAD                    파일 업로드 — 첨부 MIME 으로 문서/이미지 업로드를 가려 낸다
 #                                  (csv_final_upload_behavior). 상위 이름 자체는 분석표에 없어 여기 남는다.
 #   FILE_UPLOAD_DELETE             업로드한 파일 삭제 — 분석표는 종류별로 나눠 쓰는데 파서는 상위 이름만 낸다 → 팀 결정 대기
+#   FILE_DOWNLOAD                  파일 다운로드 — 2026-10-08 팀 목록에서 삭제되어 여기로 들어왔다. 전부터
+#                                  csv_final_download_behavior() 가 문서/생성 이미지만 올렸으므로 출력은 그대로다.
 # label 이 아예 없는 action 은 이 집합에 들어오지 않지만 최종 timeline 에서 빠지는 결과는 같다
 # (csv_final_user_behavior() 가 팀 목록 대조 하나로 판단한다). 내부 action 코드를 User_behavior 로
 # 내보내는 fallback 은 두지 않는다 — 팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다 (2026-10-01 확정).
