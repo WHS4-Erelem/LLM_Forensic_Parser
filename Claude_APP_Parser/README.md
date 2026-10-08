@@ -122,6 +122,11 @@ CSV 는 UTF-8 BOM 으로 저장해 엑셀에서 바로 열린다. 시각은 KST,
 근거를 찾지 못한 행위는 행을 만들지 않는다. `User_behavior` 는 고정된 행위 분류표의
 이름만 쓴다 (`parser/events.py` 참조).
 
+`Artifact_path` 의 드라이브 문자는 가정이 아니라 실측이다. 이미지 입력은 `HKLM\SYSTEM\MountedDevices`
+를 읽어 각 NTFS 볼륨이 원래 PC 에서 어떤 문자(`C:` 등)였는지 확인한다(`parser/mounted_devices.py`,
+MBR=디스크 서명+파티션 오프셋 / GPT=파티션 GUID 로 대조). SYSTEM 하이브가 없거나 문자가 없는
+파티션(복구·예약)은 종전대로 `C:` 로 표기한다. 근거는 `result.json` 의 `filesystem.drive_letters` 에 남는다.
+
 `Behavior_details ` 는 `<행위>_<짧은 라벨>` 꼴의 요약만 담는다. 로그 원문·타임스탬프
 같은 긴 텍스트는 넣지 않는다 (원문은 `result.json` 의 `details`·`evidence.excerpt` 에 남는다).
 팀 공통 양식에 맞춘 것이다.
@@ -254,6 +259,7 @@ python -m unittest discover -s tests -v
 | `tests/test_desktop_config.py` | `claude_desktop_config.json` 수집, MCP 인자·토큰·경로 비노출, 로그인 중복 행 없음, 깨진 JSON |
 | `tests/test_live.py` | 라이브 결과가 이미지 입력과 같은 행위·시각·판정인지, 원본 불변, 탐색 범위, 증거 안 출력 거부, 실행 중인 앱이 잡은 파일 읽기, 독점 잠금 파일 보고 |
 | `tests/test_output_format.py` | 팀 공통 양식 — Behavior_details 는 짧은 라벨만(로그 원문 제외), 대화 CSV 는 발화자 확인된 것만(unknown 제외), 같은 실행의 Prefetch 를 한 행으로 병합(먼 실행은 분리) |
+| `tests/test_mounted_devices.py` | SYSTEM\\MountedDevices 로 볼륨별 드라이브 문자 확인, GPT/MBR 볼륨키 대조, 하이브 없을 때 C: 폴백, `_winpath` 가 확인된 문자 우선 사용 |
 
 BitLocker 시험은 처음 실행할 때 `dissect.fve` 저장소의 BitLocker 테스트 볼륨(고정
 커밋, AGPL-3.0 데이터라 저장소에는 넣지 않음)을 `tests/_data/bde/` 로 내려받는다.

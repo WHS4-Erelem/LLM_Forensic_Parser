@@ -90,13 +90,16 @@ def _one_line(v, limit=300):
 
 
 def _winpath(r):
-    """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...'
+    """이미지 내부 경로 '/Users/x/...' -> '<드라이브>\\Users\\x\\...'
 
-    라이브 분석은 실제로 읽은 위치를 쓴다 (D:\\ 를 분석했으면 D:\\Users\\…).
+    드라이브 문자 우선순위:
+      1) location.drive — 이미지: SYSTEM\\MountedDevices 로 확인된 볼륨별 실제 문자
+      2) location.live_root — 라이브: 실제로 읽은 위치 (D:\\ 를 분석했으면 D:\\Users\\…)
+      3) 'C:' — 하이브가 없거나 문자가 없는 파티션은 종전대로 가정
     """
     loc = (r.get("evidence") or {}).get("location") or {}
     p = loc.get("path") or ""
-    return (loc.get("live_root") or "C:") + p.replace("/", "\\") if p else ""
+    return (loc.get("drive") or loc.get("live_root") or "C:") + p.replace("/", "\\") if p else ""
 
 
 def _behavior_details(r, titles):
