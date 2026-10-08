@@ -96,6 +96,107 @@ def _fold_prefetch_cluster(cluster):
     return len(others)
 
 
+def _usn_secs(r):
+    from datetime import datetime
+    u = r["timestamp"].get("utc")
+    return datetime.fromisoformat(u.replace("Z", "+00:00")).timestamp() if u else None
+
+
+def _fold_usn_prefetch(records):
+    """같은 앱 실행에 속한 USN 의 프리패치 FILE_CREATE 행을 없애고, 그 시각을 프리패치 실행 행의
+    근거로 붙인다. 같은 기동이 '실행(Prefetch)' + '실행(USN)' 두 행으로 나오던 것을 막는다.
+
+    프리패치 파일 행이 전혀 없거나(그 .pf 가 한참 전에 생성된 '첫 실행') 실행 구간 밖이면
+    USN 행을 그대로 둔다 — 그때는 USN 이 유일한 첫 실행 근거다.
+    """
+    by_id = {r["record_id"]: r for r in records}
+
+    def visible(r):                 # superseded 를 따라가 화면에 남는 대표 행을 찾는다
+        seen = set()
+        while (r.get("details") or {}).get("superseded_by") and r["record_id"] not in seen:
+            seen.add(r["record_id"])
+            nxt = by_id.get(r["details"]["superseded_by"])
+            if nxt is None:
+                break
+            r = nxt
+        return r
+
+    pf_by_lineage, reps = {}, []
+    for r in records:
+        det = r.get("details") or {}
+        if det.get("artifact") != "prefetch":
+            continue
+        if det.get("lineage"):
+            pf_by_lineage.setdefault(det["lineage"], r)
+        if not det.get("superseded_by"):
+            t = _usn_secs(r)
+            if t is not None:
+                reps.append((t, r["event"]["event_id"], r))
+
+    from .output import to_kst
+    folded = 0
+    for r in records:
+        det = r.get("details") or {}
+        if (det.get("artifact") != "usn_journal" or det.get("match") != "prefetch"
+                or det.get("key_reason") != "FILE_CREATE" or det.get("superseded_by")):
+            continue
+        t = _usn_secs(r)
+        target = None
+        lin = det.get("lineage")
+        if lin and lin in pf_by_lineage:          # 같은 .pf 의 프리패치 파일 행 = 같은 근거
+            target = visible(pf_by_lineage[lin])
+        elif t is not None:                        # 같은 기동 구간 안의 다른 하위 프로세스 pf
+            for tt, eid, rep in reps:
+                if eid == r["event"]["event_id"] and abs(tt - t) <= PREFETCH_RUN_WINDOW:
+                    target = rep
+                    break
+        if target is None or target["record_id"] == r["record_id"]:
+            continue
+        det["superseded_by"] = target["record_id"]
+        r["parse"]["notes"].append("usn_prefetch_folded_into=%s" % target["record_id"])
+        tdet = target["details"]
+        add = "USN 생성 기록 %s" % (to_kst(r["timestamp"].get("utc"))[11:19])
+        tdet["merge_note"] = (tdet["merge_note"] + "; " + add) if tdet.get("merge_note") else add
+        target["parse"]["notes"].append("usn_prefetch_evidence=%s" % det.get("file_name"))
+        folded += 1
+    return folded
+
+
+def _fold_package_installs(records):
+    """WindowsApps 의 같은 패키지 폴더 생성이 반복되면(자동 업데이트·MSIX 스테이징) 앱 설치로
+    여러 번 세지 않는다. 앞선 설치 신호(SETUP 프리패치 또는 더 이른 패키지 폴더 생성)가 있으면
+    뒤의 패키지 폴더 생성은 '업데이트/스테이징 후보(NA-00)'로 내린다 — 설치 행은 가장 이른 1건만.
+    """
+    installs = []
+    for r in records:
+        det = r.get("details") or {}
+        if r["event"]["event_id"] != "E02-01":
+            continue
+        t = _usn_secs(r)
+        if t is None:
+            continue
+        if det.get("artifact") == "prefetch":
+            installs.append((t, "setup_pf", r))
+        elif det.get("artifact") == "usn_journal" and det.get("match") == "package":
+            installs.append((t, "pkg", r))
+    installs.sort(key=lambda x: x[0])
+    downgraded, seen_install = 0, False
+    for _t, kind, r in installs:
+        if kind == "pkg" and seen_install:
+            r["event"]["event_id"] = "NA-00"
+            r["event"]["event_name"] = events.name("NA-00")
+            r["details"]["candidate_event"] = "E02-01"
+            r["user_action"] = model.user_action(
+                observed=r["user_action"].get("observed_artifact") or r["details"].get("file_name"),
+                rationale="WindowsApps 에 같은 패키지 폴더가 앞선 설치 신호 뒤 다시 생성됨 — "
+                          "자동 업데이트·MSIX 스테이징으로 보여 설치로 세지 않는다")
+            r["parse"]["notes"].append("package_create_update_candidate")
+            downgraded += 1
+        else:
+            seen_install = True
+    return downgraded
+
+
 def _corroborate(records):
     """
     독립된 저장소 2곳 이상이 같은 행위를 뒷받침하면 확신도를 '확인' 으로 올린다.
@@ -116,6 +217,8 @@ def _corroborate(records):
         t = secs(r)
         if t is None or r["event"]["event_id"] == "NA-00":
             continue
+        if (r.get("details") or {}).get("superseded_by"):   # 병합·접힌 행은 교차검증에 넣지 않는다
+            continue
         buckets.setdefault(r["event"]["event_id"], []).append((t, r))
 
     upgraded = 0
@@ -135,9 +238,14 @@ def _corroborate(records):
                 # 저장소가 달라 보여도 독립 근거가 아니다
                 if lineage and (r2.get("details") or {}).get("lineage") == lineage:
                     continue
-                # USN 시각은 저널 기록 시각이라 행위 시각과 같다고 단정하지 않는다. 그래서 USN 은
-                # 다른 흔적에 의해 확인될 수는 있어도, 다른 행을 확인으로 올리는 근거가 되지 않는다
-                if (r2.get("details") or {}).get("artifact") == "usn_journal":
+                r2_art = (r2.get("details") or {}).get("artifact")
+                # USN 시각은 저널 기록 시각이라 행위 시각과 같다고 단정하지 않는다 — USN 은 다른 행을
+                # 확인으로 올리는 근거가 되지 않는다
+                if r2_art == "usn_journal":
+                    continue
+                # 프리패치 ↔ USN 은 같은 앱 기동이 Prefetch 한 저장소에 남긴 것이라 서로 독립 근거가
+                # 아니다 (다른 .pf 라도). 양방향 모두 서로를 확정으로 올리지 않는다
+                if {mine, r2_art} == {"prefetch", "usn_journal"}:
                     continue
                 r["user_action"]["confidence"] = model.CONF_CONFIRMED
                 r["user_action"]["rationale"] = (
@@ -508,6 +616,14 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     runs_merged = _merge_prefetch_runs(records)
     if runs_merged:
         say("같은 실행의 프리패치 %d건을 한 행으로 합침" % runs_merged)
+
+    usn_folded = _fold_usn_prefetch(records)
+    if usn_folded:
+        say("같은 실행의 USN 프리패치 기록 %d건을 실행 행 근거로 합침" % usn_folded)
+
+    pkg_folded = _fold_package_installs(records)
+    if pkg_folded:
+        say("반복된 패키지 폴더 생성 %d건을 업데이트 후보로 내림" % pkg_folded)
 
     say("교차검증 중…")
     corroborated = _corroborate(records)
