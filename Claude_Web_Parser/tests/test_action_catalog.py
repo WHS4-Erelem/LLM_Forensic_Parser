@@ -6,7 +6,6 @@ import datetime as dt
 import pytest
 
 from claude_web_forensics.analysis import detectors as detectors_module
-from claude_web_forensics.analysis.accounts import build_account_context
 from claude_web_forensics.analysis.rules import (
     ACTION_LABELS,
     EXCLUDED_ACTION_CODES,
@@ -16,7 +15,6 @@ from claude_web_forensics.analysis.rules import (
     label_for,
 )
 from claude_web_forensics.analysis.conversations import ConversationBuilder, DraftTrace
-from claude_web_forensics.analysis.correlator import Correlator
 from claude_web_forensics.analysis.detectors import (
     DETECTOR_REGISTRY,
     DetectorContext,
@@ -27,7 +25,6 @@ from claude_web_forensics.analysis.detectors import (
     detect_prompt,
     run_all,
 )
-from claude_web_forensics.analysis.file_analysis import FileBuilder, collect_upload_metadata
 from claude_web_forensics.model.entities import (
     FAMILY_CACHE,
     FAMILY_HISTORY,
@@ -105,26 +102,20 @@ def rec(family, locator, ts=None, **attrs) -> EvidenceRecord:
     )
 
 
-def ctx_for(records, *, drafts=(), file_traces=(), extended_fs=False, conversations=None):
+def ctx_for(records, *, drafts=(), extended_fs=False, conversations=None):
     store = EvidenceStore()
     store.extend(records)
     builder = conversations or ConversationBuilder()
     if conversations is None:
         builder.ingest(store)
     builder.drafts.extend(drafts)
-    return DetectorContext(
-        store=store, correlator=Correlator(store), conversations=builder,
-        account_ctx=build_account_context(store), file_traces=list(file_traces),
-        lifecycles={}, extended_fs=extended_fs,
-        artifact_available={f: True for f in store.families_present()},
-    )
+    return DetectorContext(store=store, conversations=builder, extended_fs=extended_fs)
 
 
 def draft(text, record):
     return DraftTrace(
-        draft_id="d1", text=text, timestamp=T0, account_uuid=None, conversation_uuid=None,
-        attachment_count=None, file_count=None, family=FAMILY_LOCAL_STORAGE,
-        evidence_ids=[record.evidence_id],
+        draft_id="d1", text=text, timestamp=T0, account_uuid=None,
+        family=FAMILY_LOCAL_STORAGE, evidence_ids=[record.evidence_id], sequence=1,
     )
 
 
@@ -144,8 +135,9 @@ def rich_context():
              "content": [{"type": "text", "text": "hi"}]},
         ],
     }
-    cache = rec(FAMILY_CACHE, "k", conversation_uuid="11111111-1111-1111-1111-111111111111",
-                key_kind="conversation_api", _json=payload, cache_key="k", variant_index=0)
+    tree = rec(FAMILY_INDEXEDDB, "k", conversation_uuid="11111111-1111-1111-1111-111111111111",
+               key_kind="react_query_cache", record_state="LIVE",
+               value={"clientState": {"queries": [{"state": {"data": payload}}]}})
     draft_idb = rec(FAMILY_INDEXEDDB, "d", key_kind="chat_draft",
                     value={"state": {"files": [
                         {"file_name": "[MRK_E0501].png", "file_uuid": "f-d1", "size_bytes": 4,
@@ -155,15 +147,9 @@ def rich_context():
     settings = rec(FAMILY_HISTORY, "u", T0, subtype="url",
                    url="https://claude.ai/new#settings/data-privacy-controls/export-data")
     ls = rec(FAMILY_LOCAL_STORAGE, "ls", T0, script_key="static-composer-draft-data")
-    records = [cache, draft_idb, settings, ls]
-    store = EvidenceStore()
-    store.extend(records)
-    files = FileBuilder()
-    files.add_uploads(collect_upload_metadata(store))
     return ctx_for(
-        records,
+        [tree, draft_idb, settings, ls],
         drafts=[draft("[MRK_E0505] 문서 다운로드 실험ㅎ\n두 번째 줄", ls)],
-        file_traces=files.traces,
     )
 
 
@@ -254,7 +240,9 @@ def test_export_screen_access_is_detail_of_e0701():
     assert [(e.action_code, e.action_label, e.verdict) for e in events] == [
         ("E07-01", "대화 데이터 Export", VERDICT_SUSPECTED)
     ]
-    assert events[0].action_detail.startswith("Export 설정 화면 접근(완료 미확인)_https://")
+    assert events[0].action_detail == (
+        "Export 설정 화면 접근(완료 미확인)_claude.ai/new#settings/data-privacy-controls/export-data"
+    )
 
 
 def test_detail_never_contains_codes_or_ids():

@@ -45,6 +45,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chatgpt_web_parser as p  # noqa: E402
 
+# private(_ 로 시작) 구현은 하위호환 wrapper 가 노출하지 않는다 — 소유 모듈에서 직접 가져온다.
+# 특히 image._EWF_IMG_INFO_CLASS 는 테스트가 값을 되돌려 놓는 모듈 전역이라 wrapper 복사본으로는 안 된다.
+from chatgpt_parser import image as _image  # noqa: E402
+from chatgpt_parser.artifacts import cache as _cache  # noqa: E402
+from chatgpt_parser.artifacts import history as _history  # noqa: E402
+from chatgpt_parser.artifacts import session_storage as _session_storage  # noqa: E402
+from chatgpt_parser.detectors import conversation as _conversation_rules  # noqa: E402
+from chatgpt_parser.output import final_csv as _final_csv  # noqa: E402
+from chatgpt_parser.recovery import conversations as _recovery  # noqa: E402
+
 LOGOUT_URL = "https://chatgpt.com/auth/logout"
 LOGOUT_RAW = "13432494600507032"  # webkit_us, History visits.id=42 에서 확인된 값
 LOGOUT_UTC = "2026-08-29T16:30:00.507032Z"
@@ -1375,8 +1385,8 @@ class PipelineTest(HistoryTestBase):
         # S9-pre: 같은 폴더의 Local Storage/leveldb 도 읽는다 (fixture 에는 없음 → NOT_PRESENT)
         self.assertEqual([(c.artifact_type, c.status) for c in coverages],
                          [("history", "PARSED"), ("local_storage", "NOT_PRESENT"), ("session_storage", "NOT_PRESENT"),
-                          ("cache", "NOT_PRESENT"), ("shared_proto_db", "NOT_PRESENT"),
-                          ("sessions", "NOT_PRESENT")])
+                          ("cache", "NOT_PRESENT"), ("preferences", "NOT_PRESENT"),
+                          ("shared_proto_db", "NOT_PRESENT"), ("sessions", "NOT_PRESENT")])
 
     # 2
     def test_detect(self):
@@ -1894,7 +1904,7 @@ class ProfileDiscoveryTest(ProfileDiscoveryTestBase):
         self.assertEqual([(c.artifact_type, c.browser_profile, c.status) for c in coverages if c.os_user == "Bob"],
                          [("history", "Default", "NOT_PRESENT"), ("local_storage", "Default", "NOT_PRESENT"),
                           ("session_storage", "Default", "NOT_PRESENT"), ("cache", "Default", "NOT_PRESENT"),
-                          ("shared_proto_db", "Default", "NOT_PRESENT"),
+                          ("preferences", "Default", "NOT_PRESENT"), ("shared_proto_db", "Default", "NOT_PRESENT"),
                           ("sessions", "Default", "NOT_PRESENT")])
         self.assertNotIn(p.CHROME_PROFILE_NOT_FOUND, warnings)
 
@@ -1920,7 +1930,7 @@ class ProfileDiscoveryTest(ProfileDiscoveryTestBase):
         self.assertEqual([(c.artifact_type, c.os_user, c.browser_profile, c.status) for c in coverages],
                          [("history", None, None, "PARSED"), ("local_storage", None, None, "NOT_PRESENT"),
                           ("session_storage", None, None, "NOT_PRESENT"), ("cache", None, None, "NOT_PRESENT"),
-                          ("shared_proto_db", None, None, "NOT_PRESENT"),
+                          ("preferences", None, None, "NOT_PRESENT"), ("shared_proto_db", None, None, "NOT_PRESENT"),
                           ("sessions", None, None, "NOT_PRESENT")])
         self.assertEqual(coverages[1].source_path, f"{ALICE_UD}/Profile 1/Local Storage/leveldb")  # History 와 같은 폴더
         self.assertEqual(coverages[2].source_path, f"{ALICE_UD}/Profile 1/Session Storage")
@@ -1928,7 +1938,8 @@ class ProfileDiscoveryTest(ProfileDiscoveryTestBase):
         self.assertEqual(len(records), 1)
         self.assertEqual(warnings, [])  # 자동 탐색을 함께 실행하지 않음
         result = p.run(self.source, f"{ALICE_UD}/Default/History")
-        self.assertEqual([c.artifact_type for c in result.coverage], ["history", "local_storage", "session_storage", "cache", "shared_proto_db", "sessions"])
+        self.assertEqual([c.artifact_type for c in result.coverage],
+                         ["history", "local_storage", "session_storage", "cache", "preferences", "shared_proto_db", "sessions"])
         self.assertEqual(result.warnings, [p.RUN_WARNING_ANALYSIS_SCOPE,
                                            p.RUN_WARNING_MESSAGE_RECOVERY_SCOPE])
 
@@ -2051,8 +2062,8 @@ class AutoDiscoveryCliTest(ProfileDiscoveryTestBase):
         self.assertNotIn("안녕 인사 응답", stdout)
         data = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(list(data), PARSE_RESULT_KEYS)  # 결과 JSON 구조는 S6 과 같음
-        # Profile 4개 × (History + Local Storage + Session Storage + Cache + shared_proto_db + Sessions)
-        self.assertEqual(len(data["coverage"]), 24)
+        # Profile 4개 × (History + Local Storage + Session Storage + Cache + Preferences + shared_proto_db + Sessions)
+        self.assertEqual(len(data["coverage"]), 28)
         self.assertEqual(len(data["records"]), 6)
         self.assertEqual(sorted((e["action"], e["os_user"], e["browser_profile"]) for e in data["events"]),
                          [("CONVERSATION_ACCESS", "Alice", "Profile 1"), ("LOGIN", "Alice", "Default"), ("LOGOUT", "Alice", "Default")])
@@ -2081,7 +2092,7 @@ class AutoDiscoveryCliTest(ProfileDiscoveryTestBase):
         self.assertEqual([(c["artifact_type"], c["os_user"], c["status"]) for c in data["coverage"]],
                          [("history", None, "PARSED"), ("local_storage", None, "NOT_PRESENT"),
                           ("session_storage", None, "NOT_PRESENT"), ("cache", None, "NOT_PRESENT"),
-                          ("shared_proto_db", None, "NOT_PRESENT"),
+                          ("preferences", None, "NOT_PRESENT"), ("shared_proto_db", None, "NOT_PRESENT"),
                           ("sessions", None, "NOT_PRESENT")])
         self.assertEqual(sorted(e["action"] for e in data["events"]), ["LOGIN", "LOGOUT"])
         self.assertNotIn(p.CHROME_PROFILE_NOT_FOUND, data["warnings"])
@@ -2301,11 +2312,11 @@ class AccountIdentitySwitchTest(unittest.TestCase):
 
     def test_summary_row_explains_reason_and_keeps_schema(self):
         records = switch_chain() + [identity_record("aaaa1111", -60), identity_record("bbbb2222", 200)]
-        row = p._timeline_row(p.detect_account_switch(records)[0])
+        row = _final_csv._timeline_row(p.detect_account_switch(records)[0])
         self.assertEqual(list(row), list(p.CSV_TIMELINE_COLUMNS))
-        self.assertEqual(row["User_behavior"], "계정 변경")
-        self.assertTrue(row["Behavior_details "].startswith("ACCOUNT_SWITCH | SUPPORTING | "))
-        self.assertIn("aaaa1111 → bbbb2222", row["Behavior_details "])
+        self.assertEqual(row["User_behavior"], "계정 전환")  # 팀 분류 체계 이름 (2026-09-23 행위명 통일)
+        # 최종 CSV 는 "<발견 근거>_<핵심 내용>" 만 낸다 (action·evidence_level 같은 내부 표현은 events.csv 에 남는다).
+        self.assertEqual(row["Behavior_details "], "재인증/계정 전환 흔적_aaaa1111 → bbbb2222")
 
     def test_single_artifact_change_without_chain_makes_no_event(self):
         # 계정 식별자 하나만 바뀌고 인증 체인이 없으면 ACCOUNT_SWITCH 를 만들지 않는다.
@@ -2968,7 +2979,7 @@ class ConversationResidueTest(LocalStorageTestBase):
                          (RESIDUE_ID, "안녕 인사 응답", "RESIDUAL_ONLY", []))
         self.assertEqual((conversation.create_time_raw, conversation.create_time_utc, conversation.create_time_kst,
                           conversation.create_time_type, conversation.create_time_source),
-                         (CREATE_TIME, CREATE_TIME, CREATE_KST, "iso_utc", p._RESIDUE_CREATE_TIME_SOURCE))
+                         (CREATE_TIME, CREATE_TIME, CREATE_KST, "iso_utc", _recovery._RESIDUE_CREATE_TIME_SOURCE))
         coverage = next(c for c in result.coverage if c.artifact_type == "local_storage")
         source = conversation.source_artifacts[0]
         self.assertEqual((source["artifact_type"], source["source_path"], source["source_sha256"], source["sequence"], source["operation"]),
@@ -3552,13 +3563,13 @@ class EwfAdapterTest(ImageTestBase):
 
     def setUp(self):
         super().setUp()
-        p._EWF_IMG_INFO_CLASS = None
-        self.addCleanup(setattr, p, "_EWF_IMG_INFO_CLASS", None)
+        _image._EWF_IMG_INFO_CLASS = None
+        self.addCleanup(setattr, _image, "_EWF_IMG_INFO_CLASS", None)
 
     def test_adapter_exposes_size_read_and_close(self):
         data = bytes(range(256)) * 16
         handle = FakeEwfHandle(data)
-        image = p._ewf_img_info_class()(handle, ["disk.E01", "disk.E02"])
+        image = _image._ewf_img_info_class()(handle, ["disk.E01", "disk.E02"])
         self.assertIsInstance(image, p.pytsk3.Img_Info)
         self.assertEqual(image.get_size(), len(data))
         self.assertEqual(image.read(10, 5), data[10:15])
@@ -3573,7 +3584,7 @@ class EwfAdapterTest(ImageTestBase):
     def test_real_pytsk3_reads_partition_table_through_adapter(self):
         synthetic_mbr_image(self.image)
         handle = FakeEwfHandle(self.image.read_bytes())
-        image = p._ewf_img_info_class()(handle, ["disk.E01"])
+        image = _image._ewf_img_info_class()(handle, ["disk.E01"])
         try:
             partitions, warnings = p.list_image_partitions(image)
         finally:
@@ -3590,8 +3601,8 @@ class EwfOpenTest(ImageTestBase):
 
     def setUp(self):
         super().setUp()
-        p._EWF_IMG_INFO_CLASS = None
-        self.addCleanup(setattr, p, "_EWF_IMG_INFO_CLASS", None)
+        _image._EWF_IMG_INFO_CLASS = None
+        self.addCleanup(setattr, _image, "_EWF_IMG_INFO_CLASS", None)
         self.e01 = self.base / "disk.E01"
         self.e01.write_bytes(b"EVF\x09\x0d\x0a\xff\x00")
 
@@ -3731,12 +3742,13 @@ def build_blockfile_cache(directory, entries, *, table_len=64, index_magic=0xC10
         data2 += info.ljust(info_blocks * 1024, b"\x00")
         (directory / f"f_{number:06x}").write_bytes(entry["body"])
         key = (CACHE_KEY_PREFIX + entry["url"]).encode("latin-1")
+        blocks = min(4, max(1, -(-(96 + len(key)) // 256)))  # key 가 길면 EntryStore 가 여러 block 을 차지한다 (실제 Cache 와 같다)
         slot = entry.get("slot", number - 1)
         store = struct.pack("<IIIiiiQiI", 0, table[slot], 0, 0, 0, 0, 13432490000000000, len(key), 0)  # next = 같은 slot 의 기존 entry
         store += struct.pack("<4i", len(info), len(entry["body"]), 0, 0) + struct.pack("<4I", info_addr, 0x80000000 | number, 0, 0)
         if not entry.get("unindexed"):  # unindexed: data_1 에는 있지만 index hash table 에서 도달할 수 없는 entry
-            table[slot] = cache_addr(2, 1, (len(data1) - 8192) // 256)
-        data1 += (store.ljust(96, b"\x00") + key).ljust(256, b"\x00")
+            table[slot] = cache_addr(2, 1, (len(data1) - 8192) // 256, blocks)
+        data1 += (store.ljust(96, b"\x00") + key).ljust(blocks * 256, b"\x00")
     header = struct.pack("<IIiiiiIi", index_magic, 0x30000, len(entries), 0, 0, 0, 0, table_len).ljust(368, b"\x00")
     (directory / "index").write_bytes(header + struct.pack(f"<{table_len}I", *table))
     (directory / "data_1").write_bytes(data1)
@@ -3776,6 +3788,22 @@ def cache_conversation(conversation_id=CACHE_CONV_ID, nodes=None):
                for node_id, parent, children, message in nodes}
     return {"conversation_id": conversation_id, "title": "합성 캐시 대화", "create_time": CACHE_CREATE_RAW, "update_time": 1787221050.0,
             "current_node": "m-image", "mapping": mapping, "owner": "user-SECRETOWNER", "moderation_results": []}
+
+
+def cache_conversation_flat(conversation_id=CACHE_CONV_ID, messages=None):
+    """2026-09-30 Scenario 이미지에서 확인한 평면 목록 응답. 부모는 metadata.parent_id 에만 있고 children 은 응답에 없다."""
+    if messages is None:  # user → assistant + 부모가 응답에서 잘린 메시지 (num_turns 로 잘린 경우)
+        messages = [
+            (cache_message("f-user", "user", {"content_type": "text", "parts": ["평면 목록 질문"]}, CACHE_CREATE_RAW), None),
+            (cache_message("f-assistant", "assistant", {"content_type": "text", "parts": ["평면 목록 답변"]}, 1787221040.5,
+                           message_type="next"), "f-user"),
+            (cache_message("f-orphan", "assistant", {"content_type": "text", "parts": ["부모가 잘린 답변"]}, 1787221041.0,
+                           message_type="next"), "f-cut-off-parent"),
+        ]
+    flat = [{**message, "metadata": {**message["metadata"], "parent_id": parent_id}} for message, parent_id in messages]
+    return {"conversation_id": conversation_id, "title": "합성 평면 대화", "create_time": CACHE_CREATE_RAW,
+            "update_time": 1787221041.0, "current_node": "f-orphan", "messages": flat,
+            "owner": "user-SECRETOWNER", "moderation_results": []}
 
 
 def br_json(obj):
@@ -3970,6 +3998,129 @@ class CacheBlockfileCarvingTest(CacheTestBase):
         self.assertNotIn("conversation", records[0].observed)
 
 
+class CacheConversationEndpointAndSchemaTest(CacheTestBase):
+    """대화 응답 endpoint 의 두 형태 (단수형 · 복수형+query) 와 두 응답 스키마 (mapping tree · messages 목록). 2026-09-30 확인."""
+
+    PLURAL_QUERY = "?include_has_versions=true&num_turns=10"
+
+    @classmethod
+    def plural_entry(cls, obj=None, conversation_id=CACHE_CONV_ID, query=None, **overrides):
+        query = cls.PLURAL_QUERY if query is None else query
+        return {"url": f"https://chatgpt.com/backend-api/conversations/{conversation_id}{query}",
+                "body": br_json(obj if obj is not None else cache_conversation_flat(conversation_id)), **overrides}
+
+    def test_singular_endpoint_without_query_still_supported(self):
+        build_blockfile_cache(self.cache_dir, [self.conversation_entry()])
+        records, coverage = self.read()
+        self.assertEqual((len(records), coverage.status, coverage.record_count), (1, "PARSED", 1))
+        observed = records[0].observed
+        self.assertEqual((observed["url"], observed["url_conversation_id"], observed["cache_key_kind"]),
+                         (f"https://chatgpt.com/backend-api/conversation/{CACHE_CONV_ID}", CACHE_CONV_ID, "conversation_response"))
+        self.assertNotIn("url_redacted_keys", observed)  # 가릴 query 가 없으면 키를 만들지 않는다
+
+    def test_plural_endpoint_with_query_supported(self):
+        build_blockfile_cache(self.cache_dir, [self.plural_entry(cache_conversation())])
+        records, coverage = self.read()
+        self.assertEqual((len(records), coverage.status, coverage.record_count), (1, "PARSED", 1))
+        observed = records[0].observed
+        self.assertEqual((observed["url"], observed["url_conversation_id"], observed["cache_key_kind"]),
+                         (f"https://chatgpt.com/backend-api/conversations/{CACHE_CONV_ID}{self.PLURAL_QUERY}",
+                          CACHE_CONV_ID, "conversation_response"))  # key 의 URL 그대로 (만들어 낸 URL 아님)
+        self.assertEqual(observed["conversation"]["conversation_id"], CACHE_CONV_ID)
+
+    def test_auth_query_value_is_redacted_in_url(self):
+        build_blockfile_cache(self.cache_dir, [self.plural_entry(cache_conversation(), query="?access_token=SECRETQUERYTOKEN&num_turns=10")])
+        observed = self.read()[0][0].observed
+        self.assertNotIn("SECRETQUERYTOKEN", json.dumps(self.read()[0][0].to_dict(), ensure_ascii=False))
+        self.assertEqual((observed["url_redacted_keys"], "num_turns=10" in observed["url"]), (["access_token"], True))
+
+    def test_other_backend_api_endpoints_are_not_conversation_bodies(self):
+        build_blockfile_cache(self.cache_dir, self.noise_entries() + [
+            {"url": f"https://chatgpt.com/backend-api/conversations/{CACHE_CONV_ID}/textdocs{self.PLURAL_QUERY}",
+             "body": b"[]", "info": http_info(None)},
+            {"url": "https://chatgpt.com/backend-api/conversations", "body": b"{}", "info": http_info(None)},
+            {"url": f"https://chatgpt.com/backend-api/conversations/{CACHE_CONV_ID}/stream_status", "body": b'{"status":"ok"}',
+             "info": http_info(None)},
+        ])
+        records, coverage = self.read()
+        # stream_status · textdocs · 목록 endpoint (단수형·복수형 모두) 는 대화 본문이 아니다.
+        self.assertEqual((records, coverage.status, coverage.record_count), ([], "PARSED", 0))
+
+    def test_mapping_tree_schema_regression(self):
+        build_blockfile_cache(self.cache_dir, [self.conversation_entry()])
+        records, _ = self.read()
+        nodes = records[0].observed["conversation"]["mapping"]
+        self.assertEqual([node["node_id"] for node in nodes],
+                         ["root", "m-user", "m-assistant", "m-code", "m-output", "m-image", "m-variant"])
+        by_id = {node["node_id"]: node for node in nodes}
+        self.assertEqual((by_id["m-user"]["parent"], by_id["m-user"]["children"], by_id["root"]["message"]),
+                         ("root", ["m-assistant", "m-variant"], None))  # 트리의 parent·children·빈 root 유지
+        self.assertEqual([m.message_id for m in p.extract_cache_conversations(records)[0].messages],
+                         ["m-user", "m-assistant", "m-code", "m-output", "m-image", "m-variant"])
+
+    def test_messages_list_schema_recovers_messages(self):
+        build_blockfile_cache(self.cache_dir, [self.plural_entry()])
+        records, coverage = self.read()
+        self.assertEqual((len(records), coverage.status, records[0].warnings), (1, "PARSED", []))
+        nodes = records[0].observed["conversation"]["mapping"]
+        self.assertEqual([(node["node_id"], node["parent"], node["children"]) for node in nodes],
+                         [("f-user", None, ["f-assistant"]), ("f-assistant", "f-user", []), ("f-orphan", "f-cut-off-parent", [])])
+        conversation = p.extract_cache_conversations(records)[0]
+        self.assertEqual((conversation.conversation_id, conversation.title, conversation.recovery_status, conversation.warnings),
+                         (CACHE_CONV_ID, "합성 평면 대화", "RECOVERED", []))
+        self.assertEqual([(m.sequence_index, m.message_id, m.parent_message_id, m.role, m.content_type, m.content)
+                          for m in conversation.messages],
+                         [(0, "f-user", None, "user", "text", "평면 목록 질문"),
+                          (1, "f-assistant", "f-user", "assistant", "text", "평면 목록 답변"),
+                          (2, "f-orphan", None, "assistant", "text", "부모가 잘린 답변")])  # 부모가 응답에 없으면 추정하지 않는다
+        first = conversation.messages[0]
+        self.assertEqual((first.timestamp_raw, first.timestamp_utc, first.timestamp_kst, first.timestamp_type, first.timestamp_source),
+                         (repr(CACHE_CREATE_RAW), CACHE_CREATE_UTC, CACHE_CREATE_KST, "unix_s_decimal",
+                          _conversation_rules._CACHE_MESSAGE_TIME_SOURCE))
+        self.assertTrue(conversation.messages[2].record_location.endswith("mapping=f-orphan"))
+        for secret in SECRET_CACHE_VALUES:  # owner · request_id 는 평면 목록에서도 비출력
+            self.assertNotIn(secret, json.dumps([r.to_dict() for r in records], ensure_ascii=False))
+
+    def test_messages_list_without_id_or_parent_uses_index_node_id(self):
+        body = {"conversation_id": CACHE_CONV_ID, "title": "id 없음", "messages": [
+            {"author": {"role": "user"}, "content": {"content_type": "text", "parts": ["첫 질문"]}, "create_time": 1787221032},
+            {"id": "", "author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["빈 id"]}, "metadata": {}},
+            {"id": "dup", "author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["중복 id 1"]}},
+            {"id": "dup", "author": {"role": "assistant"}, "content": {"content_type": "text", "parts": ["중복 id 2"]},
+             "metadata": {"parent_id": "dup"}},
+        ]}
+        build_blockfile_cache(self.cache_dir, [self.plural_entry(body)])
+        records, _ = self.read()
+        nodes = records[0].observed["conversation"]["mapping"]
+        self.assertEqual([node["node_id"] for node in nodes], ["messages[0]", "messages[1]", "dup", "messages[3]"])
+        messages = p.extract_cache_conversations(records)[0].messages
+        self.assertEqual([(m.message_id, m.parent_message_id) for m in messages],
+                         [(None, None), ("", None), ("dup", None), ("dup", "dup")])  # id 를 만들어 내지 않는다
+
+    def test_malformed_bodies_do_not_crash(self):
+        cases = [
+            ({"conversation_id": CACHE_CONV_ID, "messages": "목록이 아님"}, [p.CACHE_UNEXPECTED_STRUCTURE], False),
+            ({"conversation_id": CACHE_CONV_ID, "messages": ["문자열 원소"]}, [p.CACHE_UNEXPECTED_STRUCTURE], False),
+            ({"conversation_id": CACHE_CONV_ID, "items": [], "total": 0}, [p.CACHE_UNEXPECTED_STRUCTURE], False),
+            ([1, 2, 3], [p.CACHE_UNEXPECTED_STRUCTURE], False),
+            ({"conversation_id": CACHE_CONV_ID, "messages": []}, [], True),
+            ({"conversation_id": CACHE_CONV_ID, "messages": [{"metadata": "dict 아님", "content": None}]}, [], True),
+            ({"conversation_id": CACHE_CONV_ID, "messages": [{"id": 7, "metadata": {"parent_id": 7}}]}, [], True),
+            ({"conversation_id": CACHE_CONV_ID, "mapping": {"n": "dict 아님"}}, [p.CACHE_UNEXPECTED_STRUCTURE], False),
+        ]
+        for body, expected_warnings, has_conversation in cases:
+            with self.subTest(body=body):
+                build_blockfile_cache(self.cache_dir, [self.plural_entry(body)])
+                records, coverage = self.read()
+                self.assertEqual((len(records), records[0].warnings), (1, expected_warnings))
+                self.assertEqual("conversation" in records[0].observed, has_conversation)
+                self.assertEqual(coverage.status, "PARSED" if has_conversation else "PARTIAL")
+                recovered = p.extract_cache_conversations(records)
+                self.assertEqual(len(recovered), 1 if has_conversation else 0)
+                if has_conversation and not recovered[0].messages:
+                    self.assertEqual(recovered[0].recovery_status, "RESIDUAL_ONLY")
+
+
 class CacheConversationExtractionTest(CacheTestBase):
     def setUp(self):
         super().setUp()
@@ -4005,7 +4156,7 @@ class CacheConversationExtractionTest(CacheTestBase):
         self.assertEqual(messages[4].warnings, [f"{p.MESSAGE_NON_TEXT_PARTS}:1"])
         self.assertEqual((messages[0].timestamp_raw, messages[0].timestamp_utc, messages[0].timestamp_kst, messages[0].timestamp_type,
                           messages[0].timestamp_source),
-                         (repr(CACHE_CREATE_RAW), CACHE_CREATE_UTC, CACHE_CREATE_KST, "unix_s_decimal", p._CACHE_MESSAGE_TIME_SOURCE))
+                         (repr(CACHE_CREATE_RAW), CACHE_CREATE_UTC, CACHE_CREATE_KST, "unix_s_decimal", _conversation_rules._CACHE_MESSAGE_TIME_SOURCE))
         self.assertEqual((messages[1].timestamp_utc, messages[2].timestamp_type, messages[2].timestamp_utc),
                          ("2026-08-20T10:17:20.500000Z", "unix_s", "2026-08-20T10:17:21Z"))
         self.assertTrue(all(m.conversation_id == CACHE_CONV_ID and m.source_artifact == "cache"
@@ -4162,7 +4313,7 @@ class SessionStorageReaderTest(SessionStorageTestBase):
                           put.observed["sequence"], put.observed["map_id"], put.observed["value"], put.observed["value_encoding"]),
                          ("https://chatgpt.com/", SS_EXPORT_KEY, "data_export_pending_confirm", "PUT", 31, "2", EXPORT_MS, "utf-16-le"))
         self.assertEqual((put.timestamp_raw, put.timestamp_utc, put.timestamp_kst, put.timestamp_type, put.timestamp_source),
-                         (EXPORT_MS, EXPORT_UTC, EXPORT_KST, "unix_ms", p._SESSION_EXPORT_TIME_SOURCE))
+                         (EXPORT_MS, EXPORT_UTC, EXPORT_KST, "unix_ms", _session_storage._SESSION_EXPORT_TIME_SOURCE))
         self.assertEqual((delete.observed["operation"], delete.observed["sequence"], delete.observed["value"], delete.timestamp_raw),
                          ("DELETE", 41, None, None))  # DELETE 에 시각을 만들지 않음
         self.assertEqual(put.record_location, f"offset={put.observed['log_record_offset']} block=0 sequence=31 operation=1")
@@ -4304,7 +4455,7 @@ class ImageGenerationRequestRuleTest(SessionStorageTestBase):
                          (IMAGEGEN_KEY, IMAGEGEN_MS, 40397))
         self.assertEqual((first.timestamp_raw, first.timestamp_utc, first.timestamp_kst, first.timestamp_type,
                           first.timestamp_source),
-                         (str(IMAGEGEN_MS), IMAGEGEN_UTC, IMAGEGEN_KST, "unix_ms", p._SESSION_IMAGEGEN_TIME_SOURCE))
+                         (str(IMAGEGEN_MS), IMAGEGEN_UTC, IMAGEGEN_KST, "unix_ms", _session_storage._SESSION_IMAGEGEN_TIME_SOURCE))
         self.assertEqual((records[-1].observed["started_at_ms"], records[-1].timestamp_raw), (None, None))
         self.assertIn(f"{p.SESSION_STORAGE_NON_ALLOWLISTED_OPERATIONS}:1", coverages[0].warnings)  # checkpoint 키는 Record 아님
 
@@ -4317,7 +4468,7 @@ class ImageGenerationRequestRuleTest(SessionStorageTestBase):
                            "PARTIALLY_VERIFIED")])
         event = events[0]
         self.assertEqual((event.timestamp_utc, event.timestamp_kst, event.timestamp_source, event.device_attribution),
-                         (IMAGEGEN_UTC, IMAGEGEN_KST, p._SESSION_IMAGEGEN_TIME_SOURCE, "UNKNOWN"))
+                         (IMAGEGEN_UTC, IMAGEGEN_KST, _session_storage._SESSION_IMAGEGEN_TIME_SOURCE, "UNKNOWN"))
         self.assertEqual([(e.evidence_level, e.observed["last_displayed_percent"])
                           for e in event.primary_evidence + event.supporting_evidence],
                          [("DIRECT", 40), ("SUPPORTING", 50), ("SUPPORTING", 61), ("SUPPORTING", 74)])
@@ -5472,7 +5623,7 @@ class SharedProtoDbFileDownloadRuleTest(SharedProtoDbReaderTest):
 
     def test_same_guid_in_history_keeps_both_sources_in_one_event(self):
         records, coverages = self.read(self.put(10, spdb_value()))
-        history_record = p._history_download_record(
+        history_record = _history._history_download_record(
             "Default/History", None, "Default",
             {"id": 1, "guid": SPDB_GUID, "target_path": r"C:\Users\u\Downloads\report.pdf",
              "start_time": 13433876833869648, "end_time": 0, "tab_url": CHATGPT_TAB_URL},
@@ -5619,6 +5770,101 @@ class SnssReaderTest(unittest.TestCase):
         self.assertEqual(len(records), 2)
         records, coverages = p.read_chrome_sessions(self.source, "Profile 9/Sessions")
         self.assertEqual([(c.source_path, c.status) for c in coverages], [("Profile 9/Sessions", "NOT_PRESENT")])
+
+
+class PreferencesReaderTest(unittest.TestCase):
+    """§7.7 Chrome Preferences Reader (browser.clear_data 선택 상태만)."""
+
+    # 2026-09-30 E10-04 원자료에서 확인한 값 (POST = 캐시 삭제 후)
+    POST_CLEAR_DATA = {"browsing_history": False, "cache": True, "cookies": False, "download_history": False}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "Chrome"
+        (self.root / "Default").mkdir(parents=True)
+        self.source = p.DirectorySource(self.root)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def read(self, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        (self.root / "Default" / "Preferences").write_bytes(data)
+        records, coverage = p.read_preferences(self.source, "Default/Preferences", os_user="llmtest",
+                                               browser_profile="Default")
+        self.assertEqual(coverage.source_sha256, hashlib.sha256(data).hexdigest())
+        return records, coverage
+
+    # PREF 1
+    def test_clear_data_selection_is_one_record(self):
+        records, coverage = self.read({"browser": {"clear_data": dict(self.POST_CLEAR_DATA), "theme": {"t": 1}}})
+        self.assertEqual((coverage.artifact_type, coverage.status, coverage.record_count, coverage.warnings),
+                         ("preferences", "PARSED", 1, []))
+        record, = records
+        self.assertEqual(record.observed, {"key": "browser.clear_data",
+                                           "key_kind": "clear_browsing_data_selection",
+                                           "clear_data": self.POST_CLEAR_DATA})
+        self.assertEqual((record.os_user, record.browser_profile, record.record_location),
+                         ("llmtest", "Default", "browser.clear_data"))
+
+    # PREF 2 — 이 값에는 삭제 시각이 없다. 파일 수정 시각을 행위 시각으로 바꿔 쓰지 않는다.
+    def test_reader_makes_no_timestamp(self):
+        record, = self.read({"browser": {"clear_data": {"cache": True}}})[0]
+        self.assertEqual((record.timestamp_raw, record.timestamp_utc, record.timestamp_kst, record.timestamp_source),
+                         (None, None, None, None))
+        self.assertEqual(record.timestamp_type, "unknown")
+
+    # PREF 3 — E10-04 PRE: clear_data 키 자체가 없다 (오류가 아니다)
+    def test_missing_clear_data_is_parsed_without_a_record(self):
+        records, coverage = self.read({"browser": {"theme": {}, "window_placement": {"top": 2}}})
+        self.assertEqual((records, coverage.status, coverage.record_count), ([], "PARSED", 0))
+        self.assertEqual(coverage.warnings, [p.PREFERENCES_CLEAR_DATA_NOT_PRESENT])
+
+    # PREF 4
+    def test_missing_file_is_not_present(self):
+        records, coverage = p.read_preferences(self.source, "Default/Preferences")
+        self.assertEqual((records, coverage.status, coverage.record_count, coverage.warnings),
+                         ([], "NOT_PRESENT", 0, []))
+        self.assertIsNone(coverage.source_sha256)
+
+    # PREF 5
+    def test_broken_json_is_parse_error_with_the_hash_kept(self):
+        (self.root / "Default" / "Preferences").write_bytes(b"{not json")
+        records, coverage = p.read_preferences(self.source, "Default/Preferences")
+        self.assertEqual((records, coverage.status, coverage.warnings), ([], "PARSE_ERROR", [p.PREFERENCES_NOT_JSON]))
+        self.assertEqual(coverage.source_sha256, hashlib.sha256(b"{not json").hexdigest())
+
+    # PREF 6
+    def test_empty_file_is_parse_error(self):
+        (self.root / "Default" / "Preferences").write_bytes(b"")
+        _, coverage = p.read_preferences(self.source, "Default/Preferences")
+        self.assertEqual((coverage.status, coverage.warnings), ("PARSE_ERROR", [p.PREFERENCES_NOT_JSON]))
+
+    # PREF 7
+    def test_folder_instead_of_a_file_is_parse_error(self):
+        (self.root / "Default" / "Preferences").mkdir()
+        _, coverage = p.read_preferences(self.source, "Default/Preferences")
+        self.assertEqual((coverage.status, coverage.warnings), ("PARSE_ERROR", [p.PREFERENCES_READ_ERROR]))
+
+    # PREF 8 — 체크박스 상태(bool)만 남긴다
+    def test_non_boolean_values_are_not_copied(self):
+        records, _ = self.read({"browser": {"clear_data": {"cache": True, "time_period": 4, "note": "x"}}})
+        self.assertEqual(records[0].observed["clear_data"], {"cache": True})
+
+    # PREF 9 — Preferences 의 나머지 키(계정 등 개인정보)는 읽지 않는다
+    def test_other_preferences_keys_are_not_read(self):
+        records, _ = self.read({"browser": {"clear_data": {"cache": True}},
+                                "account_info": [{"email": "victim@example.com"}],
+                                "profile": {"name": "실명"}})
+        dumped = json.dumps([dataclasses.asdict(record) for record in records], ensure_ascii=False)
+        self.assertNotIn("victim@example.com", dumped)
+        self.assertNotIn("실명", dumped)
+
+    # PREF 10 — Profile 폴더 아래 경로 (대소문자 무시)
+    def test_preferences_path_uses_the_real_name(self):
+        self.assertEqual(p.preferences_path(self.source, "Default"), "Default/Preferences")
+        (self.root / "Profile 1").mkdir()
+        self.assertEqual(p.preferences_path(self.source, "Profile 1"), "Profile 1/Preferences")
 
 
 class TemporaryChatRuleTest(SnssReaderTest):
@@ -6001,7 +6247,8 @@ class FileUploadRuleTest(CacheTestBase):
 
 
 # --- 최종 사용자용 CSV 2종 (timeline.csv / recovered_conversations.csv) --------------------------
-# 새 판정을 만들지 않는 파생 산출물이다 — 행 수가 Event 수 · 복구된 메시지 수와 정확히 일치해야 한다.
+# 새 판정을 만들지 않는 파생 산출물이다 — 복구된 메시지 수와 행 수는 정확히 일치한다.
+# timeline 행 수는 팀 분류 체계에 있는 Event 수와 일치한다 (목록 밖 행위는 아래 정책 테스트 참조).
 
 class FinalCsvExportTest(unittest.TestCase):
     def setUp(self):
@@ -6041,8 +6288,10 @@ class FinalCsvExportTest(unittest.TestCase):
         result = make_result()
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        stamps = [dict(zip(header, row))["Timestamp"] for row in rows if dict(zip(header, row))["Timestamp"]]
-        self.assertEqual(stamps, sorted(stamps))  # run() 이 시각순으로 정렬한 순서를 그대로 쓴다
+        stamps = [dict(zip(header, row))["Timestamp"] for row in rows]
+        dated = [stamp for stamp in stamps if stamp != p.CSV_EMPTY_CELL]  # "-" 는 시각이 아니라 빈 셀 placeholder 다
+        self.assertEqual(dated, sorted(dated))  # run() 이 시각순으로 정렬한 순서를 그대로 쓴다
+        self.assertEqual(stamps[:len(dated)], dated)  # 시각 없는 행("-")은 시각 있는 행 뒤에 온다
         self.assertEqual(len(rows), len({tuple(row) for row in rows}))
 
     def test_timeline_model_is_team_value(self):
@@ -6050,25 +6299,30 @@ class FinalCsvExportTest(unittest.TestCase):
         header, rows = self.read_csv("timeline.csv")
         self.assertEqual({dict(zip(header, row))["Model"] for row in rows}, {"chatgpt-web"})
 
-    def test_timeline_keeps_rule_id_status_and_kst_timestamp(self):
+    def test_timeline_keeps_event_order_status_and_kst_timestamp(self):
+        """행은 Event 순서를 그대로 따르고 시각·판정은 Event 값 그대로다 (rule_id 는 최종 CSV 에 내지 않는다)."""
         result = make_result()
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        by_rule = {}
-        for row in rows:
-            cells = dict(zip(header, row))
-            by_rule[cells["Artifact_details "].split("rule_id=")[1].split(" | ")[0]] = cells
-        for event in result.events:
-            row = by_rule[event.rule_id]
-            self.assertEqual(row["Timestamp"], p.csv_final_timestamp(event.timestamp_kst) or "")
-            self.assertIn(f"confidence={event.confidence}", row["Artifact_details "])  # 내부 상세는 이 칸에 남는다
-            self.assertIn("KST", row["Timestamp"] or "KST")
+        events = [event for event in result.events if event.action not in p.CSV_NON_TEAM_ACTIONS]
+        self.assertEqual(len(rows), len(events))
+        for event, row in zip(events, [dict(zip(header, row)) for row in rows]):
+            self.assertEqual(row["Timestamp"], p.csv_final_timestamp(event.timestamp_kst) or p.CSV_EMPTY_CELL)
+            self.assertEqual(row["Verdict"], p.CSV_VERDICT_LABELS[event.action_status])
+            if event.timestamp_kst:
+                self.assertIn("KST", row["Timestamp"])  # 시각이 있는 행만 팀 표기를 갖는다 (없으면 "-")
 
     def test_final_timestamp_uses_team_notation_without_fake_precision(self):
-        """팀 표기는 "YYYY-MM-DD HH:MM:SS[.ffffff] KST" — 소수 자리를 늘리거나 줄이지 않는다."""
+        """팀 표기는 "YYYY-MM-DD HH:MM:SS.ffffff KST" 고정 — 통합 contract 의 TS_RE 가 소수 6자리를 요구한다.
+
+        소수부가 없으면 `.000000` 을 채운다. 시각을 만들어 내는 것이 아니라 표기를 맞추는 것이고,
+        원본 정밀도는 JSON 의 timestamp_raw / timestamp_utc 에 그대로 남는다 (가짜 정밀도 금지는 그쪽에서 지킨다).
+        """
         self.assertEqual(p.csv_final_timestamp("2026-09-01T18:41:00.065000+09:00"),
                          "2026-09-01 18:41:00.065000 KST")
-        self.assertEqual(p.csv_final_timestamp("2026-09-01T18:06:16+09:00"), "2026-09-01 18:06:16 KST")
+        self.assertEqual(p.csv_final_timestamp("2026-09-01T18:06:16+09:00"), "2026-09-01 18:06:16.000000 KST")
+        # 이미 있는 소수부는 늘리거나 줄이지 않는다. format_kst 는 소수 0자리 또는 6자리만 만들어서
+        # 아래 입력은 실제 경로에 나오지 않는다 (나온다면 소수 자릿수 정규화를 별도로 정해야 한다).
         self.assertEqual(p.csv_final_timestamp("2026-09-01T18:06:16.5+09:00"), "2026-09-01 18:06:16.5 KST")
         self.assertIsNone(p.csv_final_timestamp(None))
         self.assertEqual(p.csv_final_timestamp("2026-09-01T09:41:00Z"), "2026-09-01T09:41:00Z")  # KST 아니면 그대로
@@ -6077,16 +6331,14 @@ class FinalCsvExportTest(unittest.TestCase):
         result = make_result()
         result.conversations = [make_conversation()]
         self.export(result)
+        # 통합 contract: Timestamp 는 "YYYY-MM-DD HH:MM:SS.ffffff KST" 또는 "-" 뿐이다 (빈 칸은 EMPTY_CELL 위반)
+        team_stamp = r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6} KST|-)$"
         header, rows = self.read_csv("timeline.csv")
         for row in rows:
-            stamp = dict(zip(header, row))["Timestamp"]
-            if stamp:
-                self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)? KST$")
+            self.assertRegex(dict(zip(header, row))["Timestamp"], team_stamp)
         header, rows = self.read_csv("recovered_conversations.csv")
         for row in rows:
-            stamp = dict(zip(header, row))["timestamp"]
-            if stamp:
-                self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)? KST$")
+            self.assertRegex(dict(zip(header, row))["timestamp"], team_stamp)
 
     def test_timeline_verdict_maps_detected_and_candidate(self):
         result = make_result()
@@ -6097,7 +6349,7 @@ class FinalCsvExportTest(unittest.TestCase):
         header, rows = self.read_csv("timeline.csv")
         self.assertEqual([dict(zip(header, row))["Verdict"] for row in rows], ["확정", "의심"])
 
-    def test_timeline_user_behavior_uses_korean_label_or_keeps_action(self):
+    def test_timeline_user_behavior_uses_team_label_and_drops_unknown_action(self):
         result = make_result()
         known, unknown = make_event(), make_event(event_id="event:2")
         known.action, unknown.action = "ACCOUNT_SWITCH", "SOME_FUTURE_ACTION"
@@ -6105,7 +6357,8 @@ class FinalCsvExportTest(unittest.TestCase):
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
         behaviors = [dict(zip(header, row))["User_behavior"] for row in rows]
-        self.assertEqual(behaviors, ["계정 변경", "SOME_FUTURE_ACTION"])  # 모르는 action 은 번역하지 않는다
+        # 모르는 action 은 번역하지도, 내부 코드로 내보내지도 않는다 — 행 자체를 만들지 않는다 (2026-10-01 팀 확정).
+        self.assertEqual(behaviors, ["계정 전환"])
 
     def test_timeline_builds_artifact_path_and_behavior_details(self):
         result = make_result()
@@ -6115,12 +6368,13 @@ class FinalCsvExportTest(unittest.TestCase):
         event = result.events[0]
         evidence = event.primary_evidence[0]
         self.assertIn(evidence.source_path, row["Artifact_path"])
-        if evidence.record_location:  # record 상세는 경로가 아니라 Artifact_details 칸에 둔다
+        if evidence.record_location:  # record 상세는 경로에 붙이지 않는다 (records.csv / JSON 에 그대로 남는다)
             self.assertNotIn(evidence.record_location, row["Artifact_path"])
-            self.assertIn(f"record={evidence.record_location}", row["Artifact_details "])
         self.assertNotIn("#", row["Artifact_path"])
-        self.assertIn(evidence.evidence_level, row["Behavior_details "])
-        self.assertIn(f"artifact_type={evidence.artifact_type}", row["Artifact_details "])
+        # 최종 CSV 두 칸에는 내부 표현을 내지 않는다 — 아티팩트는 사람이 읽는 이름으로만 적는다
+        self.assertNotIn(evidence.evidence_level, row["Behavior_details "])
+        self.assertNotIn(f"artifact_type={evidence.artifact_type}", row["Artifact_details "])
+        self.assertTrue(row["Artifact_details "].startswith("[History] "), row["Artifact_details "])
         # 두 칸의 역할이 다르다 - 같은 문장을 그대로 복제하지 않는다
         self.assertNotEqual(row["Behavior_details "], row["Artifact_details "])
 
@@ -6131,7 +6385,9 @@ class FinalCsvExportTest(unittest.TestCase):
         result.events = [event]
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        self.assertNotIn("conversation_id=", dict(zip(header, rows[0]))["Behavior_details "])
+        # 대화 ID 를 관찰하지 못했으면 그 자리에 다른 값을 채우지 않는다 (URL 근거만 남는다)
+        self.assertEqual(dict(zip(header, rows[0]))["Behavior_details "],
+                         "로그아웃 URL 방문_https://chatgpt.com/auth/logout")
 
     def test_timeline_conversation_id_comes_from_observed_evidence(self):
         event = make_event()
@@ -6140,12 +6396,13 @@ class FinalCsvExportTest(unittest.TestCase):
         result.events = [event]
         self.export(result)
         header, rows = self.read_csv("timeline.csv")
-        self.assertIn("conversation_id=conv-xyz", dict(zip(header, rows[0]))["Behavior_details "])
+        self.assertEqual(dict(zip(header, rows[0]))["Behavior_details "], "로그아웃 URL 방문_conv-xyz")
 
     def test_timeline_redacts_auth_query_values(self):
         event = make_event()
-        event.primary_evidence[0].note = ("https://chatgpt.com/auth/callback"
-                                          "?code=SECRETAUTHCODE&state=SECRETSTATE&access_token=SECRETTOKEN")
+        event.primary_evidence[0].observed = {"url": ("https://chatgpt.com/auth/callback"
+                                                      "?code=SECRETAUTHCODE&state=SECRETSTATE"
+                                                      "&access_token=SECRETTOKEN")}
         event.primary_evidence[0].record_location = "urls.id=1"
         result = make_result()
         result.events = [event]
@@ -6189,7 +6446,7 @@ class FinalCsvExportTest(unittest.TestCase):
         self.assertEqual([first["role"], second["role"]], ["user", "assistant"])
         self.assertEqual(first["content"], conversation.messages[0].content)  # 절단 없음
         self.assertEqual(second["content"], conversation.messages[1].content)
-        self.assertEqual(first["parent_message_uuid"], "")
+        self.assertEqual(first["parent_message_uuid"], p.CSV_EMPTY_CELL)  # 부모 없음도 빈 칸이 아니라 "-"
         self.assertEqual(second["parent_message_uuid"], "msg-0")
         self.assertEqual(first["conversation_uuid"], "conv-1")
         self.assertEqual(first["message_uuid"], "msg-0")
@@ -6219,10 +6476,10 @@ class FinalCsvExportTest(unittest.TestCase):
 
     def test_cache_address_file_resolves_real_data_file(self):
         """CacheAddr 해석: block file 은 data_N, 외부 파일은 f_xxxxxx. 해석 못 하면 None."""
-        self.assertEqual(p._cache_address_file(0xc2030328), "data_3")
-        self.assertEqual(p._cache_address_file(0xa0010647), "data_1")
-        self.assertEqual(p._cache_address_file(0x8000014e), "f_00014e")
-        self.assertIsNone(p._cache_address_file(0x00030328))  # initialized bit 없음
+        self.assertEqual(_cache._cache_address_file(0xc2030328), "data_3")
+        self.assertEqual(_cache._cache_address_file(0xa0010647), "data_1")
+        self.assertEqual(_cache._cache_address_file(0x8000014e), "f_00014e")
+        self.assertIsNone(_cache._cache_address_file(0x00030328))  # initialized bit 없음
 
     def test_recovered_conversations_keeps_partial_status_and_unknown_role(self):
         message = make_message(0, recovery_status="PARTIAL", content=None, role="UNKNOWN", timestamp_kst=None,
@@ -6232,7 +6489,7 @@ class FinalCsvExportTest(unittest.TestCase):
         self.export(result)
         header, rows = self.read_csv("recovered_conversations.csv")
         row = dict(zip(header, rows[0]))
-        self.assertEqual((row["role"], row["content"], row["timestamp"]), ("UNKNOWN", "", ""))
+        self.assertEqual((row["role"], row["content"], row["timestamp"]), ("UNKNOWN", "-", "-"))
 
     def test_debug_output_keeps_detailed_internal_fields(self):
         """최종 CSV 에서 빠진 상세 정보는 --debug-output 쪽에 그대로 남아 있어야 한다."""
@@ -6260,6 +6517,558 @@ class FinalCsvExportTest(unittest.TestCase):
             text = (self.dir / name).read_text(encoding="utf-8-sig")
             for secret in ("session-token", "Bearer ", "__Secure-next-auth"):
                 self.assertNotIn(secret, text)
+
+
+# --- 최종 User_behavior 는 팀 분류 체계에 있는 행위만 (2026-09-23 팀 회의 확정) ------------------
+# 목록 밖 행위는 탐지를 멈추지 않는다 — Event·Evidence·debug CSV 에는 남고 최종 timeline.csv 행만 만들지 않는다.
+
+class TimelineUserBehaviorPolicyTest(unittest.TestCase):
+    TEAM_BEHAVIORS_FILE = Path(__file__).resolve().parent.parent.parent / "integration" / "user_behaviors.txt"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="csv-policy-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+
+    def export(self, result, debug=False):
+        return p.write_result_csv(result, self.dir, debug=debug)
+
+    def read_csv(self, name):
+        with open(self.dir / name, encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.reader(handle))
+        return rows[0], rows[1:]
+
+    def behaviors_for(self, actions):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(actions)]
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    def test_non_team_actions_make_no_timeline_row(self):
+        """팀 목록 밖 행위 (대화 열람 · 프로필 화면 접근 · 대화 목록에서 사라짐 · 파일 업로드 계열) 는 최종 timeline 에 없다."""
+        self.assertEqual(self.behaviors_for(sorted(_final_csv.CSV_NON_TEAM_ACTIONS)), [])
+
+    def test_conversation_access_is_excluded_but_still_detected(self):
+        """CONVERSATION_ACCESS 는 Event 로 남고 debug events.csv 에도 있다 — 출력만 제외한다."""
+        result = make_result()
+        result.events = [make_event(action="CONVERSATION_ACCESS")]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        event_header, event_rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows], ["CONVERSATION_ACCESS"])
+
+    def test_team_behaviors_survive(self):
+        """분석표에 있는 행위는 그대로 최종 timeline 에 남는다."""
+        self.assertEqual(
+            self.behaviors_for(["LOGIN", "LOGOUT", "CONVERSATION_CREATE", "ACCOUNT_SWITCH",
+                                "PROMPT_SEND", "TEMPORARY_CHAT"]),
+            ["로그인", "로그아웃", "새로운 대화 생성", "계정 전환", "사용자 프롬프트 입력/전송", "임시 채팅 사용"])
+
+    def test_conversation_delete_uses_canonical_team_name(self):
+        self.assertEqual(self.behaviors_for(["CONVERSATION_DELETE"]), ["기존 대화 삭제"])
+
+    def test_mixed_events_keep_only_team_behaviors(self):
+        """제외 행위가 섞여도 나머지 행위와 순서는 그대로다."""
+        self.assertEqual(
+            self.behaviors_for(["LOGIN", "CONVERSATION_ACCESS", "LOGOUT", "PROFILE_ACCESS"]),
+            ["로그인", "로그아웃"])
+
+    # 팀 결정이 남은 이름 — 분석표는 종류별(이미지 업로드 / 문서 업로드)로 나눠 쓰는데 파서는 상위 이름만 낸다.
+    # 임의로 한쪽에 매핑하지 않고 (2026-09-23 회의에 논의 없음) 목록 밖 행위와 같은 정책으로 최종 timeline 에서만 뺀다.
+    PENDING_TEAM_MAPPING = ("업로드한 파일 삭제", "파일 업로드")
+
+    def team_behaviors_from_file(self):
+        """팀 목록 파일을 읽어 행위명 집합으로. 파일이 없는 배포(파서만 떼어낸 경우)에서는 건너뛴다."""
+        if not self.TEAM_BEHAVIORS_FILE.is_file():
+            self.skipTest(f"팀 행위 목록 없음: {self.TEAM_BEHAVIORS_FILE}")
+        return {line.strip() for line in self.TEAM_BEHAVIORS_FILE.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.strip().startswith("#")}
+
+    def test_in_parser_team_list_matches_the_shared_file(self):
+        """파서 안의 사본이 integration/user_behaviors.txt 와 글자까지 같아야 한다.
+
+        파서는 통합기 파일을 읽지 않으므로 (독립 실행 조건) 사본이 유일한 기준이다.
+        팀 목록이 바뀌면 이 테스트가 먼저 막는다.
+        """
+        self.assertEqual(sorted(_final_csv.CSV_TEAM_USER_BEHAVIORS), sorted(self.team_behaviors_from_file()))
+
+    def test_no_emitted_label_is_outside_the_team_behaviour_list(self):
+        """최종 timeline 에 나갈 수 있는 라벨은 전부 팀 목록 안에 있어야 한다 (UNKNOWN_USER_BEHAVIOR = 0).
+
+        목록 밖 이름을 쓰는 새 행위를 추가하면 이 테스트가 먼저 막는다.
+        """
+        allowed = self.team_behaviors_from_file()
+        emitted = {label for action, label in _final_csv.CSV_USER_BEHAVIOR_LABELS.items()
+                   if action not in _final_csv.CSV_NON_TEAM_ACTIONS}
+        self.assertEqual(sorted(emitted - allowed), [])
+
+    def test_pending_mappings_are_excluded_by_the_shared_list_not_by_name(self):
+        """'팀 결정 대기' 이름은 팀 목록과의 대조 결과로 제외된다 — 이름을 따로 하드코딩하지 않는다."""
+        allowed = self.team_behaviors_from_file()
+        for label in self.PENDING_TEAM_MAPPING:
+            self.assertNotIn(label, allowed)
+        excluded = {_final_csv.CSV_USER_BEHAVIOR_LABELS[action] for action in _final_csv.CSV_NON_TEAM_ACTIONS}
+        for label in self.PENDING_TEAM_MAPPING:
+            self.assertIn(label, excluded)
+
+    def test_non_team_actions_are_derived_from_the_label_table(self):
+        """제외 집합은 라벨 표와 팀 목록에서 계산된다 — 손으로 적은 이름이 아니다."""
+        self.assertEqual(_final_csv.CSV_NON_TEAM_ACTIONS,
+                         frozenset(action for action, label in _final_csv.CSV_USER_BEHAVIOR_LABELS.items()
+                                   if label not in _final_csv.CSV_TEAM_USER_BEHAVIORS))
+
+    # 2026-10-01 팀 확정: 라벨이 없는 action 도 최종 timeline 에서 빼고, 내부 action 코드를 User_behavior 로
+    # 내보내는 fallback 은 두지 않는다 (팀 목록 밖 값은 통합기의 UNKNOWN_USER_BEHAVIOR 가 된다).
+    # 대신 "조용히 사라짐" 은 아래 test_every_shipped_detector_action_has_a_team_label 이 배포 전에 막는다.
+    def test_label_less_action_makes_no_timeline_row(self):
+        """라벨이 없는 새 action 은 최종 timeline 행을 만들지 않는다."""
+        self.assertIsNone(_final_csv.csv_final_user_behavior("CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertEqual(self.behaviors_for(["CHATGPT_NEW_ACTION_WITHOUT_LABEL"]), [])
+
+    def test_label_less_action_is_still_kept_in_event_and_debug_output(self):
+        """같은 action 이 Event·debug events.csv 에는 그대로 남는다 — 개발자가 확인할 수 있어야 한다."""
+        result = make_result()
+        result.events = [make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL")]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        event_header, event_rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows],
+                         ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+        self.assertEqual([event.action for event in result.events], ["CHATGPT_NEW_ACTION_WITHOUT_LABEL"])
+
+    def test_no_internal_action_code_fallback_in_user_behavior(self):
+        """행 생성기를 직접 불러도 내부 action 코드가 User_behavior 로 나오지 않는다 (fallback 제거)."""
+        row = _final_csv._timeline_row(make_event(action="CHATGPT_NEW_ACTION_WITHOUT_LABEL"))
+        self.assertNotEqual(row["User_behavior"], "CHATGPT_NEW_ACTION_WITHOUT_LABEL")
+        self.assertNotIn(row["User_behavior"], set(_final_csv.CSV_USER_BEHAVIOR_LABELS))
+
+    def test_every_timeline_user_behavior_is_a_team_behavior(self):
+        """라벨 표의 모든 action 을 한 번에 내보내도 최종 User_behavior 는 팀 목록의 부분집합이다."""
+        actions = sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) | {"CHATGPT_NEW_ACTION_WITHOUT_LABEL"})
+        behaviors = set(self.behaviors_for(actions))
+        self.assertTrue(behaviors)
+        self.assertEqual(sorted(behaviors - self.team_behaviors_from_file()), [])
+
+    def test_file_upload_is_detected_and_kept_in_debug_but_not_in_timeline(self):
+        """FILE_UPLOAD · FILE_UPLOAD_DELETE 는 Event 로 남고 debug events.csv 에도 있다 — 최종 timeline 행만 없다."""
+        result = make_result()
+        result.events = [make_event(event_id="event:upload", action="FILE_UPLOAD"),
+                         make_event(event_id="event:upload-delete", action="FILE_UPLOAD_DELETE")]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        event_header, event_rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(event_header, row))["action"] for row in event_rows],
+                         ["FILE_UPLOAD", "FILE_UPLOAD_DELETE"])
+
+    @staticmethod
+    def _download_event(event_id, observed):
+        """History downloads 관찰값을 가진 FILE_DOWNLOAD Event."""
+        return make_event(event_id=event_id, action="FILE_DOWNLOAD",
+                          primary_evidence=[make_evidence(observed=observed)], supporting_evidence=[])
+
+    def _download_behaviors(self, events):
+        result = make_result()
+        result.events = list(events)
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    DOC_OBSERVED = {"filename": "whs_download_doc_001.docx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0001"}
+    CODE_OBSERVED = {"filename": "whs_download_code_001.py", "mime_type": "text/x-python",
+                     "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0002"}
+    BLOB_PNG_OBSERVED = {"filename": "ChatGPT Image 2026.png", "mime_type": "image/png",
+                         "download_url": "blob:https://chatgpt.com/a059f0f3"}
+    GENERATED_IMAGE_OBSERVED = {"filename": "ChatGPT Image 2026.png", "mime_type": "image/png",
+                                "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0003",
+                                "generated_image_conversation_id": "conv-0001"}
+
+    def test_document_download_is_promoted_to_the_team_name(self):
+        """Office 문서 MIME + ChatGPT 파일 제공 경로 → 팀 공식 이름 '문서 다운로드'."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:doc", self.DOC_OBSERVED)]),
+                         ["문서 다운로드"])
+
+    def test_code_file_download_is_not_a_document(self):
+        """코드 파일은 팀 '문서 다운로드' 실험 범위라고 볼 근거가 없어 최종 timeline 에 내지 않는다."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:code", self.CODE_OBSERVED)]), [])
+
+    def test_image_download_without_generation_evidence_is_excluded(self):
+        """확장자·파일명만으로 '생성 이미지 다운로드' 로 올리지 않는다 (blob: 은 출처 근거가 아니다)."""
+        self.assertEqual(self._download_behaviors([self._download_event("event:png", self.BLOB_PNG_OBSERVED)]), [])
+
+    def test_generated_image_download_needs_a_generation_link(self):
+        """생성 이미지와 연결되는 근거가 있을 때만 '생성 이미지 다운로드' 로 올린다."""
+        self.assertEqual(
+            self._download_behaviors([self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
+            ["생성 이미지 다운로드"])
+
+    # --- FILE_UPLOAD 최종 분류 (첨부 MIME 으로 문서/이미지 업로드를 가린다) ---
+    @staticmethod
+    def _upload_event(event_id, observed):
+        """Cache user 메시지 첨부 관찰값을 가진 FILE_UPLOAD Event."""
+        return make_event(event_id=event_id, action="FILE_UPLOAD",
+                          primary_evidence=[make_evidence(observed=observed)], supporting_evidence=[])
+
+    def _upload_behaviors(self, events):
+        result = make_result()
+        result.events = list(events)
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        return [dict(zip(header, row))["User_behavior"] for row in rows]
+
+    PDF_UPLOAD_OBSERVED = {"file_name": "에레렘_LLMHub_장애로그_20261001.pdf", "mime_type": "application/pdf",
+                           "conversation_id": "conv-0001"}
+    PNG_UPLOAD_OBSERVED = {"file_name": "MRK_ELELEM_LLMHUB_DASHBOARD.png", "mime_type": "image/png",
+                           "conversation_id": "conv-0001"}
+    JPEG_UPLOAD_OBSERVED = {"file_name": "whs_upload_photo_001.jpg", "mime_type": "image/jpeg",
+                            "conversation_id": "conv-0001"}
+    UNKNOWN_UPLOAD_OBSERVED = {"file_name": "whs_upload_unknown_001.bin",
+                               "mime_type": "application/octet-stream", "conversation_id": "conv-0001"}
+
+    def test_pdf_upload_is_promoted_to_document_upload(self):
+        """CASE 1 — application/pdf 첨부 → 팀 공식 이름 '문서 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED)]),
+                         ["문서 업로드"])
+
+    def test_png_upload_is_promoted_to_image_upload(self):
+        """CASE 2 — image/png 첨부 → '이미지 업로드'."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_jpeg_upload_is_promoted_to_image_upload(self):
+        """CASE 3 — image/* 대분류로 가린다 (image/jpeg)."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:jpeg", self.JPEG_UPLOAD_OBSERVED)]),
+                         ["이미지 업로드"])
+
+    def test_unknown_upload_mime_is_not_forced_into_a_category(self):
+        """CASE 4 — 근거 없는 MIME 은 문서/이미지로 만들지 않는다. MIME 이 아예 없는 경우도 같다."""
+        self.assertEqual(self._upload_behaviors([self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                                 self._upload_event("event:nomime", {})]), [])
+        self.assertIsNone(_final_csv.csv_final_user_behavior("FILE_UPLOAD"))  # event 없이 호출해도 승격 없음
+
+    def test_upload_classification_does_not_change_download_classification(self):
+        """CASE 5 — 기존 FILE_DOWNLOAD 분류 결과가 그대로다 (문서만 승격, 코드·blob 이미지는 제외)."""
+        self.assertEqual(
+            self._download_behaviors([self._download_event("event:doc", self.DOC_OBSERVED),
+                                      self._download_event("event:code", self.CODE_OBSERVED),
+                                      self._download_event("event:png", self.BLOB_PNG_OBSERVED),
+                                      self._download_event("event:gen", self.GENERATED_IMAGE_OBSERVED)]),
+            ["문서 다운로드", "생성 이미지 다운로드"])
+
+    def test_upload_rows_keep_the_timeline_header_and_one_row_per_file(self):
+        """CASE 6 — timeline.csv 열 구조·형식은 그대로이고, 파일 1개 = 행 1개 granularity 를 유지한다."""
+        result = make_result()
+        result.events = [self._upload_event("event:pdf-1", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:pdf-2", self.PDF_UPLOAD_OBSERVED),
+                         self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)]
+        self.export(result)
+        header, rows = self.read_csv("timeline.csv")
+        self.assertEqual(header, list(p.CSV_TIMELINE_COLUMNS))
+        self.assertEqual([dict(zip(header, row))["User_behavior"] for row in rows],
+                         ["문서 업로드", "문서 업로드", "이미지 업로드"])
+        self.assertEqual([dict(zip(header, row))["Model"] for row in rows], ["chatgpt-web"] * 3)
+
+    def test_generic_file_upload_never_reaches_the_final_timeline(self):
+        """어떤 조합에서도 최종 timeline 에 '파일 업로드' 는 나오지 않는다."""
+        behaviors = self._upload_behaviors([self._upload_event("event:pdf", self.PDF_UPLOAD_OBSERVED),
+                                            self._upload_event("event:bin", self.UNKNOWN_UPLOAD_OBSERVED),
+                                            self._upload_event("event:png", self.PNG_UPLOAD_OBSERVED)])
+        self.assertNotIn("파일 업로드", behaviors)
+        self.assertEqual(behaviors, ["문서 업로드", "이미지 업로드"])
+
+    def test_generic_file_download_never_reaches_the_final_timeline(self):
+        """어떤 조합에서도 최종 timeline 에 '파일 다운로드' 는 나오지 않는다 (2026-10-05 팀 결정)."""
+        events = [self._download_event("event:doc", self.DOC_OBSERVED),
+                  self._download_event("event:code", self.CODE_OBSERVED),
+                  self._download_event("event:png", self.BLOB_PNG_OBSERVED)]
+        behaviors = self._download_behaviors(events)
+        self.assertNotIn("파일 다운로드", behaviors)
+        self.assertEqual(behaviors, ["문서 다운로드"])
+
+    def test_excluded_downloads_stay_in_debug_events(self):
+        """최종에서 빠진 다운로드도 Event·근거는 events.csv 에 그대로 남는다."""
+        result = make_result()
+        result.events = [self._download_event("event:code", self.CODE_OBSERVED),
+                         self._download_event("event:png", self.BLOB_PNG_OBSERVED)]
+        self.export(result, debug=True)
+        self.assertEqual(self.read_csv("timeline.csv")[1], [])
+        header, rows = self.read_csv("events.csv")
+        self.assertEqual([dict(zip(header, row))["action"] for row in rows],
+                         ["FILE_DOWNLOAD", "FILE_DOWNLOAD"])
+
+    def test_every_shipped_detector_action_has_a_team_label(self):
+        """배포된 Rule 이 만드는 action 은 모두 라벨 표에 있어야 한다.
+
+        라벨이 없으면 그 행위는 최종 timeline 에 나가지 않는다. 조용히 빠지는 일이 배포까지 가지 않도록
+        새 Rule 을 추가하는 시점에 이 test 가 막는다 (라벨 + 발견 근거 문장 둘 다 필요하다).
+        """
+        source = Path(_final_csv.__file__).resolve().parent.parent / "detectors"
+        actions = {match for path in sorted(source.glob("*.py"))
+                   for match in re.findall(r'action="([A-Z_]+)"', path.read_text(encoding="utf-8"))}
+        self.assertTrue(actions, f"detector action 을 찾지 못했다: {source}")
+        self.assertEqual(sorted(actions - set(_final_csv.CSV_USER_BEHAVIOR_LABELS)), [])
+        self.assertEqual(sorted(actions - set(_final_csv.CSV_BEHAVIOR_REASONS)), [])
+
+
+# --- 최종 CSV 는 사람이 읽는 표현만 낸다 (2026-10-01 팀 출력 통일 요구) --------------------------
+# Behavior_details = "<발견 근거>_<핵심 내용>", Artifact_details = "[아티팩트명] 핵심 내용".
+# 내부 표현(action · evidence_level · rule_id · confidence · rule_verification · signal)은 최종 CSV 에서만
+# 빠지고 events.csv / records.csv / result.json 에는 그대로 남는다 (forensic 근거를 지우는 변경이 아니다).
+
+class FinalCsvHumanReadableTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="csv-readable-"))
+        self.addCleanup(lambda: shutil.rmtree(self.dir, ignore_errors=True))
+
+    def rows(self, result, debug=False, name="timeline.csv"):
+        self.out = self.dir / uuid.uuid4().hex  # write_result_csv 는 기존 출력을 덮어쓰지 않는다 — 호출마다 새 폴더
+        p.write_result_csv(result, self.out, debug=debug)
+        with open(self.out / name, encoding="utf-8-sig", newline="") as handle:
+            table = list(csv.reader(handle))
+        return [dict(zip(table[0], row)) for row in table[1:]]
+
+    def row_for(self, event, records=(), conversations=()):
+        result = make_result()
+        result.events = [event]
+        result.records = list(records) or result.records
+        result.conversations = list(conversations)
+        row, = self.rows(result)
+        return row
+
+    # A. User_behavior 는 팀 목록 밖 값을 내지 않는다
+    def test_user_behavior_stays_inside_the_team_list(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        outside = {row["User_behavior"] for row in self.rows(result)} - _final_csv.CSV_TEAM_USER_BEHAVIORS
+        self.assertEqual(sorted(outside), [])
+
+    # B. 전송 미확인 prompt — 새 행위명을 만들지 않고 '전송 미확인' 을 근거 칸에 적는다
+    def test_unsent_prompt_keeps_the_team_behavior_name_and_says_unconfirmed(self):
+        draft = make_record(record_id="ls-draft", artifact_type="local_storage",
+                            observed={"drafts": [{"draft_id": "null_thread", "content": "합성 초안 질문입니다\n둘째 줄"}]})
+        event = make_event(action="PROMPT_DRAFT", action_status="DETECTED",
+                           primary_evidence=[make_evidence(record_id="ls-draft", artifact_type="local_storage",
+                                                           source_path="Default/Local Storage/leveldb",
+                                                           record_location="conversationDrafts",
+                                                           observed={"sequence": 2})],
+                           supporting_evidence=[])
+        row = self.row_for(event, records=[draft])
+        self.assertEqual(row["User_behavior"], "사용자 프롬프트 입력/전송")  # 초안 전용 행위명을 만들지 않는다
+        self.assertEqual(row["Behavior_details "], "프롬프트 작성 흔적(전송 미확인)_합성 초안 질문입니다")
+        self.assertIn("전송 미확인", row["Behavior_details "])
+        self.assertEqual(row["Verdict"], "의심")  # 전송이 확인되지 않았으므로 확정이 아니다
+
+    def test_sent_prompt_shows_the_recovered_first_line(self):
+        message = make_message(0, message_id="msg-user-1", content="첫 줄 질문\n두 번째 줄")
+        conversation = make_conversation(messages=[message])
+        event = make_event(action="PROMPT_SEND", primary_evidence=[
+            make_evidence(artifact_type="cache", source_path=CACHE_PATH, record_location="entry=1",
+                          observed={"message_id": "msg-user-1", "role": "user"})], supporting_evidence=[])
+        row = self.row_for(event, conversations=[conversation])
+        self.assertEqual(row["Behavior_details "], "사용자 메시지 전송_첫 줄 질문")
+
+    def test_login_from_the_session_list_does_not_claim_a_url_visit(self):
+        """같은 '로그인' 이라도 근거가 다르면 문장이 다르다 — URL 방문을 관찰하지 않았으면 그렇게 쓰지 않는다."""
+        event = make_event(action="LOGIN", rule_id="CHATGPT_ACCOUNT_SESSION_001",
+                           primary_evidence=[make_evidence(artifact_type="local_storage",
+                                                           source_path="Default/Local Storage/leveldb",
+                                                           record_location="seq=390",
+                                                           observed={"key_kind": "account_switch_sessions",
+                                                                     "session_count": 1})],
+                           supporting_evidence=[])
+        self.assertEqual(self.row_for(event)["Behavior_details "], "세션 목록의 최근 로그인 기록_세션 1개")
+        url_event = make_event(action="LOGIN", rule_id="CHATGPT_LOGIN_001", supporting_evidence=[])
+        self.assertEqual(self.row_for(url_event)["Behavior_details "],
+                         "로그인 URL 방문 흔적_https://chatgpt.com/auth/logout")
+
+    def test_prompt_without_recovered_text_shows_only_the_reason(self):
+        """복구된 원문이 없으면 근거만 적는다 — 없는 프롬프트 내용을 만들어 내지 않는다."""
+        event = make_event(action="PROMPT_SEND", primary_evidence=[
+            make_evidence(artifact_type="cache", source_path=CACHE_PATH, record_location="entry=1",
+                          observed={"role": "user"})], supporting_evidence=[])
+        self.assertEqual(self.row_for(event)["Behavior_details "], "사용자 메시지 전송")
+
+    # C. Behavior_details 에 내부 token 이 없다
+    INTERNAL_TOKENS = ("DIRECT", "SUPPORTING", "INFERRED", "rule_id", "confidence", "rule_verification",
+                       "evidence_level", "signal_count", "Evidence Family", "Rule=")
+
+    # action 이 실제로 읽는 관찰 키(CSV_BEHAVIOR_CORE_KEYS)를 채워 '근거_내용' 형식을 확인한다.
+    # 관찰값이 전혀 없을 때 근거만 남는 것은 _behavior_core 의 설계된 동작이라 여기서 강제하지 않는다.
+    _CORE_SAMPLE_VALUES = {
+        'url': 'https://chatgpt.com/c/sample', 'title': '샘플 대화',
+        'client_conversation_id': 'conv-0001', 'removed_conversation_id': 'conv-0002',
+        'message_id': 'msg-0001', 'filename': 'sample.docx',
+        'target_path': 'C:/Users/u/Downloads/sample.docx', 'file_name': 'sample.png',
+        'conversation_id': 'conv-0003', 'url_conversation_id': 'conv-0004',
+    }
+
+    def _event_with_core_values(self, action):
+        """그 action 의 핵심 키를 채운 Event (CACHE_DELETE·전환형 action 은 전용 관찰값)."""
+        if action in self._CONDITIONAL_ACTION_EVIDENCE:   # FILE_DOWNLOAD: 문서 근거가 있어야 최종 행이 된다
+            observed = dict(self._CONDITIONAL_ACTION_EVIDENCE[action])
+        elif action == 'CACHE_DELETE':
+            observed = {'clear_data': {'cache': True, 'browsing_history': False}}
+        elif action in _final_csv.CSV_BEHAVIOR_TRANSITIONS:
+            before, after = _final_csv.CSV_BEHAVIOR_TRANSITIONS[action]
+            observed = {before: 'before-value', after: 'after-value'}
+        else:
+            keys = tuple(_final_csv.CSV_BEHAVIOR_CORE_KEYS.get(action, ())) + _final_csv.CSV_BEHAVIOR_ID_KEYS
+            observed = {}
+            for key in keys:
+                if key in self._CORE_SAMPLE_VALUES:
+                    observed[key] = self._CORE_SAMPLE_VALUES[key]
+                    break
+        if not observed:
+            return None
+        return make_event(action=action, primary_evidence=[make_evidence(observed=observed)],
+                          supporting_evidence=[])
+
+    def test_behavior_details_keeps_the_reason_and_core_shape(self):
+        """최종 Behavior_details 는 '<발견 근거>_<핵심 내용>' 이다 (근거만 남는 행을 막는다).
+
+        URL·파일명 안의 '_' 때문에 split 로 세지 않고, 포맷터가 쓴 근거 문장을 기준으로 앞뒤를 가른다.
+        """
+        reasons = (set(_final_csv.CSV_BEHAVIOR_REASONS.values())
+                   | set(_final_csv.CSV_BEHAVIOR_REASONS_BY_RULE.values()))
+        checked = 0
+        for action in sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) - _final_csv.CSV_NON_TEAM_ACTIONS):
+            event = self._event_with_core_values(action)
+            if event is None:          # 핵심 키가 정의되지 않은 action 은 대상이 아니다
+                continue
+            with self.subTest(action=action):
+                details = self.row_for(event)['Behavior_details ']
+                self.assertTrue(details and details != p.CSV_EMPTY_CELL, action)
+                reason = next((c for c in reasons if details.startswith(c)), None)
+                self.assertIsNotNone(reason, '%s: 근거 문장으로 시작하지 않는다 (%r)' % (action, details))
+                rest = details[len(reason):]
+                self.assertTrue(rest.startswith('_'), '%s: 근거 뒤에 _ 가 없다 (%r)' % (action, details))
+                self.assertTrue(rest[1:].strip(), '%s: 핵심 내용이 비어 있다 (%r)' % (action, details))
+                checked += 1
+        self.assertGreater(checked, 5, '형식을 확인한 action 이 너무 적다')
+
+    def test_session_based_login_has_a_core_value(self):
+        """세션 목록 근거의 LOGIN 도 핵심 내용(세션 개수)을 적는다 — 근거만 남기지 않는다."""
+        event = make_event(action="LOGIN", rule_id=_final_csv.CSV_ACCOUNT_SESSION_RULE_ID,
+                           primary_evidence=[make_evidence(artifact_type="local_storage",
+                                                           observed={"session_count": 1, "session_index": 0})],
+                           supporting_evidence=[])
+        details = self.row_for(event)["Behavior_details "]
+        self.assertEqual(details, "세션 목록의 최근 로그인 기록_세션 1개")
+
+    def test_session_login_details_never_show_account_identifiers(self):
+        """계정 식별자 해시·세션 토큰 길이는 최종 CSV 에 내지 않는다."""
+        event = make_event(action="LOGIN", rule_id=_final_csv.CSV_ACCOUNT_SESSION_RULE_ID,
+                           primary_evidence=[make_evidence(
+                               artifact_type="local_storage",
+                               observed={"session_count": 2, "user_id_sha256_prefix": "0000000000000000",
+                                         "session_token_length": 3740, "session_token_present": True})],
+                           supporting_evidence=[])
+        row = self.row_for(event)
+        self.assertEqual(row["Behavior_details "], "세션 목록의 최근 로그인 기록_세션 2개")
+        for token in ("0000000000000000", "3740"):
+            self.assertNotIn(token, row["Behavior_details "])
+
+    def test_behavior_details_has_no_internal_tokens(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        for row in self.rows(result):
+            for token in self.INTERNAL_TOKENS:
+                self.assertNotIn(token, row["Behavior_details "])
+
+    # FILE_DOWNLOAD 는 근거로 종류가 확인될 때만 최종 행이 되므로 문서 근거를 갖춘 Event 로 만든다
+    _CONDITIONAL_ACTION_EVIDENCE = {
+        "FILE_DOWNLOAD": {"filename": "doc.docx",
+                          "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                          "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_0001"},
+    }
+
+    def _event_for_action(self, action):
+        observed = self._CONDITIONAL_ACTION_EVIDENCE.get(action)
+        if observed is None:
+            return make_event(action=action)
+        return make_event(action=action, primary_evidence=[make_evidence(observed=observed)],
+                          supporting_evidence=[])
+
+    def test_behavior_details_does_not_start_with_the_internal_action_code(self):
+        for action in sorted(set(_final_csv.CSV_USER_BEHAVIOR_LABELS) - _final_csv.CSV_NON_TEAM_ACTIONS):
+            with self.subTest(action=action):
+                row = self.row_for(self._event_for_action(action))
+                self.assertNotIn(action, row["Behavior_details "])
+                self.assertNotIn(action, row["Artifact_details "])
+
+    # D·E. Artifact_details 는 "[아티팩트명] 핵심 내용" 이고 내부 표현이 없다
+    def test_artifact_details_uses_human_artifact_names(self):
+        cases = {
+            "history": "[History] ", "cache": "[Cache] ", "local_storage": "[Local Storage] ",
+            "session_storage": "[Session Storage] ", "sessions": "[Sessions] ", "preferences": "[Preferences] ",
+        }
+        for artifact_type, prefix in cases.items():
+            with self.subTest(artifact_type=artifact_type):
+                event = make_event(primary_evidence=[make_evidence(artifact_type=artifact_type)],
+                                   supporting_evidence=[])
+                self.assertTrue(self.row_for(event)["Artifact_details "].startswith(prefix),
+                                self.row_for(event)["Artifact_details "])
+
+    def test_artifact_details_joins_multiple_artifacts_with_a_bar(self):
+        row = self.row_for(make_event())  # 기본 Event 는 History + Local Storage 를 쓴다
+        self.assertEqual([segment.split("]")[0] + "]" for segment in row["Artifact_details "].split(" | ")],
+                         ["[History]", "[Local Storage]"])
+
+    def test_artifact_details_has_no_internal_tokens(self):
+        result = make_result()
+        result.events = [make_event(event_id=f"event:{index}", action=action)
+                         for index, action in enumerate(sorted(_final_csv.CSV_USER_BEHAVIOR_LABELS))]
+        for row in self.rows(result):
+            for token in ("rule_id=", "confidence=", "rule_verification=", "evidence_level=", "signal_count=",
+                          "Evidence Family=", "Rule=", "artifact_type=", "record="):
+                self.assertNotIn(token, row["Artifact_details "])
+
+    # F. CACHE_DELETE — 탐지 로직은 그대로고 표현만 사람이 읽는 형태다
+    def test_cache_delete_row_is_human_readable(self):
+        preferences = make_record(record_id="pf1", artifact_type="preferences", source_path="Default/Preferences",
+                                  record_location="browser.clear_data", timestamp_raw=None, timestamp_utc=None,
+                                  timestamp_kst=None, timestamp_type="unknown", timestamp_source=None,
+                                  observed={"key": "browser.clear_data", "key_kind": "clear_browsing_data_selection",
+                                            "clear_data": {"browsing_history": False, "cache": True,
+                                                           "cookies": False, "download_history": False}})
+        records = [ls_record("conversation_history",
+                             {"conversation_items": [{"id": NEW_RULE_CONV_ID, "title": "합성"}]}, record_id="l1"),
+                   preferences]
+        coverage = p.Coverage(artifact_type="cache", browser_profile="Default", source_path="Default/Cache",
+                              status="PARSED", record_count=0)
+        event, = p.detect_cache_delete(records, [coverage])
+        result = make_result()
+        result.events, result.records = [event], records
+        row, = self.rows(result)
+        self.assertEqual(row["User_behavior"], "캐시 삭제")
+        self.assertEqual(row["Behavior_details "], "캐시 삭제 설정 흔적_browser.clear_data.cache=true")
+        self.assertTrue(row["Artifact_details "].startswith("[Preferences] browser.clear_data.cache=true"),
+                        row["Artifact_details "])
+        self.assertEqual(row["Timestamp"], p.CSV_EMPTY_CELL)  # Preferences mtime 을 삭제 시각으로 쓰지 않는다
+        self.assertEqual(row["Verdict"], "의심")
+
+    # G. 최종 CSV 만 정리되고 내부 근거는 그대로 남는다
+    def test_internal_evidence_survives_in_json_and_debug_csv(self):
+        result = make_result()
+        event = result.events[0]
+        self.rows(result, debug=True)
+        with open(self.out / "events.csv", encoding="utf-8-sig", newline="") as handle:
+            table = list(csv.reader(handle))
+        event_row = dict(zip(table[0], table[1]))
+        self.assertEqual(event_row["rule_id"], event.rule_id)
+        self.assertEqual(event_row["confidence"], event.confidence)
+        self.assertEqual(event_row["rule_verification"], event.rule_verification)
+        self.assertEqual(event_row["action"], event.action)  # 내부 action 코드는 debug CSV 에 그대로
+        exported = json.dumps(result.to_dict(), ensure_ascii=False)
+        for kept in (event.rule_id, event.confidence, event.action, "evidence_level",
+                     "primary_evidence", "supporting_evidence", "DIRECT", "SUPPORTING"):
+            self.assertIn(kept, exported)
+        self.assertEqual([item.evidence_level for item in event.primary_evidence], ["DIRECT"])
+        self.assertEqual([item.evidence_level for item in event.supporting_evidence], ["SUPPORTING"])
 
 
 # --- 행위 Rule 9종 (PROMPT_SEND · FILE_UPLOAD_DELETE · SHARE_LINK · MODEL_CHANGE · ACCOUNT_NAME_CHANGE ·
@@ -6614,28 +7423,102 @@ class CacheDeleteRuleTest(NewRuleAssertMixin, unittest.TestCase):
         return ls_record("conversation_history", {"conversation_items": [{"id": NEW_RULE_CONV_ID, "title": "합성"}]},
                          record_id="l1")
 
-    def test_parsed_cache_without_entries_and_a_conversation_list_is_candidate_low(self):
-        events = p.detect_cache_delete([self.conversation_list()], [self.coverage()])
-        self.assert_candidate(events[0], "CACHE_DELETE", "CHATGPT_CACHE_DELETE_001", "LOW")
-        self.assertIsNone(events[0].timestamp_utc)
+    def preferences(self, *, cache=True, browser_profile="Default"):
+        """Preferences Reader 가 만드는 browser.clear_data Record 와 같은 모양 (시각 없음)."""
+        return make_record(record_id="pf1", artifact_type="preferences", source_path="Default/Preferences",
+                           record_location="browser.clear_data", browser_profile=browser_profile,
+                           timestamp_raw=None, timestamp_utc=None, timestamp_kst=None, timestamp_type="unknown",
+                           timestamp_source=None,
+                           observed={"key": "browser.clear_data", "key_kind": "clear_browsing_data_selection",
+                                     "clear_data": {"browsing_history": False, "cache": cache, "cookies": False,
+                                                    "download_history": False}})
 
-    def test_remaining_conversation_response_blocks_the_event(self):
+    def visit(self):
+        return make_record(record_id="h1", observed={"url": f"https://chatgpt.com/c/{NEW_RULE_CONV_ID}"})
+
+    def test_parsed_cache_without_entries_is_not_a_deletion_signal(self):
+        # 가장 중요한 regression: 대화 응답 entry 가 0건이고 맥락(S2·S3) 이 다 있어도 P1 이 없으면 삭제로 보지 않는다.
+        # entry 부재는 원래 캐시되지 않음·eviction·수집 범위 차이로도 생기는 값이라 양성 신호가 아니다
+        self.assertEqual(p.detect_cache_delete([self.conversation_list(), self.visit()], [self.coverage()]), [])
+
+    def test_remaining_conversation_response_without_clear_data_creates_no_event(self):
         self.assertEqual(p.detect_cache_delete([self.conversation_list(), cache_record([msg_node("m-user", "user")])],
                                                [self.coverage()]), [])
 
     def test_missing_cache_is_not_a_deletion(self):
-        self.assertEqual(p.detect_cache_delete([self.conversation_list()], [self.coverage("NOT_PRESENT")]), [])
+        self.assertEqual(p.detect_cache_delete([self.conversation_list(), self.preferences()],
+                                               [self.coverage("NOT_PRESENT")]), [])
 
     def test_cache_without_any_other_chatgpt_trace_creates_no_event(self):
         self.assertEqual(p.detect_cache_delete([], [self.coverage()]), [])
 
-    def test_visit_record_alone_is_also_a_signal(self):
-        visit = make_record(record_id="h1", observed={"url": f"https://chatgpt.com/c/{NEW_RULE_CONV_ID}"})
-        self.assertEqual(len(p.detect_cache_delete([visit], [self.coverage()])), 1)
+    def test_visit_record_alone_is_not_a_deletion_signal(self):
+        self.assertEqual(p.detect_cache_delete([self.visit()], [self.coverage()]), [])
 
-    def test_unrelated_history_url_is_not_a_signal(self):
-        self.assertEqual(p.detect_cache_delete([make_record(record_id="h1", observed={"url": "https://example.com/"})],
-                                               [self.coverage()]), [])
+    def test_unrelated_history_url_is_not_a_context_signal(self):
+        records = [make_record(record_id="h1", observed={"url": "https://example.com/"}), self.preferences()]
+        self.assertEqual(p.detect_cache_delete(records, [self.coverage()]), [])
+
+    # --- P1 (Preferences browser.clear_data.cache) ---------------------------
+    # 2026-09-30 E10-04: 캐시를 삭제해도 대화 응답 entry 는 남을 수 있었다 (False Negative 의 원인).
+    def test_clear_data_cache_selection_with_a_remaining_response_is_candidate_low(self):
+        records = [self.conversation_list(), cache_record([msg_node("m-user", "user")]), self.preferences()]
+        event, = p.detect_cache_delete(records, [self.coverage()])
+        self.assert_candidate(event, "CACHE_DELETE", "CHATGPT_CACHE_DELETE_001", "LOW")
+        primary, = event.primary_evidence
+        self.assertEqual((primary.artifact_type, primary.evidence_level, primary.source_path),
+                         ("preferences", "INFERRED", "Default/Preferences"))
+        self.assertEqual(primary.observed["signal"], "CLEAR_DATA_CACHE_SELECTED")
+        self.assertIs(primary.observed["clear_data"]["cache"], True)
+        self.assertEqual([item.observed["signal"] for item in event.supporting_evidence],
+                         ["CONVERSATION_LIST_PRESENT"])
+
+    def test_event_has_no_timestamp_even_though_preferences_is_a_file(self):
+        event, = p.detect_cache_delete([self.conversation_list(), self.preferences()], [self.coverage()])
+        self.assertEqual((event.timestamp_raw, event.timestamp_utc, event.timestamp_kst, event.timestamp_source),
+                         (None, None, None, None))
+        self.assertEqual((event.timestamp_type, event.primary_evidence[0].timestamp_utc), ("unknown", None))
+
+    def test_clear_data_without_cache_selected_is_not_a_signal(self):
+        records = [self.conversation_list(), cache_record([msg_node("m-user", "user")]),
+                   self.preferences(cache=False)]
+        self.assertEqual(p.detect_cache_delete(records, [self.coverage()]), [])
+
+    def test_clear_data_alone_without_chatgpt_context_creates_no_event(self):
+        records = [cache_record([msg_node("m-user", "user")]), self.preferences()]
+        self.assertEqual(p.detect_cache_delete(records, [self.coverage()]), [])
+
+    def test_clear_data_with_only_a_visit_is_enough(self):
+        records = [self.visit(), cache_record([msg_node("m-user", "user")]), self.preferences()]
+        event, = p.detect_cache_delete(records, [self.coverage()])
+        self.assert_candidate(event, "CACHE_DELETE", "CHATGPT_CACHE_DELETE_001", "LOW")
+        self.assertEqual([item.observed["signal"] for item in event.supporting_evidence],
+                         ["CONVERSATION_VISIT_PRESENT"])
+
+    def test_clear_data_of_another_profile_is_not_used(self):
+        records = [self.conversation_list(), cache_record([msg_node("m-user", "user")]),
+                   self.preferences(browser_profile="Profile 1")]
+        self.assertEqual(p.detect_cache_delete(records, [self.coverage()]), [])
+
+    def test_entry_count_is_never_reported_as_a_signal(self):
+        # 응답 entry 가 0건인 상태 (예전 S1 이 참이 되던 입력) 에서도 신호는 P1 + 맥락 2개뿐이어야 한다
+        event, = p.detect_cache_delete([self.conversation_list(), self.visit(), self.preferences()],
+                                       [self.coverage()])
+        self.assertEqual([item.observed["signal"] for item in event.primary_evidence + event.supporting_evidence],
+                         ["CLEAR_DATA_CACHE_SELECTED", "CONVERSATION_LIST_PRESENT", "CONVERSATION_VISIT_PRESENT"])
+        self.assertEqual(event.primary_evidence[0].observed["signal_count"], 3)
+        dumped = json.dumps(result_to_dict_events(event), ensure_ascii=False)
+        self.assertNotIn("CACHE_PARSED_WITHOUT_ENTRIES", dumped)
+        self.assertNotIn("conversation_response_record_count", dumped)
+        self.assertFalse(hasattr(p, "REASON_CACHE_PARSED_WITHOUT_ENTRIES"))
+
+    def test_limitations_say_what_the_selection_state_does_not_prove(self):
+        event, = p.detect_cache_delete([self.conversation_list(), self.preferences()], [self.coverage()])
+        joined = " / ".join(event.limitations)
+        self.assertIn("browser.clear_data.cache=true", joined)
+        self.assertIn("삭제 실행을 증명하지 않는다", joined)
+        self.assertIn("파일 수정 시각", joined)
+        self.assertIn("$UsnJrnl($J)", joined)
 
 
 class IncognitoRuleTest(NewRuleAssertMixin, unittest.TestCase):

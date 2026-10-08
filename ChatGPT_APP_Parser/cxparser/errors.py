@@ -34,6 +34,11 @@ class UnsupportedFormatError(CxError):
     code = "UNSUPPORTED_FORMAT"
 
 
+class VolumeLockedError(CxError):
+    """BitLocker 볼륨을 풀지 못함 (키 없음·키 틀림·dissect.fve 없음). 빈 결과로 숨기지 않는다."""
+    code = "VOLUME_LOCKED"
+
+
 class FilesystemError(CxError):
     """파일시스템 구조 판독 실패."""
     code = "FILESYSTEM_ERROR"

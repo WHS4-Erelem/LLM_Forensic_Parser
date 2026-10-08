@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 PARSER_NAME = "chatgpt_web_parser"
-PARSER_VERSION = "0.1.0"
+PARSER_VERSION = "0.2.0"
 SERVICE = "chatgpt_web"
 DEFAULT_BROWSER = "chrome"
 DISPLAY_TIMEZONE = "+09:00 (KST)"

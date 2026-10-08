@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from ..artifacts.history import redact_url_query
 from ..artifacts.local_storage import _profile_subdir
 from ..discovery import _join_source_path
 from ..models import ArtifactRecord, Coverage
@@ -33,7 +34,7 @@ from ..utils import normalize_timestamp
 #   EntryStore: +4 next, +20 state, +24 creation_time (base::Time µs = webkit_us), +32 key_len, +36 long_key,
 #               +40 data_size[4], +56 data_addr[4], +96 key
 #   stream 0 = HTTP 응답 정보 ("HTTP/1.1 200\0name: value\0…\0\0" 포함), stream 1 = 응답 본문 (정확히 data_size[1] byte)
-# 범위: key 의 URL 이 정확히 https://chatgpt.com/backend-api/conversation/<id> (query 없음) 인 entry 만 Record 로 만든다.
+# 범위: key 의 URL 이 대화 1건의 응답 endpoint 인 entry 만 Record 로 만든다 (_CONVERSATION_API_URL).
 #   stream_status / textdocs / interpreter/download / 목록 API 는 메시지 본문이 없어 대상이 아니다.
 #   응답 헤더는 status code, content-type, content-encoding 만 남긴다 (set-cookie 등 나머지 헤더 값은 출력하지 않는다).
 #   본문 인코딩: 없음·identity → 그대로, br → brotli (brotli==1.2.0, MIT, 2026-09-15 사용자 승인, 선택 import), 그 밖 → warning.
@@ -56,7 +57,12 @@ CACHE_INDEX_HEADER_SIZE = 368
 CACHE_BLOCK_HEADER_SIZE = 8192
 _CACHE_BLOCK_SIZES = {1: 36, 2: 256, 3: 1024, 4: 4096, 6: 104, 7: 48}
 _CACHE_HEADER_ALLOWLIST = ("content-type", "content-encoding")
-_CONVERSATION_API_URL = re.compile(r"https://chatgpt\.com/backend-api/conversation/([0-9A-Za-z-]+)")
+# 대화 1건의 응답 endpoint. 2026-09-30 Scenario 이미지 Cache 에서 확인한 두 가지 형태를 모두 받는다:
+#   .../backend-api/conversation/<id>                          단수형 (2026-09-15 확인)
+#   .../backend-api/conversations/<id>?<query>                  복수형 + query (현재 웹 client)
+# 목록 endpoint (.../conversations?<query> — <id> 없음) 와 하위 경로 (/textdocs · /stream_status) 는 대화 본문이 없어
+# 대상이 아니다. <id> 문자 집합에 '/' 와 '?' 가 없으므로 fullmatch 만으로 이 둘이 함께 배제된다.
+_CONVERSATION_API_URL = re.compile(r"https://chatgpt\.com/backend-api/conversations?/([0-9A-Za-z-]+)(?:\?.*)?")
 CACHE_FORMAT_NOT_SUPPORTED = "CACHE_FORMAT_NOT_SUPPORTED"
 CACHE_READ_ERROR = "CACHE_READ_ERROR"
 CACHE_PATH_OUTSIDE_SOURCE = "CACHE_PATH_OUTSIDE_SOURCE"
@@ -218,42 +224,79 @@ def _cache_response_headers(info: bytes) -> tuple[int | None, dict[str, str]]:
     return status, headers
 
 
-def _reduce_conversation_json(obj: Any) -> dict[str, Any] | None:
-    """대화 응답 JSON → 대화·메시지 복원에 필요한 필드만 (owner·moderation·request_id 등 제외). mapping 이 없으면 None."""
-    if not isinstance(obj, dict) or not isinstance(obj.get("mapping"), dict):
+def _reduce_message(message: Any) -> dict[str, Any] | None:
+    """message 객체 → 대화·메시지 복원에 필요한 필드만. message 가 없는 노드 (트리의 root 등) 는 None."""
+    if not isinstance(message, dict):
         return None
-    nodes = []
-    for node_id, node in obj["mapping"].items():
-        if not isinstance(node, dict):
-            return None
-        message = node.get("message")
-        reduced = None
-        if isinstance(message, dict):
-            author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
+    return {"id": message.get("id"), "role": author.get("role"), "author_name": author.get("name"),
+            "create_time": message.get("create_time"), "update_time": message.get("update_time"),
+            "status": message.get("status"), "recipient": message.get("recipient"),
+            "message_type": metadata.get("message_type"), "content": message.get("content"),
+            "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (§8.16)
+            "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (§8.20)
+
+
+def _reduce_conversation_json(obj: Any) -> dict[str, Any] | None:
+    """
+    대화 응답 JSON → 대화·메시지 복원에 필요한 필드만 (owner·moderation·request_id 등 제외).
+    확인된 두 가지 응답 형식을 같은 노드 목록으로 정규화한다. 둘 다 아니면 None (CACHE_UNEXPECTED_STRUCTURE).
+      - "mapping": {node_id: {parent, children, message}}  트리 (2026-09-15 확인)
+      - "messages": [message, ...]                        평면 목록 (2026-09-30 Scenario 이미지에서 확인)
+        평면 목록은 부모가 message.metadata.parent_id 에만 있고 children 이 응답에 없다 → parent 링크를 뒤집어 채운다.
+        parent_id 가 가리키는 부모가 응답에 없으면 (num_turns 로 잘린 경우) 그 노드는 root 로 남는다.
+    """
+    if not isinstance(obj, dict):
+        return None
+    nodes: list[dict[str, Any]] = []
+    if isinstance(obj.get("mapping"), dict):
+        for node_id, node in obj["mapping"].items():
+            if not isinstance(node, dict):
+                return None
+            nodes.append({"node_id": node_id, "parent": node.get("parent"),
+                          "children": node.get("children"), "message": _reduce_message(node.get("message"))})
+    elif isinstance(obj.get("messages"), list):
+        used: set[str] = set()
+        for index, message in enumerate(obj["messages"]):
+            if not isinstance(message, dict):
+                return None
+            message_id = message.get("id")
+            # node_id 는 트리 형식의 key 와 같은 자리다. id 가 없거나 겹치면 순번으로 대체한다 (값을 만들어 내지 않는다).
+            node_id = message_id if isinstance(message_id, str) and message_id and message_id not in used \
+                else f"messages[{index}]"
+            used.add(node_id)
             metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-            reduced = {"id": message.get("id"), "role": author.get("role"), "author_name": author.get("name"),
-                       "create_time": message.get("create_time"), "update_time": message.get("update_time"),
-                       "status": message.get("status"), "recipient": message.get("recipient"),
-                       "message_type": metadata.get("message_type"), "content": message.get("content"),
-                       "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (§8.16)
-                       "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (§8.20)
-        nodes.append({"node_id": node_id, "parent": node.get("parent"), "children": node.get("children"), "message": reduced})
+            parent = metadata.get("parent_id")
+            nodes.append({"node_id": node_id, "parent": parent if isinstance(parent, str) else None,
+                          "children": [], "message": _reduce_message(message)})
+        by_id = {node["node_id"]: node for node in nodes}
+        for node in nodes:
+            parent_node = by_id.get(node["parent"])
+            if parent_node is not None and parent_node is not node:
+                parent_node["children"].append(node["node_id"])
+    else:
+        return None
     return {"conversation_id": obj.get("conversation_id"), "title": obj.get("title"), "create_time": obj.get("create_time"),
             "update_time": obj.get("update_time"), "current_node": obj.get("current_node"), "mapping": nodes}
 
 
 def _cache_conversation_record(
-    cache: _BlockfileCache, entry: tuple, url_id: str, directory: str, os_user: str | None, browser_profile: str | None,
-    *, carved_at: str | None = None,
+    cache: _BlockfileCache, entry: tuple, url: str, url_id: str, directory: str, os_user: str | None,
+    browser_profile: str | None, *, carved_at: str | None = None,
 ) -> ArtifactRecord:
     address, state, created, _, sizes, addresses = entry
+    # url 은 cache key 에서 읽은 실제 요청 URL 이다 (단수형·복수형·query 가 그대로 남는다). 만들어 내지 않는다.
+    redacted_url, redacted_keys = redact_url_query(url)
     observed: dict[str, Any] = {
-        "url": f"https://chatgpt.com/backend-api/conversation/{url_id}", "cache_key_kind": "conversation_response",
+        "url": redacted_url, "cache_key_kind": "conversation_response",
         "url_conversation_id": url_id, "entry_address": f"0x{address:08x}", "entry_state": state,
         "entry_origin": "carved" if carved_at else "index",
         "http_status": None, "content_type": None, "content_encoding": None,
         "body_length": sizes[1], "body_sha256": None, "decoded_length": None, "decoded_sha256": None,
     }
+    if redacted_keys:
+        observed["url_redacted_keys"] = redacted_keys
     warnings: list[str] = []
     timestamp = normalize_timestamp(created, "webkit_us", "Cache.EntryStore.creation_time") if created else {}
     warnings += timestamp.pop("warnings", [])
@@ -375,8 +418,8 @@ def read_chrome_cache(
     for entry, location in enumerated:
         match = _CONVERSATION_API_URL.fullmatch(entry[3].rsplit(" ", 1)[-1])
         if match is not None:
-            records.append(_cache_conversation_record(cache, entry, match.group(1), directory, os_user,
-                                                      browser_profile, carved_at=location))
+            records.append(_cache_conversation_record(cache, entry, match.group(0), match.group(1), directory,
+                                                      os_user, browser_profile, carved_at=location))
     damaged = bool(unreadable) or any(record.warnings for record in records)
     return finish("PARTIAL" if damaged else "PARSED", records, sha)
 

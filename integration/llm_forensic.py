@@ -72,6 +72,7 @@ REPORT_NAME = "integration_report.json"
 # 파서 결과는 고쳐 받지 않는다. 어느 파서의 어느 파일·행·열이 어떤 값이었고 무엇이 기대됐는지만 남긴다.
 ERROR_STATUS = {
     "PARSER_EXECUTION_ERROR": "failed",              # 종료코드≠0 · 시간 초과 · 실행 불가
+    "UNSUPPORTED_INPUT": "failed",                   # 레지스트리 inputs 에 없는 이미지 확장자 → 실행하지 않음
     "OUTPUT_MISSING": "failed",                      # 레지스트리 outputs 의 CSV 가 없음
     "CSV_FORMAT_ERROR": "contract_violation",        # UTF-8 CSV 로 읽히지 않음
     "HEADER_MISMATCH": "contract_violation",
@@ -124,6 +125,14 @@ def evidence_manager(path, quick=False):
         head = fh.read(8)
     kind = "e01" if head == EWF1_SIG else "raw"
     segments = [path]
+    m = re.match(r"^(.*)\.(\d{3})$", path) if kind == "raw" else None
+    if m:                                               # raw 분할 (image.001, .002, …): 주어진 번호부터 연속으로 모은다
+        stem, n = m.group(1), int(m.group(2))
+        segments = []
+        while os.path.isfile("%s.%03d" % (stem, n)):
+            segments.append("%s.%03d" % (stem, n)); n += 1
+        if os.path.isfile("%s.%03d" % (stem, n + 1)):
+            raise ValueError("raw 중간 세그먼트 누락: .%03d" % n)
     if kind == "e01":
         stem = os.path.splitext(path)[0]
         segments, n = [], 1
@@ -139,22 +148,36 @@ def evidence_manager(path, quick=False):
     with open(segments[0], "rb") as fh:
         h.update(fh.read(64 * 1024 * 1024))
     quick_fp = h.hexdigest()
-    evidence_sha256, segment_hashes = EMPTY, []
-    if not quick:                                       # 한 번 읽으면서 세그먼트별 해시와 전체 해시를 같이 계산 (36GB 기준 수 분)
-        full = hashlib.sha256()
+    evidence_sha256, evidence_md5, evidence_sha1, segment_hashes = EMPTY, EMPTY, EMPTY, []
+    if not quick:                                       # 한 번 읽으면서 세그먼트별 SHA-256 과 전체 SHA-256·MD5·SHA-1 을 같이 계산 (36GB 기준 수 분)
+        full, full_md5, full_sha1 = hashlib.sha256(), hashlib.md5(), hashlib.sha1()
         for s in segments:
             seg = hashlib.sha256()
             with open(s, "rb") as fh:
                 for chunk in iter(lambda: fh.read(8 << 20), b""):
-                    seg.update(chunk); full.update(chunk)
+                    seg.update(chunk); full.update(chunk); full_md5.update(chunk); full_sha1.update(chunk)
             segment_hashes.append({"file": os.path.basename(s), "size_bytes": os.path.getsize(s), "sha256": seg.hexdigest()})
-        evidence_sha256 = full.hexdigest()
-    sidecars = {}
-    for f in os.listdir(os.path.dirname(path)):        # 동봉 해시 파일은 내용만 기록 (대조는 분석자 몫)
-        if f.lower().endswith((".sha256", ".md5", "_md5.txt", "_sha256.txt")):
-            with open(os.path.join(os.path.dirname(path), f), encoding="utf-8", errors="replace") as fh:
-                sidecars[f] = fh.read().strip()[:300]
+        evidence_sha256, evidence_md5, evidence_sha1 = full.hexdigest(), full_md5.hexdigest(), full_sha1.hexdigest()
+    sidecars, sidecar_hashes = {}, {}
+    stem = os.path.basename(path).rsplit(".", 1)[0].lower()
+    for f in os.listdir(os.path.dirname(path)):
+        fl = f.lower()
+        if fl.endswith((".sha256", ".md5", ".sha1", "_md5.txt", "_sha256.txt")) or (fl.endswith(".txt") and fl.startswith(stem)):
+            with open(os.path.join(os.path.dirname(path), f), encoding="utf-8-sig", errors="replace") as fh:
+                text = fh.read()
+            sidecars[f] = text.strip()[:300]
+            for algo, n in (("md5", 32), ("sha1", 40), ("sha256", 64)):
+                m = re.search(r"(?i)\b%s\b.{0,40}?\b([0-9a-f]{%d})\b" % (algo.replace("sha", "sha-?"), n), text)
+                if m:
+                    sidecar_hashes.setdefault(algo, m.group(1).lower())
+    verification = {}
+    if kind == "raw" and not quick:
+        for algo, mine in (("md5", evidence_md5), ("sha1", evidence_sha1), ("sha256", evidence_sha256)):
+            if algo in sidecar_hashes:
+                verification[algo] = "match" if sidecar_hashes[algo] == mine else "MISMATCH"
     return {"evidence_id": quick_fp[:16], "evidence_quick_fingerprint": quick_fp, "evidence_sha256": evidence_sha256,
+            "evidence_md5": evidence_md5, "evidence_sha1": evidence_sha1,
+            "sidecar_declared_hashes": sidecar_hashes, "sidecar_verification": verification,
             "segment_hashes": segment_hashes, "path": path, "kind": kind,
             "segments": [os.path.basename(s) for s in segments],
             "size_bytes": sum(os.path.getsize(s) for s in segments), "sidecar_hashes": sidecars,
@@ -196,7 +219,7 @@ def code_hash(cwd):
             if f.endswith((".py", ".json")):
                 h.update(os.path.relpath(os.path.join(root, f), cwd).encode())
                 with open(os.path.join(root, f), "rb") as fh:
-                    h.update(fh.read())
+                    h.update(fh.read().replace(b"\r\n", b"\n"))   # git autocrlf 로 줄바꿈만 다른 같은 코드는 같은 해시
     return h.hexdigest()[:16]
 
 
@@ -214,11 +237,19 @@ def run_parser(p, image, out_dir):
     parse_time_utc = utc_now()
     timeout = p.get("timeout_sec", 1800)
     exec_problem = None
+    inputs = [s.lower() for s in p.get("inputs", [])]   # 파서가 확장자를 검사해 거절하는 경우만 레지스트리에 선언 (비어 있으면 검사 안 함)
+    unsupported = bool(inputs) and os.path.splitext(image)[1].lower() not in inputs
     t0 = time.time()
     try:
+        if unsupported:                                # 실행해도 파서가 거절하므로 시간 낭비 없이 사유만 남긴다
+            raise ValueError("파서가 이 입력 확장자를 지원하지 않음: %s (지원: %s). 파서 담당자가 확장자 검사를 넓히면 parsers.json inputs 도 갱신"
+                             % (os.path.splitext(image)[1] or "(없음)", ", ".join(inputs)))
         r = subprocess.run(cmd, cwd=p["cwd"], env=env, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
         rc, out, err = r.returncode, r.stdout, r.stderr
+    except ValueError as exc:
+        rc, out, err = -3, "", str(exc)
+        exec_problem = str(exc)
     except subprocess.TimeoutExpired as exc:           # 강제 종료 전까지 나온 출력도 run.log 에 남긴다
         rc, out, err = -1, _text(exc.stdout), _text(exc.stderr) + "\ntimeout %ss" % timeout
         exec_problem = "시간 초과로 강제 종료 (timeout_sec=%s)" % timeout
@@ -234,7 +265,11 @@ def run_parser(p, image, out_dir):
     files = {k: os.path.join(out_dir, v) for k, v in p["outputs"].items()}
     missing = [k for k, v in files.items() if not os.path.isfile(v)]
     errors = []
-    if rc != 0:
+    if unsupported:
+        errors.append(make_error(p["name"], "UNSUPPORTED_INPUT", exec_problem, file="run.log", field="inputs",
+                                 actual=os.path.splitext(image)[1].lower(), expected=inputs))
+        missing = []                                   # 실행하지 않았으니 결과 없음은 당연 — 별도 오류로 세지 않는다
+    elif rc != 0:
         errors.append(make_error(p["name"], "PARSER_EXECUTION_ERROR", exec_problem or "파서가 비정상 종료 (stdout/stderr 는 run.log)",
                                  file="run.log", field="returncode", actual=rc, expected=0))
     for k in missing:
@@ -271,35 +306,60 @@ def normalize_path(raw):
     return " | ".join(x for x in parts if x) or EMPTY
 
 
-def volume_ref(path, details="", run_volume=None):
-    """볼륨 식별자. 우선순위: Artifact_details 의 volume=/partition_offset= 키 → 경로의 NTFS@오프셋·volumeN → 실행 단위 값 → '-'."""
-    m = re.search(r"\bvolume=([^,;|\s]+)", str(details), re.I) or re.search(r"partition_offset=(\d+)", str(details), re.I)
-    if m:
-        v = m.group(1)
-        return v if v.lower().startswith(("ntfs@", "volume")) else "ntfs@%s" % v
-    m = re.search(r"NTFS@(\d+)", str(path), re.I)
-    if m:
-        return "ntfs@%s" % m.group(1)
-    m = re.match(r"^(volume\d+):", str(path), re.I)
-    if m:
-        return m.group(1).lower()
-    return run_volume or EMPTY
+_VOL_KEY = re.compile(r"^(?:.*?::(NTFS@\d+)[\\/]|(volume\d+):|([A-Za-z]):[\\/])", re.I)
+_SYSTEM_DIRS = {"users", "windows"}                   # 이 폴더가 있는 볼륨 = Windows 시스템 볼륨 (C:)
 
 
-def run_volume_from_json(p, out_dir):
-    """레지스트리 volume_json: 파서가 실행 단위로 고른 파티션을 JSON 에서 읽는다 (행 단위 정보가 없는 파서용)."""
-    spec = p.get("volume_json")
-    if not spec:
-        return None
-    try:
-        with open(os.path.join(out_dir, spec["file"]), encoding="utf-8") as fh:
-            node = json.load(fh)
-        for key in spec["pointer"].strip("/").split("/"):
-            node = node[int(key)] if isinstance(node, list) else node[key]
-        m = re.search(spec["regex"], str(node))
-        return spec["format"].format(*m.groups()) if m else None
-    except (OSError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+def _volume_key(one):
+    """경로 한 개 → (볼륨 키, 볼륨 루트 기준 첫 폴더). 키: 'C:' / 'volume0' / 'ntfs@227540992',
+    볼륨 표기 없는 루트 기준 경로('Users/x/History')는 '' (한 파서 결과 안에서 같은 볼륨으로 본다), 빈 값·'-' 는 None."""
+    s = one.strip()
+    if not s or s == EMPTY:
+        return None, None
+    m = _VOL_KEY.match(s)
+    if m:
+        key, rest = (m.group(3).upper() + ":" if m.group(3) else (m.group(1) or m.group(2)).lower()), s[m.end():]
+    else:
+        key, rest = "", s
+    return key, rest.replace("/", "\\").lstrip("\\").split("\\", 1)[0].lower()
+
+
+def system_volume_keys(paths):
+    """파서 결과 전체에서 Users\\ 또는 Windows\\ 경로를 가진 볼륨 키 집합. 파서가 volume0 / NTFS@오프셋 으로만 부르는 볼륨도
+    그 안에 Users 가 있으면 시스템 볼륨이다 (번호는 파서가 열 수 있었던 NTFS 순서라 0 이 곧 C: 는 아니다)."""
+    keys = set()
+    for raw in paths:
+        for one in _PATH_SPLIT.split(str(raw)):
+            key, first = _volume_key(one)
+            if key is not None and first in _SYSTEM_DIRS:
+                keys.add(key)
+    return keys
+
+
+_DETAIL_VOLUME = re.compile(r"\bvolume=(ntfs@\d+)", re.I)   # chatgpt_desktop·gemini_web 이 Artifact_details 에 적는 파티션 오프셋
+
+
+def volume_ref(raw, system_keys=(), details=""):
+    """파서가 드라이브 문자를 준 경로는 그 문자(C:) — 파서 값 그대로, 추정 표기 없음.
+    volumeN / NTFS@오프셋 / 볼륨 표기 없는 루트 기준 경로는 같은 결과 안에 Users·Windows 경로가 있는 볼륨일 때만
+    'C: (추정, <식별자>)' — 식별자는 경로의 volume0 / ntfs@오프셋, 없으면 Artifact_details 의 volume=ntfs@오프셋, 그것도 없으면 'C: (추정)'.
+    그 외(복구·데이터 파티션, 경로 없음)는 '-'. 여러 경로는 서로 다른 값만 ' | ' 로 잇는다.
+    추정값은 통합기가 붙인 것이라 괄호로 드러낸다 (파서가 확인한 C: 와 구분)."""
+    m = _DETAIL_VOLUME.search(str(details or ""))
+    detail_id = m.group(1).lower() if m else None
+    refs = []
+    for one in _PATH_SPLIT.split(str(raw)):
+        key, _ = _volume_key(one)
+        if key and key.endswith(":"):
+            ref = key
+        elif key is not None and key in system_keys:
+            ident = key or detail_id
+            ref = "C: (추정, %s)" % ident if ident else "C: (추정)"
+        else:
+            ref = None
+        if ref and ref not in refs:
+            refs.append(ref)
+    return " | ".join(refs) or EMPTY
 
 
 def kst_to_utc(ts):
@@ -352,7 +412,7 @@ def read_contract_csv(parser, path, columns, errors):
     return len(rows) - 1, list(enumerate(rows[1:], 2))
 
 
-def normalize(run, evidence, run_volume=None):
+def normalize(run, evidence):
     """파서 결과 CSV 2개 → (events, messages, errors, source_rows).
     원본 헤더 계약을 먼저 검사하고, 통과한 행만 canonical 열 이름으로 옮긴다. 값은 고치지 않고 provenance·정규화 열만 덧붙인다.
     source_rows: 파일별 데이터 행 수 (헤더 제외, 못 읽으면 None)."""
@@ -386,9 +446,7 @@ def normalize(run, evidence, run_volume=None):
                 continue
             derived = {}
             for target, src, fn in (("timestamp_utc", "timestamp", lambda: kst_to_utc(r["timestamp"])),
-                                    ("artifact_path_normalized", "artifact_path", lambda: normalize_path(r["artifact_path"])),
-                                    ("volume_ref", "artifact_path",
-                                     lambda: volume_ref(r["artifact_path"], r.get("artifact_details", ""), run_volume))):
+                                    ("artifact_path_normalized", "artifact_path", lambda: normalize_path(r["artifact_path"]))):
                 try:
                     derived[target] = fn()
                 except Exception as exc:               # 통합 쪽 계산 실패 — 파서 값은 고치지 않고 오류로만 남긴다
@@ -402,6 +460,10 @@ def normalize(run, evidence, run_volume=None):
             raw = dict(zip(columns, values))           # row_hash 는 파서 원본 헤더·값 기준 (이전 버전과 같은 값)
             row_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
             out[kind].append({**r, **prov, **derived, "source_file": name, "row_hash": row_hash})
+    keys = system_volume_keys(x["artifact_path"] for rows in out.values() for x in rows)   # 볼륨 판정은 이 파서 결과 전체를 보고
+    for rows in out.values():
+        for x in rows:
+            x["volume_ref"] = volume_ref(x["artifact_path"], keys, x.get("artifact_details"))   # 대화 CSV 는 details 가 없어 경로만
     return out["timeline"], out["conversations"], errors + warnings, source_rows
 
 
@@ -544,10 +606,12 @@ def write_merged(db, evidence_id, out_dir):
         with open(path, "w", encoding="utf-8-sig", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(header)
+            by_parser = Counter()
+            parser_index = out_cols.index("source_parser")
             for r in rows:
-                w.writerow([_safe(c) for c in r])
-        by_parser = Counter(r[out_cols.index("source_parser")] for r in rows)
-        written.append((path, len(rows), dict(sorted(by_parser.items()))))
+                w.writerow([_safe(v) for v in r])
+                by_parser[r[parser_index]] += 1
+        written.append((path, sum(by_parser.values()), dict(sorted(by_parser.items()))))
     return written
 
 
@@ -577,6 +641,8 @@ def _console_result(status, run, events, messages, errors, dup, detail_path):
     label = "OK" if status == "success" else status.upper()
     types = ", ".join("%s x%d" % kv for kv in Counter(e["type"] for e in errors).items())
     note = types or ("동일 행 %d건은 1회만 적재" % dup if dup else "")
+    if status == "success" and not events and not messages:
+        note = (note + " · " if note else "") + "0건 — 흔적 없음이거나 파서가 입력을 못 읽은 것. run.log 확인"
     print((" %-8s %6.1fs  events=%-3d messages=%-3d %s" % (label, run["elapsed_sec"], len(events), len(messages), note)).rstrip())
     if errors:
         more = " (외 %d건)" % (len(errors) - 1) if len(errors) > 1 else ""
@@ -586,6 +652,7 @@ def _console_result(status, run, events, messages, errors, dup, detail_path):
 
 def _parser_entry(status, run, events, messages, errors, source_rows, inserted):
     return {"status": status, "timeline_rows": len(events), "conversation_rows": len(messages),
+            "artifacts_found": bool(events or messages),   # success 라도 False 면 흔적 없음 또는 입력 미인식 — run.log 로 구분
             "source_rows": source_rows, "db_inserted": inserted,
             "returncode": run["returncode"], "elapsed_sec": run["elapsed_sec"],
             "parser_version": run["parser_version"], "parse_time_utc": run["parse_time_utc"],
@@ -602,7 +669,7 @@ def run_one(p, ev, case_dir, db, run_id, report_path):
     errors, events, messages, source_rows = list(run["errors"]), [], [], {}
     if not errors:
         try:
-            events, messages, errors, source_rows = normalize(run, ev, run_volume_from_json(p, out_dir))
+            events, messages, errors, source_rows = normalize(run, ev)
         except Exception as exc:                       # 통합 코드 결함이 전체 실행을 멈추지 않게
             errors = [make_error(p["name"], "NORMALIZATION_ERROR", "정규화 중 예외 (%s: %s)" % (type(exc).__name__, exc))]
     status = status_of(errors)
@@ -650,6 +717,10 @@ def main(argv=None):
     print("[Evidence] id=%s kind=%s segments=%d size=%.1fGB quick_fp=%s sha256=%s" % (
         ev["evidence_id"], ev["kind"], len(ev["segments"]), ev["size_bytes"] / 1e9,
         ev["evidence_quick_fingerprint"][:16] + "...", ev["evidence_sha256"]))
+    if ev.get("sidecar_verification"):
+        print("[Evidence] 취득 해시 대조: %s" % ", ".join("%s=%s" % kv for kv in sorted(ev["sidecar_verification"].items())))
+    elif ev.get("sidecar_declared_hashes") and ev["kind"] == "e01":
+        print("[Evidence] 동봉 해시 %s 는 매체 해시 — E01 컨테이너 해시와 직접 비교 불가 (기록만)" % ", ".join(sorted(ev["sidecar_declared_hashes"])))
 
     reg = load_registry(args.registry)
     only = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else None
@@ -666,10 +737,9 @@ def main(argv=None):
     report = {"report_version": 1, "run_id": run_id, "generated_at_utc": None,
               "mode": "full" if only is None else "only", "only": only, "quick": args.quick,
               "registry": os.path.abspath(args.registry),
-              "evidence": {k: ev[k] for k in ("evidence_id", "kind", "path", "segments", "size_bytes",
-                                              "evidence_quick_fingerprint", "evidence_sha256")},
-              "exit_code": None, "summary": {}, "db": {"path": db_path}, "parsers": {},
-              "merged_output": {}, "integration_errors": [], "warnings": []}
+               "evidence": {"evidence_id": ev["evidence_id"]},
+               "exit_code": None, "summary": {}, "db": {"path": db_path}, "parsers": {},
+               "integration_errors": [], "warnings": []}
     unknown = [n for n in only or [] if n not in {p["name"] for p in reg["parsers"]}]
     if unknown:
         report["warnings"].append("레지스트리에 없는 파서 이름은 무시: %s" % ", ".join(unknown))
@@ -700,10 +770,14 @@ def main(argv=None):
         statuses[status] += 1
     failed = len(parsers) - statuses["success"]
 
-    fatal = False
+    fatal, merged_parsers = False, set()
     try:
         for path, n, by_parser in write_merged(db, ev["evidence_id"], case_dir):
-            report["merged_output"][os.path.basename(path)] = {"path": path, "rows": n, "rows_by_parser": by_parser}
+            field = "timeline_rows" if os.path.basename(path) == "timeline.csv" else "conversation_rows"
+            merged_parsers.update(by_parser)
+            for parser, count in by_parser.items():
+                if parser in report["parsers"]:
+                    report["parsers"][parser][field] = count
             print("[Timeline] %s  %d행" % (path, n))
     except sqlite3.Error as exc:
         fatal = True
@@ -716,7 +790,7 @@ def main(argv=None):
         print("[Timeline] FAILED OUTPUT_WRITE_ERROR 병합 CSV 쓰기 실패 (%s)" % exc)
     db.close()
     print("[DB] %s" % db_path)
-    preserved = sorted({k for m in report["merged_output"].values() for k in m["rows_by_parser"]} - set(report["parsers"]))
+    preserved = sorted(merged_parsers - set(report["parsers"]))
     report["preserved_from_previous_runs"] = preserved     # --only 로 이번에 실행하지 않았지만 병합본에 남은 파서
     report["summary"] = {"parsers_run": len(parsers), "success": statuses["success"], "failed": statuses["failed"],
                          "contract_violation": statuses["contract_violation"],
@@ -781,11 +855,20 @@ def self_test():
     assert normalize_path(r"volume0:\$Extend\$UsnJrnl:$J | volume0:\A\B.exe") == r"$extend\$usnjrnl:$J | a\b.exe"
     assert normalize_path(r"C:\A\f.txt::$DATA") == r"a\f.txt::$DATA"
     assert normalize_path("-") == EMPTY and normalize_path("") == EMPTY
-    assert volume_ref("img.E01::NTFS@227540992/Users") == "ntfs@227540992"
-    assert volume_ref("volume0:\\Users") == "volume0" and volume_ref("C:\\Users") == EMPTY
-    assert volume_ref("C:\\Users", "[Rollout] MFT=1, volume=ntfs@227540992, 규칙=E04-01") == "ntfs@227540992"
-    assert volume_ref("C:\\Users", "x, partition_offset=1048576; y") == "ntfs@1048576"
-    assert volume_ref("Users/a", "", "ntfs@5") == "ntfs@5"
+    # volume_ref: 드라이브 문자는 파서 값 그대로, volumeN / NTFS@오프셋 / 볼륨 표기 없는 경로는 Users·Windows 가 있는 볼륨일 때만
+    # 'C: (추정, 식별자)' (식별자: 경로 → Artifact_details 의 volume= → 없음), 아니면 '-'
+    assert volume_ref("C:\\Users\\A") == "C:" and volume_ref("d:/Data/x") == "D:" and volume_ref("-") == EMPTY
+    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J") == EMPTY                    # 혼자서는 어느 볼륨인지 모른다
+    sys_keys = system_volume_keys(["volume0:\\Users\\A\\x", "volume1:\\Recovery\\WindowsRE", "img.E01::NTFS@227540992/Windows/Prefetch/a.pf"])
+    assert sys_keys == {"volume0", "ntfs@227540992"}, sys_keys
+    assert volume_ref("volume0:\\$Extend\\$UsnJrnl:$J", sys_keys) == "C: (추정, volume0)" and volume_ref("volume1:\\Recovery\\x", sys_keys) == EMPTY
+    assert volume_ref("D:/img.E01::NTFS@227540992/Users/llmtest/History", sys_keys) == "C: (추정, ntfs@227540992)"   # 이미지 경로의 D: 는 볼륨이 아니다
+    assert volume_ref("volume0:\\Users\\A\\y | C:\\Users\\A\\z", sys_keys) == "C: (추정, volume0) | C:" and volume_ref("C:\\a | D:\\b") == "C: | D:"
+    rel_keys = system_volume_keys(["Users/llmtest/AppData/Local/Google/Chrome/User Data/Default/History", "-"])   # 볼륨 표기 없는 루트 기준 경로 (chatgpt_web)
+    assert rel_keys == {""} and volume_ref("Users/llmtest/x", rel_keys) == "C: (추정)" and volume_ref("-", rel_keys) == EMPTY
+    assert volume_ref("Users/llmtest/x", rel_keys, "[History] URL=…, volume=ntfs@227540992") == "C: (추정, ntfs@227540992)"   # gemini_web: 식별자는 Artifact_details 에서
+    assert volume_ref("C:\\Users\\A", rel_keys, "volume=ntfs@5") == "C:"                   # 드라이브 문자가 있으면 추정 표기를 붙이지 않는다
+    assert volume_ref("Recovery/WindowsRE/x", system_volume_keys(["Recovery/WindowsRE/x"])) == EMPTY
     assert kst_to_utc("2026-09-15 13:20:41.807000 KST") == "2026-09-15T04:20:41.807000Z"
     assert kst_to_utc("-") is None and kst_to_utc("2026-09-15 13:20:41 KST") is None
     assert _safe("=1") == "'=1" and _safe("") == EMPTY and _safe("-") == EMPTY
@@ -812,6 +895,33 @@ def self_test():
         assert ev["evidence_sha256"] == hashlib.sha256(data).hexdigest() == ev["segment_hashes"][0]["sha256"]
         assert ev["evidence_quick_fingerprint"] == ev["evidence_sha256"] and ev["evidence_id"] == ev["evidence_sha256"][:16]
         assert evidence_manager(raw, quick=True)["evidence_sha256"] == EMPTY
+        assert ev["evidence_md5"] == hashlib.md5(data).hexdigest() and ev["evidence_sha1"] == hashlib.sha1(data).hexdigest()
+        with open(os.path.join(td, "x.txt"), "w", encoding="utf-8") as fh:
+            fh.write("Created By FTK Imager\n  [Computed Hashes]\n    MD5 Hash:    %s\n    SHA1 Hash:   %s\n" % (hashlib.md5(data).hexdigest(), "0" * 40))
+        ev2 = evidence_manager(raw)
+        assert ev2["sidecar_declared_hashes"] == {"md5": hashlib.md5(data).hexdigest(), "sha1": "0" * 40}, ev2["sidecar_declared_hashes"]
+        assert ev2["sidecar_verification"] == {"md5": "match", "sha1": "MISMATCH"}, ev2["sidecar_verification"]
+        os.remove(os.path.join(td, "x.txt"))
+        # raw 분할 (image.001/.002): 세그먼트를 모두 모으고 전체 해시는 이어붙인 값, 결번은 거부
+        a, b = os.urandom(700), os.urandom(300)
+        for n, chunk in ((1, a), (2, b)):
+            with open(os.path.join(td, "split.%03d" % n), "wb") as fh:
+                fh.write(chunk)
+        sp = evidence_manager(os.path.join(td, "split.001"))
+        assert sp["kind"] == "raw" and sp["segments"] == ["split.001", "split.002"] and sp["size_bytes"] == 1000
+        assert sp["evidence_sha256"] == hashlib.sha256(a + b).hexdigest() and len(sp["segment_hashes"]) == 2
+        os.rename(os.path.join(td, "split.002"), os.path.join(td, "split.003"))
+        try:
+            evidence_manager(os.path.join(td, "split.001")); assert False, "결번을 잡아야 한다"
+        except ValueError as exc:
+            assert "누락" in str(exc)
+        os.remove(os.path.join(td, "split.001")); os.remove(os.path.join(td, "split.003"))
+        # 소스 해시는 줄바꿈(CRLF/LF)에 영향받지 않는다 (git autocrlf 로 PC 마다 다른 파일)
+        for sub, nl in (("lf", b"\n"), ("crlf", b"\r\n")):
+            os.makedirs(os.path.join(td, sub))
+            with open(os.path.join(td, sub, "m.py"), "wb") as fh:
+                fh.write(b"x = 1" + nl + "print('한글')".encode() + nl)
+        assert code_hash(os.path.join(td, "lf")) == code_hash(os.path.join(td, "crlf"))
         _self_test_contract(td)
         _self_test_db(td)
         _self_test_end_to_end(td, raw, ev["evidence_id"])
@@ -921,7 +1031,8 @@ def _self_test_end_to_end(td, image, evidence_id):
     reg = {"parsers": [{"name": n, "model": n, "python": sys.executable, "cwd": td,
                         "args": ["fake_parser.py", n, mode, "{out}"],
                         "outputs": {"timeline": "timeline.csv", "conversations": "recovered_conversations.csv"}}
-                       for n, mode in (("alpha", "ok"), ("beta", "bad"), ("gamma", "fail"))]}
+                       for n, mode in (("alpha", "ok"), ("beta", "bad"), ("gamma", "fail"), ("delta", "ok"))]}
+    reg["parsers"][3]["inputs"] = [".e01"]             # delta 는 E01 만 지원한다고 선언 → .dd 입력이면 실행 없이 UNSUPPORTED_INPUT
     reg_path, out = os.path.join(td, "reg.json"), os.path.join(td, "out")
     with open(reg_path, "w", encoding="utf-8") as fh:
         json.dump(reg, fh)
@@ -964,7 +1075,12 @@ def _self_test_end_to_end(td, image, evidence_id):
     assert "UNKNOWN_USER_BEHAVIOR x2" in console
     assert p["gamma"]["status"] == "failed" and [e["type"] for e in p["gamma"]["errors"]] == [
         "PARSER_EXECUTION_ERROR", "OUTPUT_MISSING", "OUTPUT_MISSING"]
-    assert rep["summary"] == {"parsers_run": 3, "success": 1, "failed": 1, "contract_violation": 1,
+    assert p["delta"]["status"] == "failed" and [e["type"] for e in p["delta"]["errors"]] == ["UNSUPPORTED_INPUT"]
+    assert re.search(r"\[Runner\] delta +FAILED .*UNSUPPORTED_INPUT", console) and p["delta"]["elapsed_sec"] < 1
+    with open(os.path.join(case, "delta", "run.log"), encoding="utf-8") as fh:
+        assert "지원하지 않음" in fh.read()               # 실행 안 했어도 사유는 run.log 에 남는다
+    assert p["alpha"]["artifacts_found"] and not p["gamma"]["artifacts_found"]
+    assert rep["summary"] == {"parsers_run": 4, "success": 1, "failed": 2, "contract_violation": 1,
                               "normalization_error": 0, "db_error": 0} and rep["exit_code"] == 1
     with open(os.path.join(case, "timeline.csv"), encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.reader(fh))
@@ -972,7 +1088,7 @@ def _self_test_end_to_end(td, image, evidence_id):
     tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}
-    assert {r["volume_ref"] for r in tl} == {"ntfs@5", "ntfs@7"}                         # volume_ref 규칙은 그대로
+    assert {r["volume_ref"] for r in tl} == {"C:", "C: (추정, volume0) | C: (추정, ntfs@7)"}   # C:\ 는 파서 값, volume0·NTFS@7 은 Users 가 있어 추정
     assert all(re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", r["parse_time_utc"]) for r in tl)
     with open(os.path.join(case, "recovered_conversations.csv"), encoding="utf-8-sig", newline="") as fh:
         assert next(csv.reader(fh)) == CONV_COLUMNS + EXTRA_COLUMNS
@@ -981,17 +1097,17 @@ def _self_test_end_to_end(td, image, evidence_id):
     rc, console, rep = cli(FAKE_MODE_ALPHA="v2")
     assert db_rows("select distinct behavior_details from events where source_parser='alpha' and behavior_details like 'v=%'") == [("v=v2",)]
     assert db_rows("select content from messages") == [("hello v2",)]
-    assert db_rows("select count(*) from runs") == [(6,)] and rep["db"]["reset"]["scope"] == "evidence"
+    assert db_rows("select count(*) from runs") == [(8,)] and rep["db"]["reset"]["scope"] == "evidence"
 
     # 3) --only beta (이번엔 성공): alpha 결과는 유지, beta 만 교체
     rc, console, rep = cli("--only", "beta", FAKE_MODE_BETA="ok")
     assert rc == 0 and list(rep["parsers"]) == ["beta"] and rep["db"]["reset"]["parsers"] == ["beta"]
     assert db_rows("select source_parser, count(*) from events group by source_parser order by 1") == [("alpha", 2), ("beta", 2)]
-    assert rep["preserved_from_previous_runs"] == ["alpha"] and rep["merged_output"]["timeline.csv"]["rows_by_parser"] == {"alpha": 2, "beta": 2}
+    assert rep["preserved_from_previous_runs"] == ["alpha"]
     # 4) --only beta 가 다시 계약 위반이면 beta 의 이전 결과도 빠진다 (alpha 는 그대로)
     rc, console, rep = cli("--only", "beta")
     assert rc == 1 and db_rows("select source_parser, count(*) from events group by source_parser order by 1") == [("alpha", 2)]
-    assert db_rows("select count(*) from runs") == [(8,)]
+    assert db_rows("select count(*) from runs") == [(10,)]
     # 5) 헤더 끝 공백이 빠진 CSV → HEADER_MISMATCH 로 거부
     rc, console, rep = cli("--only", "beta", FAKE_BAD_HEADER="1")
     assert rep["parsers"]["beta"]["error_types"].get("HEADER_MISMATCH") == 1 and "HEADER_MISMATCH" in console

@@ -22,6 +22,7 @@ from .image import open_image_source
 from .output.csv_writer import write_result_csv
 from .artifacts.history import read_chatgpt_history
 from .artifacts.local_storage import local_storage_dir, read_local_storage
+from .artifacts.preferences import preferences_path, read_preferences
 from .artifacts.session_storage import read_session_storage, session_storage_dir
 from .artifacts.sessions import read_chrome_sessions, sessions_dir
 from .artifacts.shared_proto_db import read_shared_proto_db, shared_proto_db_dir
@@ -102,16 +103,19 @@ def extract(
         cache_records, cache_coverage = read_chrome_cache(
             source, cache_data_dir(source, profile_path, notes), os_user=user, browser_profile=profile,
         )
+        preference_records, preferences_coverage = read_preferences(
+            source, preferences_path(source, profile_path, notes), os_user=user, browser_profile=profile,
+        )
         download_records, download_coverages = read_shared_proto_db(
             source, shared_proto_db_dir(source, profile_path, notes), os_user=user, browser_profile=profile,
         )
         navigation_records, snss_coverages = read_chrome_sessions(
             source, sessions_dir(source, profile_path, notes), os_user=user, browser_profile=profile,
         )
-        records += (history_records + storage_records + session_records + cache_records + download_records
-                    + navigation_records)
+        records += (history_records + storage_records + session_records + cache_records + preference_records
+                    + download_records + navigation_records)
         coverages += ([history_coverage] + storage_coverages + session_coverages + [cache_coverage]
-                      + download_coverages + snss_coverages)
+                      + [preferences_coverage] + download_coverages + snss_coverages)
     return records, coverages
 
 
@@ -140,7 +144,9 @@ EVENT_RULES = (
     detect_account_name_change,   # CHATGPT_ACCOUNT_NAME_CHANGE_001 (계정 이름 해시 전이)
     detect_history_delete,        # CHATGPT_HISTORY_DELETE_001 (방문 기록 결손 신호 2개 이상)
     detect_conversation_delete,   # CHATGPT_CONVERSATION_DELETE_001 (목록 이탈 + 복귀 없음 + Cache 응답 없음)
-    detect_cache_delete,          # CHATGPT_CACHE_DELETE_001 (Cache 는 읽혔으나 대화 응답 entry 0건)
+    # CHATGPT_CACHE_DELETE_001: Preferences browser.clear_data.cache is True + ChatGPT 맥락(S2 목록 또는 S3 방문).
+    # 대화 응답 entry 0건은 양성 신호가 아니다 - 판정·evidence·confidence 에 쓰지 않는다.
+    detect_cache_delete,
     detect_incognito,             # CHATGPT_INCOGNITO_001 (시크릿 창 표식이 있을 때만)
 )
 
@@ -191,19 +197,20 @@ INPUT_TYPES = ("dir", "image")
 
 def analyze_chatgpt_web(
     input_path: str | os.PathLike[str], *, input_type: str = "dir", history_path: str | None = None,
-    os_user: str | None = None, browser_profile: str | None = None,
+    os_user: str | None = None, browser_profile: str | None = None, key_material: str | None = None,
 ) -> ParseResult:
     """
     입력 1개를 분석해 ParseResult 를 돌려준다. **파일을 쓰지 않는다** (출력은 write_final_outputs 가 한다).
       input_type="dir"    input_path = 분석용 폴더 (원본은 읽기만 한다)
       input_type="image"  input_path = DD/RAW 또는 E01 이미지 (pytsk3 / pyewf 필요)
     history_path 를 주면 자동 탐색 대신 그 History 1개만 읽는다 (Source 기준 상대 경로).
+    key_material 은 BitLocker 이미지용 키다 (recovery:/passphrase:/bek:/fvek:, 폴더 입력에는 쓰지 않는다).
     """
     if input_type not in INPUT_TYPES:
         raise ValueError(f"input_type must be one of {INPUT_TYPES}, got {input_type!r}")
     if input_type == "dir":
         return run(DirectorySource(input_path), history_path, os_user=os_user, browser_profile=browser_profile)
-    image_source = open_image_source(input_path)
+    image_source = open_image_source(input_path, key_material)
     try:
         return run(image_source, history_path, os_user=os_user, browser_profile=browser_profile)
     finally:

@@ -1,0 +1,4 @@
+# PC마다 다른 경로가 들어가는 실제 설정 (예시는 erelm_config.example.json)
+erelm_config.json
+# Jython 컴파일 산출물
+*.class

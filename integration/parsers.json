@@ -40,12 +40,6 @@
         "{out}/result.json",
         "--overwrite"
       ],
-      "volume_json": {
-        "file": "result.json",
-        "pointer": "/input/partition",
-        "regex": "byte_offset=(\\d+)",
-        "format": "ntfs@{0}"
-      },
       "outputs": {
         "timeline": "timeline.csv",
         "conversations": "recovered_conversations.csv"
@@ -60,10 +54,10 @@
       "python": ".venv312/Scripts/python.exe",
       "cwd": "../Claude_APP_Parser",
       "args": [
-        "aifp_parse.py",
-        "--image",
+        "run_parser.py",
+        "--input",
         "{image}",
-        "--out",
+        "--out-dir",
         "{out}",
         "--no-banner"
       ],
@@ -73,7 +67,7 @@
       },
       "timeout_sec": 3600,
       "version_args": [
-        "aifp_parse.py",
+        "run_parser.py",
         "--version"
       ]
     },
@@ -110,6 +104,8 @@
     {
       "name": "gemini_web",
       "model": "gemini-web",
+      "inputs": [".e01", ".dd", ".img", ".raw", ".001"],
+      "_inputs_note": "gemini_parser.py IMAGE_SUFFIXES 기준",
       "python": ".venv312/Scripts/python.exe",
       "cwd": "../Gemini_Web_Parser",
       "args": [
@@ -130,7 +126,9 @@
     {
       "name": "lmstudio",
       "model": "lmstudio",
-      "python": ".venv314/Scripts/python.exe",
+      "inputs": [".e01", ".ex01", ".s01", ".l01", ".dd", ".raw", ".img", ".001"],
+      "_inputs_note": "lmstudio_parser.py 이미지 판별 목록 기준. 목록 밖 확장자는 이미지로 인식되지 않아 0건이 나온다",
+      "python": ".venv312/Scripts/python.exe",
       "cwd": "../LMstudio_parser",
       "args": [
         "lmstudio_parser.py",
