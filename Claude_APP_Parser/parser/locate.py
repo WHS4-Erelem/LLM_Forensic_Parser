@@ -53,7 +53,8 @@ _PATTERNS = [
     # ── 계정·설정 ────────────────────────────────────────────────────
     ("config",        re.compile(r"/users/(?P<user>[^/]+)/" + _ROOT +
                                  r"/(?P<fn>config\.json|ant-did|ant-device-registry\.json"
-                                 r"|window-state\.json|plan-usage-history\.json)$")),
+                                 r"|window-state\.json|plan-usage-history\.json"
+                                 r"|claude_desktop_config\.json)$")),
     # ── 앱 로그 (패키지 밖) ──────────────────────────────────────────
     ("applog",        re.compile(r"/users/(?P<user>[^/]+)/appdata/local/claude/logs/"
                                  r"(?P<fn>[^/]+\.log)$")),

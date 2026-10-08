@@ -26,7 +26,7 @@ class VfsFile:
     def __init__(self, path, size, source, *, mft_record=None, sequence=None,
                  allocated=True, si_times=None, fn_times=None, volume_index=None,
                  volume_offset=None, native_path=None, parse_errors=None,
-                 path_source=None, live_root=None, time_source=None):
+                 path_source=None, live_root=None, time_source=None, volume_drive=None):
         self.path = path                    # '/Users/x/.codex/...' (소스 내부 경로)
         self.size = size
         self._source = source
@@ -37,6 +37,7 @@ class VfsFile:
         self.fn_times = fn_times or {}
         self.volume_index = volume_index
         self.volume_offset = volume_offset
+        self.volume_drive = volume_drive    # 이미지: SYSTEM\MountedDevices 로 확인된 드라이브 문자
         self.native_path = native_path      # dir 소스일 때 실제 로컬 경로
         self.parse_errors = list(parse_errors or [])
         self.path_source = path_source
@@ -62,6 +63,8 @@ class VfsFile:
         if self.volume_index is not None:
             loc["partition_index"] = self.volume_index
             loc["partition_offset_bytes"] = self.volume_offset
+        if self.volume_drive:
+            loc["drive"] = self.volume_drive
         if self.native_path:
             loc["native_path"] = self.native_path
         if self.live_root:
@@ -83,13 +86,16 @@ class TskImageVfs:
     def __init__(self, image, key_material=None):
         img = image.img
         self.volumes = []      # [(volume_desc, FS_Info)]
+        self.scanned_dirs = {}     # iter_files 가 채운다
         self.skipped = []
         self.locked = []       # 풀지 못한 BitLocker 볼륨 (skipped 에도 들어간다)
         self._plain_images = []   # 복호화 이미지 — FS_Info 가 쓰는 동안 살아 있어야 한다
         try:
             vs = pytsk3.Volume_Info(img)
             bs = vs.info.block_size
-            scheme = {1: "MBR", 8: "GPT"}.get(int(vs.info.vstype), str(vs.info.vstype))
+            scheme = {int(pytsk3.TSK_VS_TYPE_DOS): "MBR",
+                      int(pytsk3.TSK_VS_TYPE_GPT): "GPT"}.get(int(vs.info.vstype),
+                                                              str(vs.info.vstype))
             parts = [(p.start * bs, p.len * bs, p.desc.decode("utf-8", "replace"), scheme)
                      for p in vs if int(p.flags) & int(pytsk3.TSK_VS_PART_FLAG_ALLOC)]
         except TSK_ERRORS:
@@ -134,9 +140,22 @@ class TskImageVfs:
                 partitions=[{"offset_bytes": p[0], "type": p[2]} for p in parts],
                 skipped=self.skipped)
 
+        # 각 볼륨이 원래 PC 에서 어떤 드라이브 문자였는지 — SYSTEM\MountedDevices 로 확인해
+        # vd['drive'] 에 채운다. Artifact_path 의 드라이브 문자는 가정이 아니라 실측이 된다.
+        # 하이브가 없거나 판독 실패해도 분석은 멈추지 않고, 출력은 종전대로 C: 로 가정한다.
+        from . import mounted_devices
+        try:
+            self.drive_letters = mounted_devices.assign(
+                img, parts[0][3], bs if parts[0][3] != "NONE" else 512, self.volumes)
+        except Exception as exc:  # noqa: BLE001 — 드라이브 문자 판정 실패는 분석 중단 사유가 아니다
+            self.drive_letters = {"status": "드라이브 문자 판정 실패 (%s) — C: 로 가정"
+                                            % str(exc)[:100]}
+
     def iter_files(self):
+        self.scanned_dirs = {}     # 볼륨 index -> {(MFT#, seq): 경로} — USN 저널 대조에 쓴다
         for vd, fs in self.volumes:
             dirs = {}      # (MFT#, seq) -> 경로 : 탐색한 디렉터리
+            self.scanned_dirs[vd["index"]] = dirs
             yielded = set()
             for path, entry in _expand_roots(fs):
                 for vf in self._walk(vd, fs, path, entry, dirs):
@@ -202,6 +221,7 @@ class TskImageVfs:
                      allocated=name_alloc and meta_alloc,
                      si_times=_si_times(meta), fn_times=fn.get("times"),
                      volume_index=vd["index"], volume_offset=vd["offset_bytes"],
+                     volume_drive=vd.get("drive"),
                      parse_errors=errors, path_source=path_source)
         vf._fs = fs
         return vf
@@ -229,6 +249,7 @@ class TskImageVfs:
         return {
             "reader": "The Sleuth Kit %s (pytsk3)" % pytsk3.TSK_VERSION_STR,
             "volumes": [vd for vd, _fs in self.volumes],
+            "drive_letters": getattr(self, "drive_letters", None),
             "skipped_partitions": self.skipped,
             "locked_volumes": self.locked,
             "scan_roots": list(SCAN_ROOTS),
