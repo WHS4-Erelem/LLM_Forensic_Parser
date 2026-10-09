@@ -9,9 +9,9 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
+from PyQt6.QtCore import QRect, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPen,
-                         QStandardItem, QStandardItemModel)
+                         QPixmap, QStandardItem, QStandardItemModel)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QFileDialog,
                              QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -34,6 +34,8 @@ from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "ARTINEX"                      # 사용자에게 보이는 제품명
 APP_TAGLINE = "Integrated LLM Forensic Analysis"
+LOGO = os.path.join(HERE, "assets", "Logo.png")   # ERELM 로고 원본 (162x150). 절대경로를 적지 않는다
+LOGO_HEIGHT = 44                                  # TopBar 60px 안에서 ERELM 글자까지 읽히는 높이
 STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "BadgeBlue"),
                 "waiting": ("대기", "BadgeNeutral"), "skipped": ("미실행", "BadgeNeutral"),
                 "failed": ("실패", "BadgeRed"), "contract_violation": ("계약 위반", "BadgeRed"),
@@ -144,40 +146,17 @@ def metric_card(label_text, value_text):
     return card
 
 
-class BrandMark(QWidget):
-    """상단 브랜드 심볼 — ERELM 로고(링 + E 형태 가로선 + 데이터 블록 + 돋보기 손잡이)를 단순화한 벡터 그림.
+def brand_mark(path=LOGO, height=LOGO_HEIGHT):
+    """ERELM 로고 라벨 — 원본 비율 그대로 높이만 맞춘다 (crop·stretch·색 변경 없음).
 
-    40px 에서 형태가 남도록 요소를 4개로 줄였다 (링·가로선 3줄·블록 2개·손잡이).
-    색은 현재 테마의 cyan 과 lime 두 가지만 쓴다 (gradient·glow 없음).
+    파일을 읽지 못해도 빈 라벨을 돌려준다. 로고 때문에 GUI 가 뜨지 않으면 안 된다.
     """
-
-    RING = "#b5e853"        # lime — 링 위쪽
-    ACCENT = "#4cc2d6"      # cyan — 링 아래쪽·가로선·손잡이 (TopBar 기존 accent)
-    SIZE = 40
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(self.SIZE, self.SIZE)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        scale = self.width() / float(self.SIZE)       # 40px 기준으로 그리고 위젯 크기에 맞춘다
-        painter.scale(scale, scale)
-        ring = QRectF(4.5, 4.5, 25.0, 25.0)
-        for color, start, span in ((self.RING, 20, 145), (self.ACCENT, 165, 140)):
-            painter.setPen(QPen(QColor(color), 2.6, cap=Qt.PenCapStyle.RoundCap))
-            painter.drawArc(ring, start * 16, span * 16)   # 오른쪽 아래 75° 는 비워 손잡이로 이어진다
-        painter.setPen(QPen(QColor(self.ACCENT), 2.0, cap=Qt.PenCapStyle.RoundCap))
-        for y, width in ((12.6, 9.0), (17.0, 6.5), (21.4, 9.0)):   # E 를 연상시키는 3줄
-            painter.drawLine(QPointF(10.0, y), QPointF(10.0 + width, y))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(self.RING))
-        for y in (13.4, 19.4):                                     # 오른쪽 데이터 블록
-            painter.drawRect(QRectF(21.6, y, 3.4, 3.4))
-        painter.setPen(QPen(QColor(self.ACCENT), 3.4, cap=Qt.PenCapStyle.RoundCap))
-        painter.drawLine(QPointF(26.0, 26.0), QPointF(34.0, 34.0))  # 돋보기 손잡이
-        painter.end()
+    label = QLabel()
+    label.setObjectName("BrandMark")
+    pixmap = QPixmap(path)
+    if not pixmap.isNull():
+        label.setPixmap(pixmap.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation))
+    return label
 
 
 class StatusRow(QWidget):
@@ -801,11 +780,10 @@ class MainWindow(QWidget):
         bar = QFrame()
         bar.setObjectName("TopBar")
         row = QHBoxLayout(bar)
-        row.setContentsMargins(16, 10, 16, 10)
-        row.setSpacing(12)
+        row.setContentsMargins(16, 8, 16, 8)       # 로고 44px 가 들어가도 TopBar 높이 60px 유지
+        row.setSpacing(14)
 
-        row.addWidget(BrandMark(), 0, Qt.AlignmentFlag.AlignVCenter)
-        row.addSpacing(4)
+        row.addWidget(brand_mark(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)

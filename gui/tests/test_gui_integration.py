@@ -431,16 +431,16 @@ class PluginIsolationTest(unittest.TestCase):
 
 
 class BrandingTest(unittest.TestCase):
-    """상단 브랜딩이 ARTINEX 로 보이고 심볼 위젯이 만들어진다."""
+    """사용자에게 보이는 상단 브랜딩 — ARTINEX 텍스트 + ERELM 로고 asset."""
 
     @classmethod
     def setUpClass(cls):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PyQt6.QtWidgets import QApplication
         cls.app = QApplication.instance() or QApplication([])
-        from main_window import APP_NAME, APP_TAGLINE, BrandMark, MainWindow
-        cls.names = (APP_NAME, APP_TAGLINE)
-        cls.BrandMark, cls.window = BrandMark, MainWindow()
+        import main_window
+        cls.mw = main_window
+        cls.window = main_window.MainWindow()
 
     def test_window_title_is_the_product_name(self):
         self.assertEqual(self.window.windowTitle(), "ARTINEX")
@@ -450,21 +450,37 @@ class BrandingTest(unittest.TestCase):
         texts = [w.text() for w in self.window.findChildren(QLabel)]
         self.assertIn("ARTINEX", texts)
         self.assertIn("Integrated LLM Forensic Analysis", texts)
-        self.assertEqual(self.names, ("ARTINEX", "Integrated LLM Forensic Analysis"))
 
-    def test_brand_mark_replaces_the_text_badge(self):
-        marks = self.window.findChildren(self.BrandMark)
-        self.assertEqual(len(marks), 1)
-        self.assertEqual(marks[0].size().width(), 40)
-        self.assertEqual(marks[0].size().height(), 40)
+    def test_logo_asset_is_in_the_repository(self):
+        """절대경로가 아니라 gui/ 안의 asset 을 쓴다 (실행 위치가 달라져도 찾는다)."""
+        self.assertEqual(Path(self.mw.LOGO), GUI_DIR / "assets" / "Logo.png")
+        self.assertTrue(Path(self.mw.LOGO).is_file())
 
-    def test_brand_mark_draws_without_error(self):
+    def test_logo_is_shown_at_its_original_aspect_ratio(self):
         from PyQt6.QtGui import QPixmap
-        pixmap = QPixmap(40, 40)                      # paintEvent 가 실제로 그려지는지 (좌표·펜 오류 검출)
-        pixmap.fill()
-        mark = self.BrandMark()
-        mark.render(pixmap)
-        self.assertFalse(pixmap.isNull())
+        source = QPixmap(self.mw.LOGO)
+        self.assertFalse(source.isNull())
+        shown = self.mw.brand_mark().pixmap()
+        self.assertFalse(shown.isNull())
+        self.assertEqual(shown.height(), self.mw.LOGO_HEIGHT)
+        self.assertAlmostEqual(shown.width() / shown.height(),
+                               source.width() / source.height(), delta=0.02)
+
+    def test_header_has_exactly_one_logo_and_no_text_badge(self):
+        from PyQt6.QtWidgets import QLabel
+        marks = [w for w in self.window.findChildren(QLabel) if w.objectName() == "BrandMark"]
+        self.assertEqual(len(marks), 1)
+        self.assertFalse(marks[0].pixmap().isNull())
+        self.assertEqual([w.text() for w in self.window.findChildren(QLabel) if w.text() == "EL"], [])
+
+    def test_missing_logo_does_not_break_the_window(self):
+        label = self.mw.brand_mark(str(GUI_DIR / "assets" / "no-such-logo.png"))
+        self.assertTrue(label.pixmap().isNull())        # 예외 없이 빈 라벨
+
+    def test_no_hand_drawn_brand_symbol_remains(self):
+        source = (GUI_DIR / "main_window.py").read_text(encoding="utf-8")
+        self.assertNotIn("BrandMark(QWidget)", source)  # QPainter 로고 구현은 제거됐다
+        self.assertNotIn("class BrandMark", source)
 
 
 if __name__ == "__main__":

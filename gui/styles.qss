@@ -2,7 +2,6 @@
    Background #121820 / Shell #171f29 / Panel #1b2430 / Card #1f2937 / Card hover #26323f
    Border #2c3947 / Rail #31404f / Text #e6edf3 / Dim #b9c6d2 / Muted #8294a5
    Accent Teal #4cc2d6 / Blue #6ea8e8 / Green #5ec98b / Yellow #e3b341 / Red #ef6b6b
-   Brand Lime #b5e853 (BrandMark 심볼 전용)
    (delegate 가 직접 그리는 색은 main_window.DARK 와 같은 값이다) */
 
 QWidget {
