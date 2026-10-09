@@ -26,7 +26,7 @@ from .artifacts.preferences import preferences_path, read_preferences
 from .artifacts.session_storage import read_session_storage, session_storage_dir
 from .artifacts.sessions import read_chrome_sessions, sessions_dir
 from .artifacts.shared_proto_db import read_shared_proto_db, shared_proto_db_dir
-from .detectors.auth import detect_account_name_change, detect_account_session_login, detect_account_session_switch, detect_account_switch, detect_login, detect_logout, detect_profile_access
+from .detectors.auth import correlate_login_evidence, detect_account_name_change, detect_account_session_login, detect_account_session_switch, detect_account_switch, detect_login, detect_logout, detect_profile_access
 from .detectors.conversation import detect_conversation_access, detect_conversation_create, detect_conversation_delete, detect_conversation_removed_from_list, detect_conversation_retry
 from .detectors.file_activity import detect_file_download, detect_file_upload, detect_file_upload_delete
 from .detectors.misc import detect_cache_delete, detect_data_export_request, detect_history_delete, detect_image_generation_request, detect_incognito, detect_model_change, detect_share_link, detect_temporary_chat
@@ -155,11 +155,13 @@ def detect(records: list[ArtifactRecord], coverages: list[Coverage] | tuple[Cove
     """
     ArtifactRecord 에 ChatGPT Event Rule 을 적용한다. 파일을 읽지 않고 입력 Record 를 수정하지 않는다.
     Rule 사이에 상태를 공유하지 않는다 (ACCESS 는 CREATE 연결을 스스로 다시 계산해 제외한다).
+    Rule 을 모두 적용한 뒤 Evidence 결합 단계가 한 번 돈다 — 같은 행위 1회를 두 Rule 이 각각 Event 로
+    만든 경우를 합치기만 하고, 새 판정·새 시각·새 Evidence 는 만들지 않는다 (correlate_login_evidence).
     """
     events: list[Event] = []
     for rule in EVENT_RULES:
         events.extend(rule(records, coverages))
-    return events
+    return correlate_login_evidence(events, records)
 
 
 def run(

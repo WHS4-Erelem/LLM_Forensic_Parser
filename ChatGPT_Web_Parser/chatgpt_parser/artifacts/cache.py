@@ -230,12 +230,18 @@ def _reduce_message(message: Any) -> dict[str, Any] | None:
         return None
     author = message.get("author") if isinstance(message.get("author"), dict) else {}
     metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-    return {"id": message.get("id"), "role": author.get("role"), "author_name": author.get("name"),
-            "create_time": message.get("create_time"), "update_time": message.get("update_time"),
-            "status": message.get("status"), "recipient": message.get("recipient"),
-            "message_type": metadata.get("message_type"), "content": message.get("content"),
-            "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (§8.16)
-            "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (§8.20)
+    reduced = {"id": message.get("id"), "role": author.get("role"), "author_name": author.get("name"),
+               "create_time": message.get("create_time"), "update_time": message.get("update_time"),
+               "status": message.get("status"), "recipient": message.get("recipient"),
+               "message_type": metadata.get("message_type"), "content": message.get("content"),
+               "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (§8.16)
+               "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (§8.20)
+    # has_versions: 응답 URL 의 include_has_versions=true 로 서버가 붙이는 "이 메시지에 다른 버전이 있는가" 표시.
+    # 키가 실제로 있을 때만 남긴다 (없는 응답의 observed 를 바꾸지 않는다). 이 값으로 행위를 판정하지 않는다 —
+    # 지금은 증거 보존만 하고, 분기(mapping 트리)가 실제로 캐시된 이미지를 확보한 뒤 판정을 검토한다.
+    if "has_versions" in metadata:
+        reduced["has_versions"] = metadata.get("has_versions")
+    return reduced
 
 
 def _reduce_conversation_json(obj: Any) -> dict[str, Any] | None:

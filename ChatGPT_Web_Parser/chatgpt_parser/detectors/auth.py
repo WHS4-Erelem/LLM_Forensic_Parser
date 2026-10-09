@@ -12,7 +12,7 @@ import sqlite3
 import struct
 import sys
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -588,3 +588,118 @@ def detect_account_name_change(records: list[ArtifactRecord],
                 confidence="MEDIUM" if timestamp.get("timestamp_utc") else "LOW",
                 warnings=_merged_warnings([older, newer])))
     return events
+
+
+# ---- 로그인 증거 결합 (CHATGPT_LOGIN_001 ← CHATGPT_ACCOUNT_SESSION_001) --------
+# 로그인 1회가 Rule 2개에서 각각 Event 가 되어 최종 timeline 에 2행으로 나왔다 (정답지 대조 2026-10-09).
+#   CHATGPT_LOGIN_001           History 의 OAuth callback 방문  (이 PC 에서 관찰한 방문)
+#   CHATGPT_ACCOUNT_SESSION_001 Local Storage lastLoggedInAt     (값 안에 들어 있는 서버 보고 시각)
+# "몇 초 이내면 같은 로그인" 으로 합치지 않는다. Artifact 가 직접 말해 주는 것만 조건으로 쓴다:
+#   (a) 같은 os_user · browser_profile (같은 Chrome 프로필의 History ↔ Local Storage)
+#   (b) lastLoggedInAt 이 그 callback 의 **인증 흐름 구간** 안에 있다. 구간은 History 의 인증 단계
+#       (login_with / authorize / callback — detect_account_switch 와 같은 _AUTH_STEPS) 로 만들고 logout 에서 끊는다.
+#       임의의 시간 창이 아니라 방문 기록이 그려 놓은 구간이다.
+#   (c) 한 인증 흐름에 callback 이 1개뿐이고, callback ↔ 세션 로그인이 1:1 로만 맞는다
+#       (callback 이 여러 개면 OAuth 재시도와 구분하지 못하므로 합치지 않는다)
+#   (d) 그 프로필의 세션 목록에 계정 식별자가 1개뿐이다. 2개 이상이면 (= CHATGPT_ACCOUNT_SESSION_001 의
+#       ACCOUNT_SWITCH 조건) callback 이 어느 계정의 로그인인지 말해 주지 못하므로 합치지 않는다.
+#       History 체인 Rule(CHATGPT_ACCOUNT_SWITCH_001) 은 차단 조건으로 쓰지 않는다 — CANDIDATE 이고
+#       같은 계정 재로그인에서도 logout→login_with→authorize→callback 체인이 똑같이 관찰된다.
+# 합칠 때 History callback Event 를 대표로 남기고 세션 Event 의 Evidence 를 전부 SUPPORTING 으로 옮긴다.
+# 버리는 Evidence 는 없고, 조건이 하나라도 맞지 않으면 두 Event 를 그대로 둔다 (지금까지와 같은 결과).
+
+LOGIN_CORRELATION_LIMITATION = (
+    "같은 프로필의 계정 세션 목록(lastLoggedInAt)이 이 callback 의 인증 흐름 구간 안에 있어 로그인 1회의 보조 근거로 합쳤다. "
+    "서버 보고 시각과 방문 시각이 다른 것은 정상이며, 합쳤다는 것이 로그인 성공을 확정하지는 않는다"
+)
+
+
+def _auth_flow_spans(records: list[ArtifactRecord]) -> dict[str, tuple[datetime, datetime]]:
+    """{callback Record id: (인증 흐름 시작 UTC, callback UTC)}. logout 으로 끊고, callback 이 2개 이상인 흐름은 뺀다."""
+    spans: dict[str, tuple[datetime, datetime]] = {}
+    for group in _history_groups(records):
+        flow: list[tuple[ArtifactRecord, str]] = []
+        for record in list(group) + [None]:                     # None = 마지막 흐름을 닫는 표시
+            step = _auth_step(record) if record is not None else "logout"
+            if step is None:
+                continue
+            if step != "logout":
+                flow.append((record, step))
+                continue
+            callbacks = [r for r, name in flow if name == "callback"]
+            times = [when for r, _ in flow if (when := _record_utc(r)) is not None]
+            if len(callbacks) == 1 and times:                   # callback 이 여럿이면 어느 것이 그 로그인인지 모른다
+                end = _record_utc(callbacks[0])
+                if end is not None:
+                    spans[callbacks[0].record_id] = (min(times), end)
+            flow = []
+    return spans
+
+
+def _event_record_id(event: Event) -> str | None:
+    """Event 의 대표 Evidence 가 가리키는 Record (없으면 첫 primary)."""
+    items = list(event.primary_evidence)
+    for item in items:
+        if item.evidence_id == event.representative_evidence_id:
+            return item.record_id
+    return items[0].record_id if items else None
+
+
+def correlate_login_evidence(events: list[Event], records: list[ArtifactRecord]) -> list[Event]:
+    """같은 로그인 1회의 Event 2개를 1개로 합친다. 새 판정을 만들지 않고 Evidence 도 버리지 않는다."""
+    callbacks = [e for e in events if e.rule_id == LOGIN_RULE_ID and e.action == "LOGIN"]
+    sessions = [e for e in events if e.rule_id == ACCOUNT_SESSION_RULE_ID and e.action == "LOGIN"
+                and e.timestamp_utc]
+    if not callbacks or not sessions:
+        return list(events)
+    identities: dict[tuple, set[str]] = {}                      # 프로필별 세션 목록에 기록된 계정 식별자
+    for record in _account_session_puts(records):
+        for session in record.observed["sessions"]:
+            prefix = session.get("user_id_sha256_prefix") if isinstance(session, dict) else None
+            if prefix:
+                identities.setdefault((record.os_user, record.browser_profile), set()).add(prefix)
+    switch_scopes = {scope for scope, found in identities.items() if len(found) > 1}
+    switch_scopes |= {(e.os_user, e.browser_profile) for e in events
+                      if e.action == "ACCOUNT_SWITCH" and e.rule_id == ACCOUNT_SESSION_RULE_ID}
+    spans = _auth_flow_spans(records)
+    matches: dict[str, list[Event]] = {}                        # callback event_id → 세션 Event 후보
+    owners: dict[str, list[Event]] = {}                         # 세션 event_id → callback 후보
+    for callback in callbacks:
+        if (callback.os_user, callback.browser_profile) in switch_scopes:
+            continue
+        span = spans.get(_event_record_id(callback) or "")
+        if span is None:
+            continue
+        for session in sessions:
+            if (session.os_user, session.browser_profile) != (callback.os_user, callback.browser_profile):
+                continue
+            try:
+                when = datetime.fromisoformat(session.timestamp_utc)
+            except ValueError:
+                continue
+            if span[0] <= when <= span[1]:
+                matches.setdefault(callback.event_id, []).append(session)
+                owners.setdefault(session.event_id, []).append(callback)
+
+    merged: dict[str, Event] = {}
+    dropped: set[str] = set()
+    for callback in callbacks:
+        found = matches.get(callback.event_id) or []
+        if len(found) != 1 or len(owners.get(found[0].event_id) or []) != 1:
+            continue                                            # 후보가 여럿이면 합치지 않는다
+        session = found[0]
+        moved = [replace(item, evidence_level="SUPPORTING")
+                 for item in list(session.primary_evidence) + list(session.supporting_evidence)]
+        reasons = list(callback.confidence_reason)
+        if REASON_SUPPORTING_CORRELATED not in reasons:
+            reasons.append(REASON_SUPPORTING_CORRELATED)
+        limitations = list(callback.limitations) + [LOGIN_CORRELATION_LIMITATION]
+        limitations += [text for text in session.limitations if text not in limitations]
+        warnings = list(callback.warnings) + [text for text in session.warnings if text not in callback.warnings]
+        merged[callback.event_id] = replace(
+            callback, supporting_evidence=list(callback.supporting_evidence) + moved,
+            confidence_reason=reasons, limitations=limitations, warnings=warnings)
+        dropped.add(session.event_id)
+    if not merged:
+        return list(events)
+    return [merged.get(event.event_id, event) for event in events if event.event_id not in dropped]

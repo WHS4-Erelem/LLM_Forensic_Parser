@@ -267,12 +267,16 @@ CSV_BEHAVIOR_REASONS = {
     "LOGOUT": "로그아웃 URL 방문",
     "ACCOUNT_SWITCH": "재인증/계정 전환 흔적",
     "ACCOUNT_NAME_CHANGE": "계정 이름 변경 흔적",
-    "CONVERSATION_CREATE": "대화 생성 기록",
+    # 대표 시각은 /c/WEB:<클라이언트 id> → /c/<서버 대화 id> 방문이다. "새 채팅" 클릭은 URL 을 바꾸지 않아
+    # History 에 남지 않으므로, 이 시각이 클릭 시각이 아니라 첫 메시지 전송으로 대화 URL 이 확정된 시각임을 적는다.
+    "CONVERSATION_CREATE": "대화 생성 기록(첫 메시지 전송 후 대화 URL 확정)",
     "CONVERSATION_DELETE": "대화 삭제 요청/이벤트",
     "CONVERSATION_RETRY": "동일 사용자 메시지 아래 응답 분기",
     "PROMPT_SEND": "사용자 메시지 전송",
     "PROMPT_DRAFT": "프롬프트 작성 흔적(전송 미확인)",
-    "FILE_DOWNLOAD": "다운로드 완료 기록",
+    # 대표 시각은 downloads.start_time (다운로드 시작) 이다. 완료 여부는 Artifact_details 의
+    # 다운로드 상태·완료 시각으로 읽는다 — 시작 시각에 "완료" 라고 적지 않는다.
+    "FILE_DOWNLOAD": "다운로드 시작 기록",
     "IMAGE_GENERATION_REQUEST": "이미지 생성 요청 기록",
     "SHARE_LINK": "공유 링크 생성 기록",
     "MODEL_CHANGE": "모델 선택 값 변경",
@@ -333,7 +337,10 @@ CSV_ARTIFACT_LABELS = {
 }
 # artifact 별로 최종 CSV 에 낼 observed key: (observed key, 사람이 읽는 이름, 단위)
 CSV_ARTIFACT_DETAIL_FIELDS = {
+    # end_timestamp_kst 는 Reader 가 downloads.end_time 을 변환해 둔 값이다 (대표 시각은 start_time 이므로
+    # 완료 시각은 여기서만 보인다). 값이 없으면 칸을 만들지 않는다 — 시각을 추정해 채우지 않는다.
     "history": (("url", "URL", ""), ("title", "제목", ""), ("state", "다운로드 상태", ""),
+                ("end_timestamp_kst", "완료 시각", ""),
                 ("filename", "파일명", ""), ("current_path", "저장 경로", ""), ("mime_type", "파일 형식", "")),
     "local_storage": (("key", "저장 key", ""), ("conversation_count", "대화 항목", "건"),
                       ("draft_count", "초안", "건"), ("session_count", "계정 세션", "개"),

@@ -7581,5 +7581,220 @@ class NewRuleRegressionTest(unittest.TestCase):
             self.assertNotEqual(event.confidence, "HIGH")
 
 
+# =============================================================================
+# 정답지(시간기록) 대조 QA 반영 — 로그인 증거 결합 · 다운로드/대화 생성 시각 의미 · has_versions 보존
+# =============================================================================
+# 2026-10-09 실제 시나리오 시간기록 대조에서 확인한 것만 고정한다.
+#   F-LOGIN        로그인 1회가 Rule 2개 때문에 timeline 2행이 되던 문제 → 인증 흐름 구간이 겹칠 때만 결합
+#   F-DOWNLOAD     대표 시각은 downloads.start_time 인데 문구가 "완료" 였던 의미 불일치
+#   F-CREATE       대표 시각이 "새 채팅" 클릭이 아니라 첫 메시지 전송 후 URL 확정 시각임을 문구로 밝힌다
+#   F-EDIT         수정 전 본문이 없는 Artifact 라 탐지를 만들지 않는다. has_versions 만 잃지 않게 보존한다
+# 정답지 시각을 Parser 결과에 넣지 않으며, 시간 근접성만으로 결합하지 않는다.
+
+ACCOUNT_SESSION_USER_A = "aaaa111122223333"
+ACCOUNT_SESSION_USER_B = "bbbb444455556666"
+
+
+def account_session_record(seconds, *, user=ACCOUNT_SESSION_USER_A, record_id="ls:session", sequence=100,
+                           extra_users=(), profile="Default", os_user=None):
+    """accountSwitchSessions PUT Record. lastLoggedInAt 은 BASE_WEBKIT 기준 초 오프셋으로 만든다."""
+    def session_for(prefix, offset):
+        when = datetime(2026, 8, 29, 16, 30, 0, tzinfo=timezone.utc) + timedelta(seconds=offset)
+        return {"user_id_sha256_prefix": prefix, "session_token_present": True, "session_token_length": 4612,
+                "workspace_count": 1,
+                "last_logged_in_at": {"timestamp_raw": str(int(when.timestamp() * 1000)),
+                                      "timestamp_utc": when.isoformat().replace("+00:00", "Z"),
+                                      "timestamp_kst": when.astimezone(timezone(timedelta(hours=9))).isoformat(),
+                                      "timestamp_type": "unix_ms",
+                                      "timestamp_source": "LocalStorage.oai/apps/accountSwitchSessions[].lastLoggedInAt"}}
+
+    sessions = [session_for(user, seconds)] + [session_for(prefix, offset) for prefix, offset in extra_users]
+    return p.ArtifactRecord(
+        record_id=record_id, artifact_type="local_storage", os_user=os_user, browser_profile=profile,
+        source_path=f"{profile}/Local Storage/leveldb/000019.ldb", record_location=f"sequence={sequence}",
+        observed={"key_kind": "account_switch_sessions", "operation": "PUT", "sequence": sequence,
+                  "session_count": len(sessions), "sessions": sessions, "storage_origin": "https://chatgpt.com"})
+
+
+def auth_flow_visits(start_id, *, offsets=(0.0, 3.0, 17.0), profile="Default", os_user=None):
+    """login_with → authorize → callback 방문 3건 (logout 없이 시작하는 첫 로그인 흐름)."""
+    urls = (LOGIN_WITH_URL, AUTHORIZE_URL, LOGIN_CALLBACK_URL)
+    return [visit(url, start_id + index, seconds, profile=profile, os_user=os_user)
+            for index, (url, seconds) in enumerate(zip(urls, offsets))]
+
+
+def logins_of(events):
+    return [event for event in events if event.action == "LOGIN"]
+
+
+class LoginEvidenceCorrelationTest(unittest.TestCase):
+    """F-LOGIN — 같은 로그인 1회의 Event 2개를 1개로 합치되 Evidence 는 버리지 않는다."""
+
+    def test_callback_and_session_login_become_one_event_with_session_evidence_kept(self):
+        """callback 의 인증 흐름 구간 안에 lastLoggedInAt 이 있으면 History Event 1건으로 합친다."""
+        records = auth_flow_visits(10) + [account_session_record(14.0)]
+        before = p.detect_login(records) + p.detect_account_session_login(records)
+        self.assertEqual(len(logins_of(before)), 2)                      # 결합 전에는 2건이 맞다
+
+        events = logins_of(p.detect(records))
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event.rule_id, "CHATGPT_LOGIN_001")             # 대표는 History OAuth callback
+        callback = next(e for e in logins_of(before) if e.rule_id == "CHATGPT_LOGIN_001")
+        self.assertEqual((event.timestamp_raw, event.timestamp_utc, event.timestamp_kst),
+                         (callback.timestamp_raw, callback.timestamp_utc, callback.timestamp_kst))
+        self.assertEqual(event.representative_evidence_id, callback.representative_evidence_id)
+        self.assertEqual(event.action_status, callback.action_status)
+        self.assertEqual(event.confidence, callback.confidence)          # 결합이 confidence 를 올리지 않는다
+        session_items = [item for item in event.supporting_evidence
+                         if item.artifact_type == "local_storage"]
+        self.assertEqual(len(session_items), 1)                          # 세션 Evidence 가 보존된다
+        self.assertEqual(session_items[0].evidence_level, "SUPPORTING")
+        self.assertEqual(session_items[0].observed["user_id_sha256_prefix"], ACCOUNT_SESSION_USER_A)
+        self.assertIn("SUPPORTING_CORRELATED", event.confidence_reason)
+        self.assertIn(p.LOGIN_CORRELATION_LIMITATION, event.limitations)
+
+    def test_two_real_logins_stay_two_events(self):
+        """logout 으로 끊긴 두 번째 로그인은 따로 남는다 (하나로 접히지 않는다)."""
+        records = (auth_flow_visits(10) + [account_session_record(14.0)]
+                   + [visit(LOGOUT_URL, 20, 600.0)]
+                   + auth_flow_visits(30, offsets=(700.0, 703.0, 717.0))
+                   + [account_session_record(714.0, record_id="ls:session2", sequence=200)])
+        events = logins_of(p.detect(records))
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e.rule_id for e in events}, {"CHATGPT_LOGIN_001"})
+        self.assertEqual(len({e.timestamp_utc for e in events}), 2)
+        for event in events:                                             # 각자 자기 세션 근거를 갖는다
+            self.assertEqual(len([i for i in event.supporting_evidence if i.artifact_type == "local_storage"]), 1)
+
+    def test_account_switch_scope_is_never_merged(self):
+        """세션 목록에 계정이 2개면 callback 이 어느 계정인지 모르므로 합치지 않는다."""
+        records = auth_flow_visits(10) + [account_session_record(
+            14.0, extra_users=((ACCOUNT_SESSION_USER_B, 20.0),))]
+        events = p.detect(records)
+        self.assertTrue([e for e in events if e.action == "ACCOUNT_SWITCH"])
+        logins = logins_of(events)
+        self.assertEqual(len(logins), 3)                                 # callback 1 + 계정별 세션 로그인 2, 결합 없음
+        self.assertEqual({e.rule_id for e in logins},
+                         {"CHATGPT_LOGIN_001", "CHATGPT_ACCOUNT_SESSION_001"})
+        callback = next(e for e in logins if e.rule_id == "CHATGPT_LOGIN_001")
+        self.assertEqual([i for i in callback.supporting_evidence if i.artifact_type == "local_storage"], [])
+
+    def test_oauth_retry_with_two_callbacks_is_not_merged(self):
+        """한 인증 흐름에 callback 이 2개면 어느 쪽 로그인인지 모르므로 합치지 않는다."""
+        records = (auth_flow_visits(10) + [visit(LOGIN_CALLBACK_URL, 13, 19.0)]
+                   + [account_session_record(14.0)])
+        events = logins_of(p.detect(records))
+        self.assertEqual(len(events), 3)                                 # callback 2건 + 세션 1건 그대로
+        self.assertEqual(len([e for e in events if e.rule_id == "CHATGPT_ACCOUNT_SESSION_001"]), 1)
+
+    def test_session_restore_without_callback_keeps_its_own_event(self):
+        """OAuth callback 이 없으면 (세션 복원 등) 세션 로그인 Event 를 그대로 남긴다."""
+        records = [account_session_record(14.0)]
+        events = logins_of(p.detect(records))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].rule_id, "CHATGPT_ACCOUNT_SESSION_001")
+        self.assertEqual(events[0].primary_evidence[0].artifact_type, "local_storage")
+
+    def test_session_login_outside_the_auth_flow_is_not_merged(self):
+        """인증 흐름 구간 밖의 lastLoggedInAt 은 합치지 않는다 (시간 근접성만으로 결합하지 않는다)."""
+        records = auth_flow_visits(10) + [account_session_record(600.0)]
+        events = logins_of(p.detect(records))
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e.rule_id for e in events},
+                         {"CHATGPT_LOGIN_001", "CHATGPT_ACCOUNT_SESSION_001"})
+
+    def test_other_profile_is_not_merged(self):
+        """다른 Chrome 프로필의 세션 목록과는 합치지 않는다."""
+        records = auth_flow_visits(10) + [account_session_record(14.0, profile="Profile 2")]
+        self.assertEqual(len(logins_of(p.detect(records))), 2)
+
+    def test_correlation_without_either_side_changes_nothing(self):
+        """한쪽만 있으면 Event 목록을 그대로 돌려준다 (결합 단계가 결과를 바꾸지 않는다)."""
+        records = auth_flow_visits(10)
+        events = p.detect_login(records)
+        self.assertEqual(p.correlate_login_evidence(events, records), events)
+        self.assertEqual(p.correlate_login_evidence([], records), [])
+
+
+class DownloadTimestampWordingTest(HistoryDownloadMixin, HistoryTestBase):
+    """F-DOWNLOAD — 대표 시각은 start_time 그대로, 문구와 Artifact_details 만 의미에 맞춘다."""
+
+    def event(self):
+        records, coverage = self.read(downloads=[download_row(tab_url=CHATGPT_TAB_URL)],
+                                      url_chains=[(1, 0, CHATGPT_ESTUARY_URL)])
+        event, = p.detect_file_download(records, [coverage])
+        return event
+
+    def test_representative_timestamp_is_still_download_start(self):
+        event = self.event()
+        self.assertEqual(event.timestamp_source, "History.downloads.start_time")
+        observed = event.primary_evidence[0].observed
+        self.assertEqual(event.timestamp_raw, str(observed["start_time"]) if "start_time" in observed
+                         else event.timestamp_raw)
+        self.assertNotEqual(event.timestamp_raw, str(observed.get("end_time")))
+
+    def test_wording_says_start_not_complete(self):
+        self.assertEqual(_final_csv.CSV_BEHAVIOR_REASONS["FILE_DOWNLOAD"], "다운로드 시작 기록")
+        self.assertNotIn("완료", _final_csv.CSV_BEHAVIOR_REASONS["FILE_DOWNLOAD"])
+
+    def test_artifact_details_carry_state_and_end_time(self):
+        """완료 여부는 이미 파싱된 state·end_timestamp_kst 로만 보인다 (새 시각을 만들지 않는다)."""
+        fields = dict((key, label) for key, label, _ in _final_csv.CSV_ARTIFACT_DETAIL_FIELDS["history"])
+        self.assertEqual(fields["state"], "다운로드 상태")
+        self.assertEqual(fields["end_timestamp_kst"], "완료 시각")
+        row = _final_csv._timeline_row(self.event())
+        self.assertTrue(row["Behavior_details "].startswith("다운로드 시작 기록"))
+        self.assertIn("다운로드 상태=COMPLETE", row["Artifact_details "])
+        self.assertIn("완료 시각=", row["Artifact_details "])
+        self.assertEqual(row["Timestamp"], _final_csv.csv_final_timestamp(self.event().timestamp_kst))
+
+
+class ConversationCreateWordingTest(unittest.TestCase):
+    """F-CREATE — 시각은 그대로 두고, 그 시각의 의미만 문구로 밝힌다."""
+
+    def test_timestamp_and_behavior_label_unchanged(self):
+        records = [visit(WEB_URL, 16, 1.0), visit(CONVERSATION_URL, 17, 2.0)]
+        event, = p.detect_conversation_create(records)
+        # 관찰된 방문 시각 중 하나를 그대로 쓴다 (계산·보정으로 만든 값이 아니다)
+        self.assertIn(event.timestamp_raw, {record.timestamp_raw for record in records})
+        row = _final_csv._timeline_row(event)
+        self.assertEqual(row["User_behavior"], "새로운 대화 생성")        # 팀 표준 값 유지
+        self.assertEqual(row["Timestamp"], _final_csv.csv_final_timestamp(event.timestamp_kst))
+
+    def test_wording_explains_that_it_is_the_url_confirmation(self):
+        reason = _final_csv.CSV_BEHAVIOR_REASONS["CONVERSATION_CREATE"]
+        self.assertTrue(reason.startswith("대화 생성 기록"))
+        self.assertIn("첫 메시지 전송", reason)
+        self.assertIn("URL 확정", reason)
+
+
+class CacheMessageHasVersionsTest(unittest.TestCase):
+    """F-EDIT — has_versions 는 보존만 한다. 수정 탐지 Event 는 만들지 않는다."""
+
+    @staticmethod
+    def message(**metadata):
+        return {"id": "m-1", "author": {"role": "user"}, "create_time": 1787126888.0,
+                "update_time": 1787126899.0, "status": "finished_successfully",
+                "content": {"content_type": "text", "parts": ["안녕"]}, "metadata": metadata}
+
+    def test_has_versions_is_kept_when_present(self):
+        for value in (True, False):
+            with self.subTest(value=value):
+                reduced = _cache._reduce_message(self.message(has_versions=value))
+                self.assertEqual(reduced["has_versions"], value)
+
+    def test_absent_has_versions_does_not_add_a_key(self):
+        reduced = _cache._reduce_message(self.message(message_type="next"))
+        self.assertNotIn("has_versions", reduced)                        # 기존 출력과 같은 모양
+        self.assertEqual(reduced["message_type"], "next")
+
+    def test_has_versions_does_not_create_an_edit_action(self):
+        """보존한 값이 행위 판정으로 새지 않는다 — 대화 수정 action 자체가 없다."""
+        self.assertNotIn("CONVERSATION_MODIFY", _final_csv.CSV_USER_BEHAVIOR_LABELS)
+        self.assertNotIn("대화 수정", set(_final_csv.CSV_USER_BEHAVIOR_LABELS.values()))
+        self.assertIn("대화 수정", _final_csv.CSV_TEAM_USER_BEHAVIORS)     # 팀 목록에는 있지만 파서는 내지 않는다
+
+
 if __name__ == "__main__":
     unittest.main()
