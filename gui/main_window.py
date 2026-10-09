@@ -9,9 +9,9 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtCore import QRect, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
-from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPen,
-                         QPixmap, QStandardItem, QStandardItemModel)
+from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
+from PyQt6.QtGui import (QBrush, QColor, QDesktopServices, QFont, QFontMetrics, QLinearGradient,
+                         QPainter, QPen, QStandardItem, QStandardItemModel)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QFileDialog,
                              QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -34,8 +34,6 @@ from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "ARTINEX"                      # 사용자에게 보이는 제품명
 APP_TAGLINE = "Integrated LLM Forensic Analysis"
-LOGO = os.path.join(HERE, "assets", "Logo.png")   # ERELM 로고 원본 (162x150). 절대경로를 적지 않는다
-LOGO_HEIGHT = 44                                  # TopBar 60px 안에서 ERELM 글자까지 읽히는 높이
 STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "BadgeBlue"),
                 "waiting": ("대기", "BadgeNeutral"), "skipped": ("미실행", "BadgeNeutral"),
                 "failed": ("실패", "BadgeRed"), "contract_violation": ("계약 위반", "BadgeRed"),
@@ -146,17 +144,57 @@ def metric_card(label_text, value_text):
     return card
 
 
-def brand_mark(path=LOGO, height=LOGO_HEIGHT):
-    """ERELM 로고 라벨 — 원본 비율 그대로 높이만 맞춘다 (crop·stretch·색 변경 없음).
+class BrandMark(QWidget):
+    """ERELM 로고 심볼 — 원본(Logo.png)의 좌표를 그대로 옮겨 그린 투명 배경 벡터.
 
-    파일을 읽지 못해도 빈 라벨을 돌려준다. 로고 때문에 GUI 가 뜨지 않으면 안 된다.
+    원본 PNG 는 불투명한 어두운 배경을 포함해 header 위에서 사각 타일로 보였다. 같은 모양을
+    배경 없이 그리고, 작은 크기에서 뭉치는 하단 'ERELM' 글자와 블록 주변 빗금은 생략한다.
+    좌표·굵기·색은 Logo.png 를 실측한 값이다 (심볼 bbox x38..111 / y32..107, 링 중심 74,68).
     """
-    label = QLabel()
-    label.setObjectName("BrandMark")
-    pixmap = QPixmap(path)
-    if not pixmap.isNull():
-        label.setPixmap(pixmap.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation))
-    return label
+
+    LIME, TEAL = "#b8db4e", "#68b1ab"      # 원본의 좌(연두)→우(청록) 가로 그라데이션 양 끝
+    BOX = (38.0, 32.0, 74.0, 76.0)         # 원본 좌표계에서 심볼이 차지하는 영역
+    SIZE = 44
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def paintEvent(self, event):
+        left, top, width, height = self.BOX
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        scale = min(self.width(), self.height()) / max(width, height)
+        painter.translate((self.width() - width * scale) / 2, (self.height() - height * scale) / 2)
+        painter.scale(scale, scale)
+        painter.translate(-left, -top)
+
+        gradient = QLinearGradient(left, 0, left + width, 0)
+        gradient.setColorAt(0, QColor(self.LIME))
+        gradient.setColorAt(1, QColor(self.TEAL))
+        brush = QBrush(gradient)
+
+        def stroke(thickness, cap=Qt.PenCapStyle.FlatCap):
+            painter.setPen(QPen(brush, thickness, cap=cap))
+
+        ring = QRectF(41.5, 35.5, 65.0, 65.0)
+        stroke(7.0)                                            # 바깥 링 — 원본처럼 45°·216° 가 끊겨 있다
+        painter.drawArc(ring, 52 * 16, 158 * 16)
+        painter.drawArc(ring, 222 * 16, 176 * 16)
+        stroke(6.5)
+        painter.drawEllipse(QRectF(51.5, 45.5, 45.0, 45.0))    # 안쪽 링
+        stroke(7.0, Qt.PenCapStyle.RoundCap)
+        painter.drawLine(QPointF(51.5, 58.0), QPointF(51.5, 80.0))          # E 세로 기둥
+        stroke(6.5, Qt.PenCapStyle.RoundCap)
+        for y, right in ((58.0, 79.0), (69.0, 74.0), (80.0, 79.0)):         # E 가로 3줄 (가운데가 짧다)
+            painter.drawLine(QPointF(51.5, y), QPointF(right, y))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(brush)
+        painter.drawRoundedRect(QRectF(80.0, 63.0, 11.5, 11.5), 2.5, 2.5)   # 데이터 블록
+        stroke(8.0, Qt.PenCapStyle.RoundCap)
+        painter.drawLine(QPointF(100.0, 94.0), QPointF(108.0, 102.0))       # 돋보기 손잡이
+        painter.end()
 
 
 class StatusRow(QWidget):
@@ -783,7 +821,7 @@ class MainWindow(QWidget):
         row.setContentsMargins(16, 8, 16, 8)       # 로고 44px 가 들어가도 TopBar 높이 60px 유지
         row.setSpacing(14)
 
-        row.addWidget(brand_mark(), 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(BrandMark(), 0, Qt.AlignmentFlag.AlignVCenter)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
