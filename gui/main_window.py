@@ -1,4 +1,4 @@
-"""elelem LLM Forensic Parser — PyQt6 메인 윈도우.
+"""ARTINEX — PyQt6 메인 윈도우 (ERELM 팀 LLM Forensic Parser GUI).
 
 흐름: Case Setup → Evidence Setup → Analysis Progress → Results Workspace.
 결과는 기존 통합 Runner 가 만든 파일에서만 읽는다. GUI 는 새 포렌식 판정을 만들지 않는다.
@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtCore import QRect, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
+from PyQt6.QtCore import QPointF, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QUrl, pyqtSlot
 from PyQt6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPen,
                          QStandardItem, QStandardItemModel)
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -32,7 +32,8 @@ from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
                            message_source, service_label)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEAM = "elelem"
+APP_NAME = "ARTINEX"                      # 사용자에게 보이는 제품명
+APP_TAGLINE = "Integrated LLM Forensic Analysis"
 STATUS_BADGE = {"success": ("완료", "BadgeGreen"), "running": ("진행", "BadgeBlue"),
                 "waiting": ("대기", "BadgeNeutral"), "skipped": ("미실행", "BadgeNeutral"),
                 "failed": ("실패", "BadgeRed"), "contract_violation": ("계약 위반", "BadgeRed"),
@@ -141,6 +142,42 @@ def metric_card(label_text, value_text):
     box.addWidget(value)
     box.addWidget(caption)
     return card
+
+
+class BrandMark(QWidget):
+    """상단 브랜드 심볼 — ERELM 로고(링 + E 형태 가로선 + 데이터 블록 + 돋보기 손잡이)를 단순화한 벡터 그림.
+
+    40px 에서 형태가 남도록 요소를 4개로 줄였다 (링·가로선 3줄·블록 2개·손잡이).
+    색은 현재 테마의 cyan 과 lime 두 가지만 쓴다 (gradient·glow 없음).
+    """
+
+    RING = "#b5e853"        # lime — 링 위쪽
+    ACCENT = "#4cc2d6"      # cyan — 링 아래쪽·가로선·손잡이 (TopBar 기존 accent)
+    SIZE = 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        scale = self.width() / float(self.SIZE)       # 40px 기준으로 그리고 위젯 크기에 맞춘다
+        painter.scale(scale, scale)
+        ring = QRectF(4.5, 4.5, 25.0, 25.0)
+        for color, start, span in ((self.RING, 20, 145), (self.ACCENT, 165, 140)):
+            painter.setPen(QPen(QColor(color), 2.6, cap=Qt.PenCapStyle.RoundCap))
+            painter.drawArc(ring, start * 16, span * 16)   # 오른쪽 아래 75° 는 비워 손잡이로 이어진다
+        painter.setPen(QPen(QColor(self.ACCENT), 2.0, cap=Qt.PenCapStyle.RoundCap))
+        for y, width in ((12.6, 9.0), (17.0, 6.5), (21.4, 9.0)):   # E 를 연상시키는 3줄
+            painter.drawLine(QPointF(10.0, y), QPointF(10.0 + width, y))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(self.RING))
+        for y in (13.4, 19.4):                                     # 오른쪽 데이터 블록
+            painter.drawRect(QRectF(21.6, y, 3.4, 3.4))
+        painter.setPen(QPen(QColor(self.ACCENT), 3.4, cap=Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(26.0, 26.0), QPointF(34.0, 34.0))  # 돋보기 손잡이
+        painter.end()
 
 
 class StatusRow(QWidget):
@@ -726,7 +763,7 @@ class MainWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("%s LLM Forensic Parser" % TEAM)
+        self.setWindowTitle(APP_NAME)
         self.resize(1480, 920)
         self.case = CaseInfo()
         self.bundle = None
@@ -767,16 +804,14 @@ class MainWindow(QWidget):
         row.setContentsMargins(16, 10, 16, 10)
         row.setSpacing(12)
 
-        logo = QLabel("EL")
-        logo.setObjectName("LogoBox")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        row.addWidget(logo)
+        row.addWidget(BrandMark(), 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addSpacing(4)
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
-        title = QLabel("%s LLM Forensic Parser" % TEAM)
+        title = QLabel(APP_NAME)
         title.setObjectName("AppTitle")
-        subtitle = QLabel("Integrated LLM Artifact Analysis")
+        subtitle = QLabel(APP_TAGLINE)
         subtitle.setObjectName("AppSubtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)

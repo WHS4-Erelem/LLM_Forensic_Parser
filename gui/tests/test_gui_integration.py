@@ -7,7 +7,7 @@ r"""GUI ↔ 통합 파서 연결 회귀 테스트 (Qt 위젯 없이 adapter·loa
   - 부분 실패(exit=1) 에서도 결과를 읽을 수 있고, warning 과 failed 를 섞지 않는다
   - GUI 가 포렌식 값을 만들지 않는다 (Timestamp "-" · volume_ref · artifact_path_normalized 원본 유지)
 
-실행: integration\.venv312\Scripts\python.exe -m unittest discover -s gui/tests
+실행: python -m unittest discover -s gui/tests   (PyQt6 가 설치된 GUI 실행 환경에서)
 """
 from __future__ import annotations
 
@@ -428,6 +428,43 @@ class PluginIsolationTest(unittest.TestCase):
         self.assertIn("llm_forensic.py", text)
         for parser_entry in ("chatgpt_web_parser.py", "claude_web", "gemini", "lmstudio_parser"):
             self.assertNotIn(parser_entry + ".py", text)
+
+
+class BrandingTest(unittest.TestCase):
+    """상단 브랜딩이 ARTINEX 로 보이고 심볼 위젯이 만들어진다."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        from main_window import APP_NAME, APP_TAGLINE, BrandMark, MainWindow
+        cls.names = (APP_NAME, APP_TAGLINE)
+        cls.BrandMark, cls.window = BrandMark, MainWindow()
+
+    def test_window_title_is_the_product_name(self):
+        self.assertEqual(self.window.windowTitle(), "ARTINEX")
+
+    def test_header_shows_the_product_name_and_tagline(self):
+        from PyQt6.QtWidgets import QLabel
+        texts = [w.text() for w in self.window.findChildren(QLabel)]
+        self.assertIn("ARTINEX", texts)
+        self.assertIn("Integrated LLM Forensic Analysis", texts)
+        self.assertEqual(self.names, ("ARTINEX", "Integrated LLM Forensic Analysis"))
+
+    def test_brand_mark_replaces_the_text_badge(self):
+        marks = self.window.findChildren(self.BrandMark)
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(marks[0].size().width(), 40)
+        self.assertEqual(marks[0].size().height(), 40)
+
+    def test_brand_mark_draws_without_error(self):
+        from PyQt6.QtGui import QPixmap
+        pixmap = QPixmap(40, 40)                      # paintEvent 가 실제로 그려지는지 (좌표·펜 오류 검출)
+        pixmap.fill()
+        mark = self.BrandMark()
+        mark.render(pixmap)
+        self.assertFalse(pixmap.isNull())
 
 
 if __name__ == "__main__":

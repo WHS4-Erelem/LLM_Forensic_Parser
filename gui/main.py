@@ -1,4 +1,4 @@
-"""elelem LLM Forensic Parser GUI 진입점.
+"""ARTINEX GUI 진입점 (ERELM 팀 LLM Forensic Parser).
 
     python gui/main.py
 
@@ -30,7 +30,7 @@ def load_stylesheet(path=QSS):
 
 def main(argv=None):
     app = QApplication(argv if argv is not None else sys.argv)
-    app.setApplicationName("elelem LLM Forensic Parser")
+    app.setApplicationName("ARTINEX")
     app.setStyle("Fusion")                   # QSS 가 플랫폼 테마에 덜 흔들리게
     app.setStyleSheet(load_stylesheet())
     window = MainWindow()
