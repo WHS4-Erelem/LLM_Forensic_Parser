@@ -594,6 +594,41 @@ def lmstudio_log_path(ctx: AnalysisContext, path: str) -> bool:
     )
 
 
+_HOST_MFT: dict[str, Any] = {}
+
+
+def host_ntfs_record(ctx: AnalysisContext, path: Path) -> Any | None:
+    """Folder input from a host DFIR tool (Autopsy): _host_metadata.json (path -> MFT record/sequence) plus the
+    original $MFT at the input root give the same NTFS record an image input would read. None otherwise."""
+    root = ctx.input_path
+    if ctx.live or not root.is_dir():
+        return None
+    key = str(root)
+    if key not in _HOST_MFT:
+        _HOST_MFT[key] = None
+        meta, mft = root / "_host_metadata.json", root / "$MFT"
+        if meta.is_file() and mft.is_file():
+            try:
+                from dissect.ntfs import NTFS
+                entries = json.loads(meta.read_text(encoding="utf-8")).get("entries") or {}
+                _HOST_MFT[key] = (NTFS(mft=mft.open("rb")).mft, entries)
+            except ImportError:
+                ctx.issue("mft_dependency_missing", str(mft), "$MFT 분석용 Dissect dependency가 설치되지 않음")
+    host = _HOST_MFT[key]
+    if host is None:
+        return None
+    try:
+        entry = host[1].get("/" + path.resolve().relative_to(root.resolve()).as_posix().lower())
+        if not entry or entry.get("mft_record") is None:
+            return None
+        record = host[0].get(entry["mft_record"])
+        if entry.get("mft_seq") is not None and int(record.header.SequenceNumber) != entry["mft_seq"]:
+            return None                                   # record reused since the host read it
+        return record
+    except Exception:
+        return None
+
+
 def add_local_file(ctx: AnalysisContext, path: Path, logical_path: str | None = None) -> None:
     try:
         st = path.stat()
@@ -625,13 +660,17 @@ def add_local_file(ctx: AnalysisContext, path: Path, logical_path: str | None = 
     birth = getattr(st, "st_birthtime", None)
     if birth is None and os.name == "nt":
         birth = st.st_ctime
+    record = host_ntfs_record(ctx, path)
+    created, modified = ntfs_record_times(record) if record is not None else (None, None)
     artifact = ArtifactRecord(
         artifact_id=stable_id(ctx.source_image, original, str(size)),
         path=original,
-        provenance=Provenance(ctx.source_image, original, "", "file",
+        provenance=Provenance(ctx.source_image, original, "", ntfs_locator(record) if record is not None else "file",
                               "content:" + hashlib.sha256(content).hexdigest() if content else ""),
-        kind="file",
+        kind="ntfs_file" if record is not None else "file",
         size=size,
+        created=created,
+        modified=modified,
         content=content,
         metadata={"collection_birthtime": birth, "collection_mtime_ns": st.st_mtime_ns,
                   "collection_ctime_ns": st.st_ctime_ns},
@@ -3715,6 +3754,14 @@ def analyze(input_path: Path, before_path: Path | None = None,
         collect_directory(ctx)
         collect_standalone_mft(ctx)
         collect_preparsed_history(ctx)
+        mft_copy, usn_copy = input_path / "$MFT", input_path / "$Extend" / "$UsnJrnl:$J"
+        if mft_copy.is_file() and usn_copy.is_file():   # 호스트 도구(Autopsy 등)가 넘긴 원본 $MFT·$J — 이미지 입력과 같은 USN 수집
+            try:
+                from dissect.ntfs import NTFS
+                with mft_copy.open("rb") as mft_fh, usn_copy.open("rb") as usn_fh:
+                    collect_ntfs_usn(ctx, NTFS(mft=mft_fh, usnjrnl=usn_fh), 0)
+            except ImportError:
+                ctx.issue("usn_dependency_missing", str(usn_copy), "$UsnJrnl 분석용 Dissect dependency가 설치되지 않음")
     elif input_path.is_file():
         add_local_file(ctx, input_path)
         collect_preparsed_history(ctx)

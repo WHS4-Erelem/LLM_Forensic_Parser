@@ -10,6 +10,7 @@
   - USN 시각은 저널 기록 시각이며 사용자 행위 시각과 같다고 단정하지 않는다.
 """
 
+import os
 import re
 import struct
 from datetime import datetime, timedelta, timezone
@@ -116,7 +117,20 @@ def read_journal(fs, chunk=4 << 20, max_bytes=None):
                  and int(a.info.type) == int(pytsk3.TSK_FS_ATTR_TYPE_NTFS_DATA)), None)
     if attr is None:
         raise FileNotFoundError("$UsnJrnl:$J 스트림을 찾지 못함")
-    size = attr.info.size
+    return _scan(lambda off, n: f.read_random(off, n, pytsk3.TSK_FS_ATTR_TYPE_NTFS_DATA, attr.info.id),
+                 attr.info.size, chunk, max_bytes)
+
+
+def read_journal_file(path, chunk=4 << 20, max_bytes=None):
+    """호스트 도구(Autopsy 등)가 원본 그대로 꺼내 준 $J 스트림 사본 — 폴더 입력용. read_journal 과 같은 결과."""
+    with open(path, "rb") as fh:
+        def read_at(off, n):
+            fh.seek(off)
+            return fh.read(n)
+        return _scan(read_at, os.fstat(fh.fileno()).st_size, chunk, max_bytes)
+
+
+def _scan(read_at, size, chunk, max_bytes):
     limit = min(size, max_bytes) if max_bytes else size
     out, scanned, tail = [], 0, b""
     first_ts = last_ts = None      # 저널이 덮는 시간 범위 — "0건" 이 순환 탓인지 판단할 근거
@@ -124,7 +138,7 @@ def read_journal(fs, chunk=4 << 20, max_bytes=None):
     while off < limit:
         want = min(chunk, limit - off)
         try:
-            buf = f.read_random(off, want, pytsk3.TSK_FS_ATTR_TYPE_NTFS_DATA, attr.info.id)
+            buf = read_at(off, want)
         except OSError:
             break
         if not buf:
