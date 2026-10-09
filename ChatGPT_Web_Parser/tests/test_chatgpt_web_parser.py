@@ -3883,7 +3883,7 @@ class ChromeCacheReaderTest(CacheTestBase):
         text = json.dumps(record.to_dict(), ensure_ascii=False)
         for secret in SECRET_CACHE_VALUES:  # 응답 헤더 (set-cookie 등) · owner · request_id 비출력
             self.assertNotIn(secret, text)
-        # Cache Reader 는 판정하지 않는다. 합성 대화의 variant 분기 → CONVERSATION_RETRY, user 메시지 → PROMPT_SEND (CANDIDATE).
+        # Cache Reader 는 판정하지 않는다. 합성 대화의 variant 분기 → CONVERSATION_RETRY, user 메시지 → PROMPT_SEND.
         self.assertEqual([e.action for e in p.detect(records)], ["CONVERSATION_RETRY", "PROMPT_SEND"])
 
     def test_identity_and_unsupported_encoding(self):
@@ -7089,6 +7089,9 @@ def cache_record(nodes, *, record_id="c1", conversation_id=NEW_RULE_CONV_ID, sou
     """mapping node 목록 → Cache 대화 응답 Record (Reader 가 만드는 구조와 같은 모양)."""
     observed = {"url": f"https://chatgpt.com/backend-api/conversation/{conversation_id}",
                 "cache_key_kind": "conversation_response", "url_conversation_id": conversation_id,
+                # Reader 가 본문까지 복구한 응답에 남기는 값 (판정 정책의 '서버 응답 사본' 조건)
+                "http_status": 200, "content_type": "application/json", "content_encoding": "br",
+                "body_length": 120, "body_sha256": "0" * 64, "decoded_length": 240, "decoded_sha256": "1" * 64,
                 "conversation": {"conversation_id": conversation_id, "title": "합성 대화",
                                  "mapping": list(nodes)}}
     observed.update(observed_extra)
@@ -7119,6 +7122,14 @@ def ls_record(key_kind, observed, *, record_id="l1", sequence=10, utc="2026-08-2
 
 
 class NewRuleAssertMixin:
+    def assert_confirmed(self, event, action, rule_id, confidence):
+        """서버 응답 사본 근거 → 확정(DETECTED). Rule 검증 수준은 그대로 PARTIALLY_VERIFIED 다."""
+        self.assertEqual((event.action, event.finding_type, event.action_status, event.confidence, event.rule_id,
+                          event.rule_verification),
+                         (action, "USER_ACTION", "DETECTED", confidence, rule_id, "PARTIALLY_VERIFIED"))
+        self.assertIn("SERVER_RESPONSE_COPY", event.confidence_reason)
+        self.assertTrue(event.limitations and event.inference)
+
     def assert_candidate(self, event, action, rule_id, confidence):
         self.assertEqual((event.action, event.finding_type, event.action_status, event.confidence, event.rule_id,
                           event.rule_verification),
@@ -7128,10 +7139,10 @@ class NewRuleAssertMixin:
 
 
 class PromptSendRuleTest(NewRuleAssertMixin, unittest.TestCase):
-    def test_user_message_creates_candidate_with_message_time(self):
+    def test_user_message_from_server_response_copy_is_confirmed(self):
         events = p.detect_prompt_send([cache_record([msg_node("m-user", "user")])])
         self.assertEqual(len(events), 1)
-        self.assert_candidate(events[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "MEDIUM")
+        self.assert_confirmed(events[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "MEDIUM")
         self.assertEqual((events[0].timestamp_raw, events[0].timestamp_kst, events[0].device_attribution),
                          ("1787221050.0", "2026-08-20T19:17:30+09:00", "SERVER_SIDE_CACHE"))
         self.assertEqual(events[0].primary_evidence[0].evidence_level, "SUPPORTING")  # DIRECT 아님
@@ -7142,6 +7153,7 @@ class PromptSendRuleTest(NewRuleAssertMixin, unittest.TestCase):
         self.assertNotIn("합성 본문", text)
 
     def test_missing_message_time_drops_confidence_to_low(self):
+        """시각을 확인하지 못하면 근거 유형과 무관하게 CANDIDATE 다 (다른 Rule 과 같은 기준)."""
         events = p.detect_prompt_send([cache_record([msg_node("m-user", "user", create_time=None)])])
         self.assert_candidate(events[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "LOW")
         self.assertIsNone(events[0].timestamp_utc)  # 시각을 만들어 내지 않는다
@@ -7169,12 +7181,102 @@ class PromptSendRuleTest(NewRuleAssertMixin, unittest.TestCase):
         self.assert_candidate(events[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "LOW")
         self.assertIn("DRAFT_CLEARED_AFTER_NON_EMPTY", events[0].confidence_reason)
         with_message = p.detect_prompt_send(drafts + [cache_record([msg_node("m-user", "user")])])
-        self.assertEqual([e.confidence_reason[1] for e in with_message], ["USER_MESSAGE_PRESENT"])
+        self.assertEqual([("USER_MESSAGE_PRESENT" in e.confidence_reason) for e in with_message], [True])
 
     def test_empty_then_non_empty_draft_is_not_an_event(self):
         self.assertEqual(p.detect_prompt_send(
             [ls_record("conversation_drafts", {"drafts": []}, record_id="l1", sequence=10),
              ls_record("conversation_drafts", {"drafts": [{"id": "d1"}]}, record_id="l2", sequence=20)]), [])
+
+
+# --- 근거 유형 판정 정책: "서버가 반환한 응답의 사본" = 확정 (팀 최종 기준 2026-10-09) ---------
+# 적용 조건은 두 가지가 모두 성립할 때뿐이다: Rule 이 server_response_copy 를 선언하고,
+# Record 가 실제로 본문까지 복구된 대화 API 응답일 것. Cache 라는 이유만의 일괄 승격은 없다.
+
+class ServerResponseCopyPolicyTest(NewRuleAssertMixin, unittest.TestCase):
+    def test_recovered_conversation_response_is_a_server_response_copy(self):
+        self.assertTrue(p.is_server_response_copy(cache_record([msg_node("m-user", "user")])))
+
+    def test_url_or_header_only_entry_is_not_a_server_response_copy(self):
+        """URL 만 남은 entry · header 만 있는 entry — 본문이 없으므로 확정 근거가 아니다."""
+        for missing in ("conversation", "decoded_sha256"):
+            record = cache_record([msg_node("m-user", "user")])
+            record.observed.pop(missing)
+            self.assertFalse(p.is_server_response_copy(record), missing)
+
+    def test_decode_or_json_failure_is_not_a_server_response_copy(self):
+        record = cache_record([])                      # Reader 는 실패하면 conversation 을 넣지 않는다
+        record.observed.pop("conversation")
+        record.observed["decoded_sha256"] = None
+        record.warnings = [p.CACHE_BODY_NOT_JSON]
+        self.assertFalse(p.is_server_response_copy(record))
+
+    def test_non_200_response_is_not_a_server_response_copy(self):
+        self.assertFalse(p.is_server_response_copy(
+            cache_record([msg_node("m-user", "user")], http_status=404)))
+
+    def test_other_cache_entries_are_not_server_response_copies(self):
+        """목록 API · 정적 리소스 등 대화 응답이 아닌 Cache entry."""
+        for kind in ("conversation_list", "static_resource", None):
+            self.assertFalse(p.is_server_response_copy(
+                cache_record([msg_node("m-user", "user")], cache_key_kind=kind)), kind)
+
+    def test_non_cache_records_are_never_server_response_copies(self):
+        self.assertFalse(p.is_server_response_copy(make_record()))
+        self.assertFalse(p.is_server_response_copy(
+            ls_record("conversation_drafts", {"drafts": [{"id": "d1"}]})))
+
+    def test_cache_backed_inference_rules_stay_candidate(self):
+        """같은 '서버 응답 사본' Record 를 써도 전이·부재를 추론하는 Rule 은 확정으로 올라가지 않는다."""
+        copies = [cache_record([msg_node("m-user", "user", attachments=[local_attachment("file-a")])],
+                               record_id="c1", utc="2026-08-20T10:00:00Z"),
+                  cache_record([msg_node("m-user", "user", attachments=[])], record_id="c2",
+                               source_path="Default/Cache/data_2", utc="2026-08-20T11:00:00Z")]
+        self.assert_candidate(p.detect_file_upload_delete(copies)[0], "FILE_UPLOAD_DELETE",
+                              "CHATGPT_FILE_UPLOAD_DELETE_001", "LOW")
+        models = [cache_record([msg_node("m-a1", "assistant", model_slug="gpt-4o", create_time=1787221050.0),
+                                msg_node("m-a2", "assistant", model_slug="gpt-5", create_time=1787221150.0)])]
+        self.assert_candidate(p.detect_model_change(models)[0], "MODEL_CHANGE",
+                              "CHATGPT_MODEL_CHANGE_001", "MEDIUM")
+
+    def test_draft_cleared_transition_is_never_promoted(self):
+        events = p.detect_prompt_send(
+            [ls_record("conversation_drafts", {"drafts": [{"id": "d1"}]}, record_id="l1", sequence=10),
+             ls_record("conversation_drafts", {"drafts": []}, record_id="l2", sequence=20)])
+        self.assert_candidate(events[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "LOW")
+        self.assertNotIn("SERVER_RESPONSE_COPY", events[0].confidence_reason)
+
+    def test_confirmed_prompt_send_keeps_its_timestamp_and_limitations(self):
+        """확정되는 것은 전송 사실이다 — 시각·단말에 대한 한계와 대표 시각은 그대로다."""
+        event = p.detect_prompt_send([cache_record([msg_node("m-user", "user")])])[0]
+        self.assertEqual((event.timestamp_kst, event.device_attribution, event.timestamp_source),
+                         ("2026-08-20T19:17:30+09:00", "SERVER_SIDE_CACHE",
+                          "Cache.conversation.mapping[].message.create_time"))
+        self.assertTrue(any("전송 시각 자체의 근거가 아니다" in text for text in event.limitations))
+
+    def test_final_csv_verdict_of_a_server_response_copy_is_confirmed(self):
+        event = p.detect_prompt_send([cache_record([msg_node("m-user", "user")])])[0]
+        self.assertEqual(_final_csv._timeline_row(event)["Verdict"], "확정")
+
+
+class ServerResponseCopyEndToEndTest(CacheTestBase, NewRuleAssertMixin):
+    """합성 Blockfile Cache → Reader → detect: 실제 복구 경로에서도 확정이 나오는지."""
+
+    def test_prompt_send_from_a_real_cache_read_is_confirmed(self):
+        build_blockfile_cache(self.cache_dir, self.noise_entries() + [self.conversation_entry()])
+        records, coverage = self.read()
+        self.assertEqual((coverage.status, coverage.record_count), ("PARSED", 1))
+        self.assertTrue(p.is_server_response_copy(records[0]))
+        sends = [e for e in p.detect(records) if e.action == "PROMPT_SEND"]
+        self.assertEqual(len(sends), 1)
+        self.assert_confirmed(sends[0], "PROMPT_SEND", "CHATGPT_PROMPT_SEND_001", "MEDIUM")
+
+    def test_unreadable_body_keeps_the_event_out_entirely(self):
+        """본문을 해제하지 못한 응답은 확정도 의심도 아니다 — PROMPT_SEND 자체가 생기지 않는다."""
+        build_blockfile_cache(self.cache_dir, [self.conversation_entry(body=b"gz", info=http_info("gzip"))])
+        records, _ = self.read()
+        self.assertFalse(p.is_server_response_copy(records[0]))
+        self.assertEqual([e for e in p.detect(records) if e.action == "PROMPT_SEND"], [])
 
 
 class FileUploadDeleteRuleTest(NewRuleAssertMixin, unittest.TestCase):
@@ -7568,6 +7670,7 @@ class NewRuleRegressionTest(unittest.TestCase):
                          [("LOGOUT", "DETECTED", "HIGH")])
 
     def test_heuristic_rules_never_return_high_confidence(self):
+        """heuristic Rule 은 HIGH 를 쓰지 않는다. 확정은 서버 응답 사본 근거를 선언한 Rule 에만 허용된다."""
         records = [cache_record([msg_node("m-user", "user", model_slug="gpt-4o")]),
                    make_record(observed={"url": "https://chatgpt.com/share/abcd"})]
         heuristic = {"CHATGPT_PROMPT_SEND_001", "CHATGPT_SHARE_LINK_001", "CHATGPT_MODEL_CHANGE_001",
@@ -7577,8 +7680,12 @@ class NewRuleRegressionTest(unittest.TestCase):
         found = [e for e in p.detect(records, []) if e.rule_id in heuristic]
         self.assertTrue(found)
         for event in found:
-            self.assertEqual(event.action_status, "CANDIDATE")
+            confirmed = "SERVER_RESPONSE_COPY" in event.confidence_reason
+            self.assertEqual(event.action_status, "DETECTED" if confirmed else "CANDIDATE")
             self.assertNotEqual(event.confidence, "HIGH")
+        # 승격은 PROMPT_SEND 하나뿐이다 — Cache 근거를 쓰는 나머지 Rule 은 그대로 CANDIDATE
+        self.assertEqual(sorted(e.rule_id for e in found if e.action_status == "DETECTED"),
+                         ["CHATGPT_PROMPT_SEND_001"])
 
 
 # =============================================================================

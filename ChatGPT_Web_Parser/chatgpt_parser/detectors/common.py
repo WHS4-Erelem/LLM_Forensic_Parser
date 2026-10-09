@@ -296,6 +296,7 @@ REASON_TIMESTAMP_APPROXIMATED = "TIMESTAMP_APPROXIMATED"
 #   - HIGH 는 쓰지 않는다 (어느 Rule 도 controlled experiment 로 검증되지 않았다).
 #   - 시각을 만들어 내지 않는다. 변환 가능한 시각이 없으면 Event 의 시각은 비워 두고 TIMESTAMP_MISSING 을 남긴다.
 REASON_HEURISTIC_RULE = "HEURISTIC_RULE"
+REASON_SERVER_RESPONSE_COPY = "SERVER_RESPONSE_COPY"
 REASON_MULTIPLE_SUPPORTING_SIGNALS = "MULTIPLE_SUPPORTING_SIGNALS"
 _HEURISTIC_COMMON_LIMITATIONS = (
     "이 Rule 은 controlled experiment 로 검증되지 않았다 — 같은 흔적을 만드는 다른 원인을 배제하지 못한다 (NEEDS_VERIFICATION)",
@@ -303,16 +304,40 @@ _HEURISTIC_COMMON_LIMITATIONS = (
 )
 
 
+def is_server_response_copy(record: ArtifactRecord) -> bool:
+    """이 Record 가 '서버가 반환한 응답의 사본' 인가 — 본문까지 복구된 Cache 의 대화 API 응답만 True.
+
+    팀 최종 판정 기준(2026-10-09)의 확정 근거 유형이다. Cache 라는 것만으로는 True 가 아니다:
+    URL 만 남은 entry · header 만 있는 entry · 본문 읽기/brotli/JSON 실패 · 목록 API · 정적 리소스는
+    conversation 본문이 없으므로 모두 False 가 된다 (Reader 가 그런 Record 에는 conversation 을 넣지 않는다).
+    """
+    observed = record.observed
+    return (record.artifact_type == "cache"
+            and observed.get("cache_key_kind") == "conversation_response"
+            and observed.get("http_status") == 200
+            and bool(observed.get("decoded_sha256"))          # 본문을 실제로 해제했다
+            and isinstance(observed.get("conversation"), dict))
+
+
 def _candidate_event(*, rule_id: str, action: str, event_id: str, record: ArtifactRecord,
                      primary: EvidenceItem, supporting: list[EvidenceItem], timestamp: dict[str, Any],
                      reasons: list[str], inference: str, limitations: list[str],
                      confidence: str = "LOW", device_attribution: str = "UNKNOWN",
-                     warnings: list[str] | None = None) -> Event:
-    """heuristic Rule 공통 Event 생성. action_status 는 CANDIDATE 고정이고 HIGH 는 쓰지 않는다."""
+                     warnings: list[str] | None = None, server_response_copy: bool = False) -> Event:
+    """heuristic Rule 공통 Event 생성. 기본 action_status 는 CANDIDATE 이고 HIGH 는 쓰지 않는다.
+
+    server_response_copy=True 는 "행위의 결과물이 서버 응답 본문에 그대로 들어 있다" 고 Rule 이 선언한 경우에만
+    쓴다. 그때도 Record 가 실제로 복구된 대화 API 응답일 때만(is_server_response_copy) 확정으로 올린다 —
+    Cache 라는 이유만으로 올리는 일괄 승격은 하지 않는다. 시각을 확인하지 못한 Event(LOW)는 올리지 않는다.
+    """
     if confidence not in ("LOW", "MEDIUM"):
         raise ValueError(f"heuristic rule confidence must be LOW/MEDIUM, got {confidence!r}")
+    confirmed = server_response_copy and confidence != "LOW" and is_server_response_copy(record)
+    if confirmed:
+        reasons = [REASON_SERVER_RESPONSE_COPY] + list(reasons)
     return Event(
-        event_id=event_id, finding_type="USER_ACTION", action=action, action_status="CANDIDATE",
+        event_id=event_id, finding_type="USER_ACTION", action=action,
+        action_status="DETECTED" if confirmed else "CANDIDATE",
         timestamp_raw=timestamp.get("timestamp_raw"), timestamp_utc=timestamp.get("timestamp_utc"),
         timestamp_kst=timestamp.get("timestamp_kst"), timestamp_type=timestamp.get("timestamp_type", "unknown"),
         timestamp_source=timestamp.get("timestamp_source"),
