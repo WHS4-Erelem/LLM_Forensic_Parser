@@ -33,13 +33,33 @@ _LABEL_TO_STATUS = {"OK": "success", "FAILED": "failed", "CONTRACT_VIOLATION": "
                     "OUTPUT_ERROR": "output_error"}
 
 
-def registry_parsers(path=REGISTRY):
-    """[(parser_id, model)] — 레지스트리에 실제로 등록된 파서만. 이름을 GUI 에 하드코딩하지 않는다."""
+def _registry(path=REGISTRY):
     import json
     with open(path, encoding="utf-8") as fh:
-        reg = json.load(fh)
-    return [(p["name"], p.get("model", p["name"])) for p in reg.get("parsers", [])
+        return json.load(fh)
+
+
+def registry_parsers(path=REGISTRY):
+    """[(parser_id, model)] — 레지스트리에 실제로 등록된 파서만. 이름을 GUI 에 하드코딩하지 않는다."""
+    return [(p["name"], p.get("model", p["name"])) for p in _registry(path).get("parsers", [])
             if p.get("enabled", True)]
+
+
+def parsers_skipping(image, path=REGISTRY):
+    """이 이미지 확장자를 레지스트리 inputs 에 선언하지 않은 파서 이름 — 통합기가 UNSUPPORTED_INPUT 으로 건너뛴다.
+
+    판단 기준은 llm_forensic.py run_parser() 와 같다 (inputs 가 비어 있으면 검사하지 않는다).
+    확장자로 결과를 바꾸지 않고, 실행 전에 어느 파서가 건너뛰는지만 미리 알려 주기 위한 것이다.
+    """
+    ext = os.path.splitext(image)[1].lower()
+    skipped = []
+    for p in _registry(path).get("parsers", []):
+        if not p.get("enabled", True):
+            continue
+        inputs = [str(s).lower() for s in p.get("inputs", [])]
+        if inputs and ext not in inputs:
+            skipped.append(p["name"])
+    return skipped
 
 
 class IntegrationRunner(QObject):
@@ -93,6 +113,7 @@ class IntegrationRunner(QObject):
         if self.is_running():
             self.logLine.emit("[GUI] 사용자 요청으로 분석을 중단합니다 (원본 증거는 변경되지 않습니다)")
             self._proc.kill()
+            self._proc.waitForFinished(3000)   # 창을 닫는 중이면 자식 프로세스가 끝난 것을 확인하고 나간다
 
     # ------------------------------------------------------------ internals
     def _on_output(self):

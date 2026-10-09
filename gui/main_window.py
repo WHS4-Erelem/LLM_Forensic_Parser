@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QChe
                              QTextBrowser, QVBoxLayout, QWidget)
 
 from case_manager import CaseInfo
-from integration_runner import EXIT_MEANING, RUNNER, IntegrationRunner, registry_parsers
+from integration_runner import EXIT_MEANING, RUNNER, IntegrationRunner, parsers_skipping, registry_parsers
 from result_loader import (CONVERSATIONS_CSV, DISPLAY_NAMES, EMPTY, REPORT_JSON,
                            ST_COMPLETED, ST_CONTRACT_VIOLATION, ST_DB_ERROR,
                            ST_NORMALIZATION_ERROR, ST_OUTPUT_ERROR,
@@ -1353,6 +1353,11 @@ class MainWindow(QWidget):
             "경로 확인됨" if ok_image else ("파일이 없음" if image else "이미지를 선택하세요"))
 
         kind, detail = self._image_kind(image) if ok_image else ("", "이미지 선택 후 확인")
+        # 확장자를 inputs 에 선언하지 않은 파서는 통합기가 UNSUPPORTED_INPUT 으로 건너뛴다 → 실행 전에 알려 준다.
+        # 목록은 parsers.json 에서 읽고, 실행을 막거나 결과를 바꾸지는 않는다 (DD 는 확장자가 자유롭다).
+        skipped = parsers_skipping(image) if ok_image else []
+        if skipped:
+            detail += " · 이 확장자를 지원 목록에 두지 않은 파서는 건너뜁니다 (%s)" % ", ".join(skipped)
         self.validation_rows["signature"].set_status("success" if kind else "waiting", detail)
 
         ok_out = bool(out_dir) and self._out_writable(out_dir)

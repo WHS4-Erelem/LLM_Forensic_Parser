@@ -95,6 +95,27 @@ class RunnerCommandTest(unittest.TestCase):
                                        {"name": "b", "model": "b", "enabled": False}]}, fh)
             self.assertEqual(ir.registry_parsers(path), [("a", "a")])
 
+    def test_parsers_skipping_follows_the_registry_inputs(self):
+        """inputs 를 선언한 파서만 확장자 검사 대상 — 판단 기준은 llm_forensic.py run_parser() 와 같다."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "parsers.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"parsers": [
+                    {"name": "any", "model": "any"},                            # inputs 없음 → 검사 안 함
+                    {"name": "img_only", "model": "m", "inputs": [".e01", ".dd"]},
+                    {"name": "off", "model": "m", "enabled": False, "inputs": [".e01"]},
+                ]}, fh)
+            self.assertEqual(ir.parsers_skipping(r"C:\x\evidence.E01", path), [])
+            self.assertEqual(ir.parsers_skipping(r"C:\x\evidence.dd", path), [])
+            self.assertEqual(ir.parsers_skipping(r"C:\x\evidence.001", path), ["img_only"])
+            self.assertEqual(ir.parsers_skipping(r"C:\x\evidence", path), ["img_only"])
+
+    def test_real_registry_skips_nothing_for_e01_and_dd(self):
+        """GUI 파일 선택창이 권하는 E01·DD 는 등록된 파서가 모두 받는다 (지원하지 않는 형식을 권하지 않는다)."""
+        for name in ("evidence.E01", "evidence.dd"):
+            with self.subTest(name=name):
+                self.assertEqual(ir.parsers_skipping(name), [])
+
 
 class ConsoleLineTest(unittest.TestCase):
     """stdout 한 줄씩 보내 상태 신호가 최신 출력 형식과 맞는지 (QProcess 없이 _handle_line 만)."""
@@ -109,6 +130,23 @@ class ConsoleLineTest(unittest.TestCase):
         self.runner.stageChanged = _Signal(self.seen, "stage")
         self.runner.parserStatus = _Signal(self.seen, "parser")
         self.runner.evidenceInfo = _Signal(self.seen, "evidence")
+
+    def test_cancel_kills_and_waits_for_the_child_process(self):
+        """창을 닫으며 중단할 때 자식 프로세스가 끝난 것을 확인하고 나간다 (고아 프로세스 방지)."""
+        calls = []
+
+        class _Proc:                                       # QProcess 대역 — 실행 중 상태만 흉내낸다
+            def state(self):
+                return "Running"
+            def kill(self):
+                calls.append("kill")
+            def waitForFinished(self, msecs):
+                calls.append(("wait", msecs))
+
+        self.runner._proc = _Proc()
+        self.runner.is_running = lambda: True
+        self.runner.cancel()
+        self.assertEqual(calls, ["kill", ("wait", 3000)])
 
     def test_evidence_line_is_reported(self):
         self.runner._handle_line("[Evidence] id=%s kind=dd segments=1 size=64.0GB quick_fp=ab… sha256=-" % EVIDENCE_ID)
