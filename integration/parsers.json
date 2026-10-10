@@ -134,8 +134,10 @@
         "lmstudio_parser.py",
         "{image}",
         "--output",
-        "{out}"
+        "{out}",
+        "--overwrite"
       ],
+      "_args_note": "--overwrite: 파서가 기존 결과가 있으면 _001 형제 폴더로 저장하므로(#26), 통합기가 정한 폴더에 그대로 쓰게 명시한다. 통합기는 실행 전 폴더를 비우지만 의도를 레지스트리에 남긴다",
       "outputs": {
         "timeline": "timeline.csv",
         "conversations": "recovered_conversations.csv"
