@@ -124,9 +124,10 @@ class TskImageVfs:
             vd.update(filesystem="NTFS", cluster_size=fs.info.block_size)
             self.volumes.append((vd, fs))
 
-        # ponytail: 잠긴 볼륨이 있는데 하나도 못 풀었으면 중단한다 — 복구 파티션 같은 평문 NTFS 만 읽고
-        # "앱 미사용" 으로 결론 내리는 것을 막기 위해서다. 평문 OS 볼륨 + 잠긴 데이터 볼륨 조합도 같이 막힌다 (키를 주면 풀림).
-        if self.locked and not any("unlock_method" in vd for vd, _fs in self.volumes):
+        # 잠긴 볼륨이 있어도 읽을 수 있는 볼륨에 Windows 시스템 볼륨(\Users)이 있으면 계속한다 — 평문 OS 볼륨 +
+        # 잠긴 데이터 볼륨 조합이 통째로 막히던 문제(0.3.29). 복구·예약 파티션 같은 평문 NTFS 만 읽히면
+        # "앱 미사용" 으로 잘못 결론 내리지 않도록 그때만 중단한다. 잠긴 볼륨은 pipeline 이 경고로 남긴다.
+        if lock_abort(self.locked, [("unlock_method" in vd, _has_users(fs)) for vd, fs in self.volumes]):
             raise VolumeLockedError(self.locked[0]["reason"], volumes=self.locked)
         if not self.volumes:
             raise UnsupportedFormatError(
@@ -232,6 +233,21 @@ class TskImageVfs:
             "scan_note": ("SCAN_ROOTS 하위 디렉터리 열거(할당/삭제 이름) + 부모가 그 하위인 "
                           "미할당 MFT 엔트리. 부모 디렉터리까지 삭제·재할당된 파일은 경로 복원 불가"),
         }
+
+
+def _has_users(fs):
+    """볼륨 루트에 \\Users 가 있으면 Windows 시스템 볼륨 — 잠긴 볼륨이 따로 있어도 분석할 가치가 있다."""
+    try:
+        fs.open_dir("/Users")
+        return True
+    except TSK_ERRORS:
+        return False
+
+
+def lock_abort(locked, readable):
+    """readable: 읽을 수 있는 볼륨마다 (BitLocker 를 푼 볼륨인가, \\Users 가 있는가).
+    잠긴 볼륨이 있고, 읽을 수 있는 볼륨 중 푼 것도 시스템 볼륨도 없으면(복구·예약 파티션뿐) True = 중단."""
+    return bool(locked) and not any(unlocked or has_users for unlocked, has_users in readable)
 
 
 def _mft_bitmap(fs):
@@ -588,4 +604,9 @@ if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색
         d = DirectoryVfs(td); d.host_meta = {"/users/a/downloads/x": {"size": 1}}
         assert d.host_stat("C:" + win) == {"size": 1} and "drive" not in next(d.iter_files()).location()
     assert _registered_package_roots() is not None                                               # 레지스트리가 없어도 예외 없이 목록
+    locked = [{"offset_bytes": 1}]                                                               # 잠긴 볼륨이 있을 때 중단 여부 (0.3.29)
+    assert lock_abort(locked, [(False, True)]) is False                   # 평문 OS 볼륨(\Users 있음) + 잠긴 데이터 볼륨 → 계속
+    assert lock_abort(locked, [(True, False)]) is False                   # BitLocker 를 푼 볼륨이 있음 → 계속
+    assert lock_abort(locked, [(False, False)]) is True                   # 복구·예약 파티션만 읽힘 → 중단
+    assert lock_abort(locked, []) is True and lock_abort([], [(False, False)]) is False   # 읽힌 볼륨 없음 → 중단 / 잠긴 볼륨 없음 → 계속
     print("vfs self-check ok")

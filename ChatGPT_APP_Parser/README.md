@@ -108,6 +108,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
 타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.29 (2026-10-10, 잠긴 볼륨 하나 때문에 정상 볼륨 분석까지 중단되던 문제): 풀지 못한 BitLocker 볼륨이 있고 BitLocker 를 푼 볼륨이 하나도 없으면 무조건 `VOLUME_LOCKED` 로 중단했다. 평문 OS 볼륨 + 잠긴 데이터 볼륨 구성에서 분석 가능한 OS 볼륨까지 버리는 셈이었다. 이제 읽을 수 있는 볼륨에 Windows 시스템 볼륨(`\Users`)이 있으면 계속 분석하고 잠긴 볼륨은 경고로만 남긴다(`vfs.lock_abort`). 복구·예약 파티션처럼 `\Users` 없는 평문 볼륨만 읽히는 경우는 종전대로 중단한다 — "앱 미사용" 으로 잘못 결론 내리지 않기 위해. 자체 검사(`python -m cxparser.vfs`)에 네 조합 추가. 시나리오 이미지 2장은 잠긴 볼륨이 없어 출력 동일.
 0.3.28 (2026-10-10, 대화 CSV 중복 판정이 다른 대화의 메시지를 지우던 문제): `recovered_conversations.csv` 는 같은 메시지가 rollout 과 SQLite 양쪽에 있을 때 한 행만 두는데, 판정 키가 (역할, 본문, ±2초) 뿐이라 **다른 대화**의 같은 본문(같은 프롬프트를 두 대화에 보낸 경우 등)도 지워졌다. 대화 ID 를 판정에 넣되, 분기 스레드는 rollout(원본 ID)·SQLite(분기 ID)의 ID 가 달라 "같은 대화 ID 이거나 다른 아티팩트" 를 사본 조건으로 한다 — 같은 아티팩트 안의 다른 대화는 남긴다. 자체 검사(`python -m cxparser.output`)에 사본·다른 대화·2초 밖 사례 추가. 시나리오 이미지 2장은 해당 사례가 없어 출력 동일.
 0.3.27 (2026-10-08, 설치 시각 정의 — 팀 결정 '설치 = 다운로드(패키지 쓰기) 완료'): 애플리케이션 설치(E02-01)의 시각을 패키지 폴더의 **생성 시각(받기 시작)** 에서 **마지막 수정 시각(패키지 쓰기 완료)** 으로 바꿨다(`package_install.py`). Store 는 받기 시작할 때 폴더를 만들고 다 받으면 폴더 수정 시각이 갱신되며, 패키지 폴더는 설치 뒤 바뀌지 않고 업데이트는 새 버전 폴더를 만들어 수정 시각이 뒤로 밀리지 않는다. 근거(details)에 `download_started_utc`(생성)·`installed_utc`(수정)·`version` 을 함께 적고, 사용자 데이터 폴더 관찰(NA-00)은 "최초 설치(첫 등록) 시점 추정" 으로 표기. image2: 11:27:19 → 11:35:24 (시트 '다운로드 완료' 11:35:30, 6초 차) — 정답 9건 9/0/0. image1: 03:54:19 → 03:57:09 (시트는 첫 실행 04:34:26 을 설치로 적어 여전히 부분) — 12/2/5 그대로. Autopsy 경유(호스트 메타데이터) 출력도 같게 바뀜.
 
@@ -243,7 +244,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `IMAGE_OPEN_FAILED` | 이미지 없음/권한, E01 열기 실패, **E01 첫·끝 섹터 읽기 실패(절단/손상)** |
 | `SEGMENT_MISSING` | E01 확장자 결번(.E01 .E02 .E04), **마지막 E01 세그먼트 누락**(마지막 파일이 `next` 섹션으로 끝남), 분할 RAW 중간 결번 |
 | `UNSUPPORTED_FORMAT` | EWF2(.Ex01), L01, VMDK/VHD/QCOW, 판독 가능한 NTFS 볼륨 없음 |
-| `VOLUME_LOCKED` | BitLocker 볼륨을 하나도 풀지 못함 (키 없음·키 틀림·`dissect.fve` 미설치). `context.volumes[].protectors` 에 그 볼륨이 받는 키 종류 |
+| `VOLUME_LOCKED` | BitLocker 볼륨을 풀지 못했고(키 없음·키 틀림·`dissect.fve` 미설치), 읽을 수 있는 볼륨 중에 BitLocker 를 푼 것도 Windows 시스템 볼륨(`\Users`)도 없음 — 복구·예약 파티션만 읽혀 "앱 미사용" 으로 잘못 결론 낼 상황. 평문 OS 볼륨이 있으면 중단하지 않고 잠긴 볼륨을 `warnings` 에 남기며 계속한다 (0.3.29). `context.volumes[].protectors` 에 그 볼륨이 받는 키 종류 |
 | (경고) 아티팩트 0건 | 이미지는 읽혔으나 Codex 경로 0건. 0.3.10부터 오류가 아니라 **0행 결과 + 경고**로 끝난다(종료코드 0). 앱을 쓰지 않은 음성 대조(negative control) 이미지에서 '없음'이 정상 결과이기 때문. `ARTIFACT_NOT_FOUND` 코드는 라이브러리 사용 시에만 남아 있다 |
 | 레코드 단위 | `JSON_DECODE_ERROR`, `READ_FAILED` 등 → 해당 레코드만 `status:error`, 같은 파일의 나머지 라인은 계속 파싱 |
 
