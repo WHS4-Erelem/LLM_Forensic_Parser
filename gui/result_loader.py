@@ -1,0 +1,654 @@
+"""통합 결과 폴더(<out>/<evidence_id>) 읽기 전용 로더.
+
+통합 Runner 가 만든 파일을 읽기만 한다. 다시 쓰지 않고, 헤더·값을 고치지 않는다.
+GUI 표시용 가공(표시명, 집계)은 여기서 끝내고 UI 쪽은 결과만 쓴다.
+"""
+from __future__ import annotations
+
+import csv
+import json
+import os
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, field
+
+# 통합이 쓰는 파일 이름 (integration/llm_forensic.py 기준)
+TIMELINE_CSV = "timeline.csv"
+CONVERSATIONS_CSV = "recovered_conversations.csv"
+REPORT_JSON = "integration_report.json"
+MANIFEST_JSON = "evidence_manifest.json"
+UNIFIED_DB = "unified.db"
+CASE_JSON = "case_info.json"
+
+# 파일의 원본 헤더는 바꾸지 않고, 화면에만 쓰는 표시명 (끝 공백·소문자 그대로가 원본)
+DISPLAY_NAMES = {
+    "Model": "Model",
+    "Timestamp": "Timestamp",
+    "User_behavior": "User Behavior",
+    "Behavior_details ": "Behavior Details",
+    "Verdict": "Verdict",
+    "Artifact_path": "Artifact Path",
+    "Artifact_details ": "Artifact Details",
+    "timestamp": "Timestamp",
+    "conversation_uuid": "Conversation UUID",
+    "conversation_title": "Conversation Title",
+    "message_uuid": "Message UUID",
+    "parent_message_uuid": "Parent Message UUID",
+    "message order": "Message Order",
+    "role": "Role",
+    "content": "Content",
+    "source_parser": "Source Parser",
+    "parser_version": "Parser Version",
+    "source_file": "Source File",
+    "parse_time_utc": "Parse Time (UTC)",
+    "artifact_path_normalized": "Artifact Path (normalized)",
+    "volume_ref": "Volume",
+    "evidence_id": "Evidence ID",
+    "evidence_sha256": "Evidence SHA-256",
+}
+# Timeline 표에 보여 줄 열 (나머지는 상세 패널에서 전체를 보여 준다)
+TIMELINE_VIEW_COLUMNS = ["Model", "Timestamp", "User_behavior", "Behavior_details ", "Verdict",
+                         "Artifact_path", "source_parser"]
+VERDICT_CONFIRMED = "확정"
+VERDICT_SUSPECTED = "의심"
+EMPTY = "-"
+
+# 서비스 식별자 → 화면 표시명 (GUI 표시 전용 helper. CSV·DB 의 원본 값은 바꾸지 않는다)
+SERVICE_LABELS = {
+    "chatgpt_web": "ChatGPT Web", "chatgpt_desktop": "ChatGPT Desktop",
+    "claude_web": "Claude Web", "claude_desktop": "Claude Desktop",
+    "gemini_web": "Gemini Web", "lmstudio": "LM Studio",
+    # parsers.json 의 model 값으로 들어오는 경우도 같은 표시명을 쓴다
+    "chatgpt-web": "ChatGPT Web", "chatgpt-desktop": "ChatGPT Desktop",
+    "claude-web": "Claude Web", "claude-desktop": "Claude Desktop",
+    "gemini-web": "Gemini Web",
+}
+
+
+def service_label(name):
+    """표시용 서비스명. 매핑에 없으면 구분자만 공백으로 바꿔 쓴다 (없는 이름을 지어내지 않는다)."""
+    if not name or name == EMPTY:
+        return EMPTY
+    key = str(name).strip()
+    if key in SERVICE_LABELS:
+        return SERVICE_LABELS[key]
+    return key.replace("_", " ").replace("-", " ").strip() or EMPTY
+
+
+# 파서가 자기 출력 폴더에 남기는 결과 JSON (warning 목록을 읽기 위해서만 본다)
+PARSER_RESULT_JSON = "result.json"
+# 아래 두 warning 이 **함께** 있을 때만 "분석 제한"으로 표시한다. 원인(암호화 등)은 단정하지 않는다.
+WARN_PROFILE_NOT_FOUND = "CHROME_PROFILE_NOT_FOUND"
+WARN_FILESYSTEM_OPEN_FAILED = "IMAGE_FILESYSTEM_OPEN_FAILED"
+
+# 화면에 쓰는 파서 상태 (실제 report status / 행 수 / warning 만 근거로 한다)
+ST_COMPLETED = "Completed"
+ST_NO_RESULT = "Completed / No Result"
+ST_FAILED = "Failed"
+ST_SKIPPED = "Skipped"
+ST_LIMITED = "Unsupported / Limited"
+ST_UNKNOWN = "-"
+# Integration 이 쓰는 status 를 화면 라벨로 옮긴다 (없는 상태를 새로 만들지 않는다).
+# llm_forensic.py 의 ERROR_STATUS / _STATUS_ORDER 기준: success · failed · contract_violation ·
+# normalization_error · db_error · output_error
+ST_CONTRACT_VIOLATION = "Contract Violation"
+ST_NORMALIZATION_ERROR = "Normalization Error"
+ST_DB_ERROR = "DB Error"
+ST_OUTPUT_ERROR = "Output Error"
+INTEGRATION_STATUS_LABELS = {
+    "failed": ST_FAILED,
+    "contract_violation": ST_CONTRACT_VIOLATION,
+    "normalization_error": ST_NORMALIZATION_ERROR,
+    "db_error": ST_DB_ERROR,
+    "output_error": ST_OUTPUT_ERROR,
+}
+
+
+class ResultLoadError(Exception):
+    """결과 폴더를 읽을 수 없을 때."""
+
+
+def _read_csv(path):
+    """(헤더, 행 목록). 파일이 없으면 ([], []). 통합 병합 CSV 는 utf-8-sig."""
+    if not os.path.isfile(path):
+        return [], []
+    with open(path, encoding="utf-8-sig", newline="") as fh:
+        reader = csv.DictReader(fh)
+        fields = list(reader.fieldnames or [])
+        return fields, [dict(row) for row in reader]
+
+
+def _read_json(path):
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def cell(row, column):
+    """표시용 값. 없거나 빈 값은 '-' (값을 만들어 내지 않는다)."""
+    value = row.get(column)
+    return EMPTY if value is None or str(value).strip() == "" else str(value)
+
+
+@dataclass
+class ConversationSession:
+    """recovered_conversations.csv 를 conversation_uuid 로 묶은 한 대화 (원본 행을 그대로 담는다)."""
+
+    conversation_uuid: str
+    title: str
+    model: str
+    first_timestamp: str
+    service: str = EMPTY           # source_parser (provenance 열)
+    last_timestamp: str = EMPTY
+    messages: list = field(default_factory=list)
+    has_uuid: bool = True          # False = conversation_uuid 가 없어 GUI 내부 기준으로 묶은 그룹
+    group_key: str = ""            # UI 내부용 그룹 키. 결과 파일·Export 에 쓰지 않는다
+
+    def display_title(self, limit=58):
+        """표시용 대화 주제. 원본을 고르기만 하고 요약·재작성하지 않는다.
+        (1) conversation_title (2) 첫 user 메시지 앞부분 (3) UUID fallback."""
+        if self.title and self.title != EMPTY:
+            return _shorten(self.title, limit)
+        preview = self.first_user_text()
+        if preview:
+            return _shorten(preview, limit)
+        if self.has_uuid and self.conversation_uuid != EMPTY:
+            return "Untitled · %s" % self.conversation_uuid[:8]
+        if self.service != EMPTY:          # UUID 가 없으면 서비스·출처만 적는다 (식별자를 만들지 않는다)
+            return "Untitled (%s · conversation_uuid 없음)" % self.service
+        return "Untitled (conversation_uuid 없음)"
+
+    def first_user_text(self):
+        """첫 user 메시지의 본문 앞부분 (원문 그대로)."""
+        for message in self.messages:
+            if cell(message, "role").strip().lower() in ("user", "human"):
+                text = " ".join(cell(message, "content").split())
+                if text and text != EMPTY:
+                    return text
+        return ""
+
+    def service_name(self):
+        """이 대화의 서비스 식별자 (source_parser 우선, 없으면 Model)."""
+        return self.service if self.service != EMPTY else self.model
+
+    def service_display(self):
+        return service_label(self.service_name())
+
+    def search_text(self):
+        """검색 대상: 제목 · UUID · 서비스 · 모델 · role · 메시지 내용."""
+        parts = [self.title, self.conversation_uuid, self.service, self.model]
+        for message in self.messages:
+            parts.append(cell(message, "role"))
+            parts.append(cell(message, "content"))
+        return " ".join(parts).lower()
+
+
+@dataclass
+class ResultBundle:
+    """결과 폴더 1개의 내용. 모든 값은 파일에서 읽은 그대로다."""
+
+    result_dir: str
+    timeline_columns: list
+    timeline_rows: list
+    conversation_columns: list
+    conversation_rows: list
+    report: dict | None
+    manifest: dict | None
+    case_info: dict | None
+    parser_warnings: dict = field(default_factory=dict)   # {parser: [warning, ...]} — 파서 result.json 원문
+
+    # ------------------------------------------------------------------ load
+    @classmethod
+    def load(cls, result_dir):
+        result_dir = os.path.abspath(result_dir)
+        if not os.path.isdir(result_dir):
+            raise ResultLoadError("결과 폴더가 없습니다: %s" % result_dir)
+        tl_cols, tl_rows = _read_csv(os.path.join(result_dir, TIMELINE_CSV))
+        cv_cols, cv_rows = _read_csv(os.path.join(result_dir, CONVERSATIONS_CSV))
+        report = _read_json(os.path.join(result_dir, REPORT_JSON))
+        if not tl_cols and not cv_cols and report is None:
+            raise ResultLoadError("통합 결과 파일(%s / %s / %s)을 찾을 수 없습니다: %s"
+                                  % (TIMELINE_CSV, CONVERSATIONS_CSV, REPORT_JSON, result_dir))
+        return cls(result_dir=result_dir, timeline_columns=tl_cols, timeline_rows=tl_rows,
+                   conversation_columns=cv_cols, conversation_rows=cv_rows, report=report,
+                   manifest=_read_json(os.path.join(result_dir, MANIFEST_JSON)),
+                   case_info=_read_json(os.path.join(result_dir, CASE_JSON)),
+                   parser_warnings=_read_parser_warnings(result_dir))
+
+    def path(self, name):
+        return os.path.join(self.result_dir, name)
+
+    def has_db(self):
+        return os.path.isfile(self.path(UNIFIED_DB))
+
+    def has_merged_outputs(self):
+        """Integration 이 병합 CSV 를 실제로 만들었는지 (report 키에 의존하지 않는다)."""
+        return os.path.isfile(self.path(TIMELINE_CSV)) and os.path.isfile(self.path(CONVERSATIONS_CSV))
+
+    # --------------------------------------------------------------- summary
+    def evidence(self):
+        """evidence_manifest.json 또는 integration_report.json 의 evidence 정보 (없으면 {})."""
+        if self.manifest:
+            return self.manifest
+        return (self.report or {}).get("evidence", {})
+
+    # ------------------------------------------------- 서비스 범위 (표시 필터)
+    def timeline_rows_of(self, service=None):
+        """service=None 이면 전체. 원본 리스트를 바꾸지 않고 걸러낸 새 리스트만 돌려준다."""
+        if not service:
+            return self.timeline_rows
+        return [r for r in self.timeline_rows if cell(r, "source_parser") == service]
+
+    def conversation_rows_of(self, service=None):
+        if not service:
+            return self.conversation_rows
+        return [r for r in self.conversation_rows if cell(r, "source_parser") == service]
+
+    def behavior_counts(self, service=None, top=8):
+        """User_behavior 별 건수 (많은 순 top 개). 팀 공통 파일에 상위 분류 정의가 없으므로
+        GUI 가 분류를 만들어 내지 않고 실제 행위명을 그대로 집계한다."""
+        counts = Counter(cell(r, "User_behavior") for r in self.timeline_rows_of(service))
+        counts.pop(EMPTY, None)
+        return counts.most_common(top)
+
+    def hour_distribution(self, service=None):
+        """[(YYYY-MM-DD HH, 건수)] — Timestamp 가 있는 행만. 시각이 없는 행 수도 함께 돌려준다."""
+        counts, missing = Counter(), 0
+        for row in self.timeline_rows_of(service):
+            stamp = cell(row, "Timestamp")
+            if stamp == EMPTY or len(stamp) < 13:
+                missing += 1
+                continue
+            counts[stamp[:13]] += 1          # 'YYYY-MM-DD HH'
+        return sorted(counts.items()), missing
+
+    def integrity(self):
+        """증거·무결성 표시 항목. manifest / report 에 기록된 값만 쓴다 (해시를 새로 계산하지 않는다)."""
+        ev = self.evidence()
+        report = self.report or {}
+        size = ev.get("size_bytes")
+        items = [
+            ("Evidence ID", ev.get("evidence_id") or "기록 없음", False),
+            ("이미지", os.path.basename(ev.get("path") or "") or "기록 없음", False),
+            ("경로", ev.get("path") or "기록 없음", True),
+            ("형식", (ev.get("kind") or "기록 없음").upper(), False),
+            ("크기", "%.1f GB (%s B)" % (size / 2 ** 30, format(size, ",")) if size else "기록 없음", False),
+            ("세그먼트", ", ".join(ev.get("segments") or []) or "기록 없음", True),
+            ("SHA-256", self._integrity_hash(ev.get("evidence_sha256")), True),
+            ("Quick Fingerprint", ev.get("evidence_quick_fingerprint") or "기록 없음", True),
+            ("Run ID", report.get("run_id") or "기록 없음", True),
+            ("분석 모드", report.get("mode") or "기록 없음", False),
+            ("실행 시각 (UTC)", report.get("generated_at_utc") or "기록 없음", False),
+            ("종료 코드", str(report.get("exit_code")) if report.get("exit_code") is not None else "기록 없음", False),
+        ]
+        if report.get("quick"):
+            items.append(("실행 모드", "--quick — 전체 Evidence SHA-256·MD5·SHA-1 과 세그먼트별 SHA-256 계산, "
+                                       "RAW sidecar 무결성 대조를 생략함 (오류 아님). "
+                                       "Parser 분석·계약 검사·병합 결과 생성은 동일하게 수행됨", False))
+        return items
+
+    def _integrity_hash(self, value):
+        """evidence_sha256 표시. --quick 이면 '-' 가 정상 결과라서 오류로 보이지 않게 사유를 덧붙인다."""
+        if value and value != EMPTY:
+            return value
+        if (self.report or {}).get("quick"):
+            return "- (--quick 로 계산 생략 — 오류 아님)"
+        return value or "기록 없음"
+
+    def metrics(self, service=None):
+        """Overview 지표. 결과 파일에서 셀 수 있는 값만 담는다."""
+        timeline_rows = self.timeline_rows_of(service)
+        conversation_rows = self.conversation_rows_of(service)
+        verdicts = Counter(cell(r, "Verdict") for r in timeline_rows)
+        parsers = (self.report or {}).get("parsers", {})
+        summary = (self.report or {}).get("summary", {})
+        services = {cell(r, "source_parser") for r in timeline_rows} | {
+            cell(r, "source_parser") for r in conversation_rows}
+        services.discard(EMPTY)
+        if service:
+            error_count = sum(int(info.get("error_count") or 0)
+                              for name, info in parsers.items() if name == service)
+        else:
+            error_count = sum(int(p.get("error_count") or 0) for p in parsers.values())
+            error_count += len((self.report or {}).get("integration_errors", []))
+        return OrderedDict([
+            ("Services with Results", str(len(services))),
+            ("Timeline Events", str(len(timeline_rows))),
+            ("Recovered Messages", str(len(conversation_rows))),
+            (VERDICT_CONFIRMED, str(verdicts.get(VERDICT_CONFIRMED, 0))),
+            (VERDICT_SUSPECTED, str(verdicts.get(VERDICT_SUSPECTED, 0))),
+            ("Parser Errors", str(error_count)),
+            ("Parsers Run", str(1 if service else summary.get("parsers_run", len(parsers)))),
+            ("Parsers Succeeded", str(summary.get("success", "-")) if not service else
+             ("1" if (parsers.get(service) or {}).get("status") == "success" else "0")),
+        ])
+
+    def parser_states(self):
+        """[(parser, status, timeline_rows, conversation_rows)] — report 에 있는 그대로."""
+        parsers = (self.report or {}).get("parsers", {})
+        rows = [(name, info.get("status", "-"), info.get("timeline_rows", 0), info.get("conversation_rows", 0))
+                for name, info in parsers.items()]
+        if not rows:   # report 가 없으면 CSV 의 source_parser 로만 (상태는 모른다고 표시)
+            counts = Counter(cell(r, "source_parser") for r in self.timeline_rows)
+            rows = [(name, "-", n, 0) for name, n in sorted(counts.items()) if name != EMPTY]
+        return sorted(rows)
+
+    # ------------------------------------------------- 화면용 상태 / 안내 문구
+    def display_status(self, parser, status, timeline_rows, conversation_rows):
+        """실제 report status · 행 수 · 파서 warning 만으로 화면 상태를 정한다 (추론 금지)."""
+        if status in (None, "", ST_UNKNOWN):
+            return ST_UNKNOWN
+        if status != "success":
+            # Integration 의 실제 status 를 그대로 옮긴다 (모르는 값이면 원문을 보여 준다)
+            return INTEGRATION_STATUS_LABELS.get(status, status)
+        if timeline_rows or conversation_rows:
+            return ST_COMPLETED
+        return ST_LIMITED if parser in self.limited_parsers() else ST_NO_RESULT
+
+    def display_parser_states(self):
+        """[(parser, display_status, report_status, timeline_rows, conversation_rows)]."""
+        executed = [(name, self.display_status(name, status, tl, cv), status, tl, cv)
+                    for name, status, tl, cv in self.parser_states()]
+        known = {row[0] for row in executed}
+        # --only 로 이번 실행에서 돌지 않은 파서는 report 에 없다 → Skipped (실패가 아니다)
+        skipped = [(name, ST_SKIPPED, "-", 0, 0)
+                   for name in sorted((self.report or {}).get("only") or []) if name not in known]
+        return executed + skipped
+
+    def limited_parsers(self):
+        """'분석 제한' 으로 표시할 파서 — result.json 에 두 warning 이 함께 있는 경우만."""
+        limited = {}
+        for parser, warnings in self.parser_warnings.items():
+            if any(w.startswith(WARN_PROFILE_NOT_FOUND) for w in warnings) and \
+                    any(w.startswith(WARN_FILESYSTEM_OPEN_FAILED) for w in warnings):
+                limited[parser] = [w for w in warnings
+                                   if w.startswith((WARN_PROFILE_NOT_FOUND, WARN_FILESYSTEM_OPEN_FAILED))]
+        return limited
+
+    def limitation_notice(self):
+        """제한 안내 문구 (근거가 없으면 None). 원인(암호화 등)을 단정하지 않는다."""
+        limited = self.limited_parsers()
+        if not limited:
+            return None
+        codes = sorted({w.split(":", 1)[0] for ws in limited.values() for w in ws})
+        return ("%s Parser는 실행되었으나 현재 Evidence에서 Chrome Artifact를 획득하지 못했습니다. "
+                "Errors & Limitations를 확인하세요. (근거 warning: %s)"
+                % (", ".join(sorted(limited)), ", ".join(codes)))
+
+    def service_counts(self):
+        """[(service, timeline 행 수)] — timeline.csv 의 source_parser 기준. 전체 건수는 len(timeline_rows)."""
+        counts = Counter(cell(r, "source_parser") for r in self.timeline_rows)
+        counts.pop(EMPTY, None)
+        return sorted(counts.items())
+
+    def verdict_values(self):
+        """timeline.csv 에 실제로 등장한 Verdict 값만 (없는 값을 선택지로 만들지 않는다)."""
+        values = {cell(r, "Verdict") for r in self.timeline_rows}
+        values.discard(EMPTY)
+        return sorted(values)
+
+    def failed_parsers(self):
+        return sorted(name for name, status, _tl, _cv in self.parser_states() if status != "success")
+
+    HEADS = {"timeline": ("탐지된 Timeline Event가 없습니다.",
+                          "선택한 서비스에서 탐지된 Timeline Event가 없습니다."),
+             "conversations": ("복구된 대화가 없습니다.",
+                               "선택한 서비스에서 복구된 대화가 없습니다."),
+             "artifacts": ("탐지된 Artifact 근거가 없습니다.",
+                           "선택한 서비스에서 탐지된 Artifact 근거가 없습니다."),
+             "errors": ("보고된 오류가 없습니다.", "선택한 서비스와 관련된 오류가 없습니다.")}
+
+    def empty_state_message(self, kind, service=None):
+        """0건 안내. '전체 0건' 과 '서비스 필터로 0건' 을 구분하고, 실패와 정상 0건도 구분한다."""
+        head = self.HEADS.get(kind, self.HEADS["timeline"])[1 if service else 0]
+        lines = [head]
+        failed = [f for f in self.failed_parsers() if not service or f == service]
+        if failed:
+            lines.append("일부 Parser가 정상적으로 끝나지 않았습니다 (%s). 0건과 실패는 다릅니다."
+                         % ", ".join(failed))
+        notice = self.limitation_notice()
+        if notice and (not service or service in self.limited_parsers()):
+            lines.append(notice)
+        if kind != "errors":
+            lines.append("Errors & Limitations에서 각 Parser의 실행 상태를 확인하세요.")
+        return "\n".join(lines)
+
+    def error_rows(self, service=None):
+        """Errors & Limitations 표. report 의 오류를 그대로 펼친다 (원인 추측 없음)."""
+        report = self.report or {}
+        out = []
+        for name, info in (report.get("parsers") or {}).items():
+            if service and name != service:          # 선택한 서비스의 오류만
+                continue
+            status = info.get("status", "-")
+            for err in info.get("errors") or []:
+                out.append({"Module": name, "Severity": status, "Type": err.get("type", "-"),
+                            "Message": _error_text(err), "Processing Result": _processing_result(status),
+                            "_raw": err})
+            if not (info.get("errors") or []) and status not in ("success", "-"):
+                out.append({"Module": name, "Severity": status, "Type": "-",
+                            "Message": "상세 오류가 보고서에 없습니다 (run.log 참조)",
+                            "Processing Result": _processing_result(status),
+                            "_raw": {"run_log": info.get("run_log")}})
+            if info.get("errors_truncated"):
+                out.append({"Module": name, "Severity": "warning", "Type": "ERRORS_TRUNCATED",
+                            "Message": "보고서에는 앞 100건만 기록됨 (전체는 unified.db runs.violations)",
+                            "Processing Result": "일부만 표시", "_raw": {}})
+        for err in report.get("integration_errors") or []:
+            # 공통 integration 오류는 전체 모드에서 보여 주고, 특정 파서를 지목한 오류는 그 서비스에서도 보여 준다
+            if service and (err.get("parser") or "integration") != service:
+                continue
+            out.append({"Module": err.get("parser") or "integration", "Severity": "integration",
+                        "Type": err.get("type", "-"), "Message": _error_text(err),
+                        "Processing Result": "통합 단계 실패", "_raw": err})
+        for text in report.get("warnings") or []:
+            if service:                              # 통합 전체 경고는 전체 모드에서만
+                continue
+            out.append({"Module": "integration", "Severity": "warning", "Type": "WARNING",
+                        "Message": str(text), "Processing Result": "계속 진행", "_raw": {}})
+        return out
+
+    def limitations(self):
+        """보고서에 실제로 적힌 제한만 문장으로 모은다."""
+        report = self.report or {}
+        notes = []
+        if report.get("quick"):
+            notes.append("--quick 실행: 전체 Evidence 의 SHA-256·MD5·SHA-1 과 세그먼트별 SHA-256 을 계산하지 않아 "
+                         "무결성 대조를 수행하지 않았습니다 (Evidence ID 용 quick fingerprint 는 계산됨). "
+                         "Parser 분석과 결과 생성은 생략되지 않았습니다.")
+        if report.get("mode") == "only":
+            notes.append("선택 실행(--only %s): 선택하지 않은 파서의 결과는 이번 실행에서 생성되지 않았습니다."
+                         % ", ".join(report.get("only") or []))
+        for name in report.get("preserved_from_previous_runs") or []:
+            notes.append("%s 결과는 이번 실행이 아니라 이전 실행에서 남은 행입니다." % name)
+        for name, info in (report.get("parsers") or {}).items():
+            if info.get("status") != "success":
+                notes.append("%s: status=%s (returncode=%s) — 이 서비스의 흔적 부재를 뜻하지 않습니다."
+                             % (name, info.get("status"), info.get("returncode")))
+            elif not info.get("timeline_rows") and not info.get("conversation_rows"):
+                notes.append("%s: 실행은 성공했고 결과 행이 0건입니다 (미발견과 미분석은 다릅니다)." % name)
+        if self.report is None:
+            notes.append("integration_report.json 이 없어 실행 상태·오류 정보를 표시할 수 없습니다.")
+        return notes
+
+    # ----------------------------------------------------------- artifacts
+    def artifact_rows(self, service=None, artifact_type=None):
+        """근거 탐색용 행 목록. timeline 행 1건 = 1행이며 값은 원본 그대로다
+        (새 판정을 만들지 않고 아티팩트 관점으로 열만 재배치한다)."""
+        rows = []
+        for row in self.timeline_rows_of(service):
+            kind = artifact_type_of(cell(row, "Artifact_details "))
+            if artifact_type and kind != artifact_type:
+                continue
+            path = cell(row, "Artifact_path")
+            rows.append({
+                "Timestamp": cell(row, "Timestamp"),
+                "Service": cell(row, "source_parser"),
+                "User Behavior": cell(row, "User_behavior"),
+                "Verdict": cell(row, "Verdict"),
+                "Summary": _summary_text(cell(row, "Behavior_details ")),
+                "Artifact Type": kind,
+                "Artifact Source": _path_tail(path),
+                "_row": row,          # 상세 패널은 원본 dict 를 그대로 쓴다
+            })
+        return rows
+
+    def artifact_types(self, service=None):
+        """[(artifact_type, 건수)] — 실제 데이터에 있는 값만. 없는 타입을 만들지 않는다."""
+        counts = Counter(artifact_type_of(cell(r, "Artifact_details "))
+                         for r in self.timeline_rows_of(service))
+        return sorted(counts.items(), key=lambda kv: (kv[0] == EMPTY, -kv[1], kv[0]))
+
+    # -------------------------------------------------------- conversations
+    def conversation_sessions(self, service=None):
+        """대화 세션 목록 (파일 순서 유지, 메시지는 message order 로 정렬).
+
+        conversation_uuid 가 있으면 그 값으로 묶는다. 없으면(`-`/빈 값) **전부 한 대화로 합치지 않고**
+        provenance(source_parser · source_file · Artifact_path · 제목) 로 GUI 내부 그룹 키를 만든다.
+        그 키는 화면 안에서만 쓰고 결과 파일·Export 에는 쓰지 않으며 사용자에게 UUID 로 보여 주지도 않는다.
+        """
+        sessions = OrderedDict()
+        for row in self.conversation_rows_of(service):
+            uuid = cell(row, "conversation_uuid")
+            has_uuid = uuid != EMPTY
+            key = uuid if has_uuid else gui_group_key(row)
+            session = sessions.get(key)
+            if session is None:
+                session = ConversationSession(conversation_uuid=uuid, title=cell(row, "conversation_title"),
+                                              model=cell(row, "Model"), first_timestamp=cell(row, "timestamp"),
+                                              service=cell(row, "source_parser"),
+                                              has_uuid=has_uuid, group_key=key)
+                sessions[key] = session
+            session.messages.append(row)
+            ts = cell(row, "timestamp")
+            if ts != EMPTY:
+                if session.first_timestamp == EMPTY or ts < session.first_timestamp:
+                    session.first_timestamp = ts
+                if session.last_timestamp == EMPTY or ts > session.last_timestamp:
+                    session.last_timestamp = ts
+        for session in sessions.values():
+            session.messages.sort(key=lambda r: _order_key(cell(r, "message order")))
+        return list(sessions.values())
+
+
+GUI_GROUP_KEY_FIELDS = ("source_parser", "source_file", "conversation_title")
+
+
+def gui_group_key(message):
+    """conversation_uuid 가 없을 때 쓰는 **UI 내부 전용** 그룹 키.
+
+    실제 식별자가 아니다. 결과 CSV·Export·화면의 UUID 칸에 쓰지 않는다. 묶을 근거(provenance)가
+    하나도 없으면 메시지마다 다른 키를 돌려줘 서로 다른 대화로 둔다 (억지로 합치지 않는다).
+    """
+    parts = [cell(message, key) for key in GUI_GROUP_KEY_FIELDS]
+    if all(part == EMPTY for part in parts):
+        return "__gui_group_key:unique:%d" % id(message)
+    return "__gui_group_key:" + "|".join(parts)
+
+
+def message_service(message, fallback=EMPTY):
+    """메시지가 속한 서비스 식별자 (source_parser → Model → 호출자 fallback)."""
+    for key in ("source_parser", "Model"):
+        value = cell(message, key)
+        if value != EMPTY:
+            return value
+    return fallback
+
+
+def message_source(message):
+    """메시지의 근거 아티팩트 표기 (경로 마지막 조각). 없으면 '-'."""
+    return _path_tail(cell(message, "Artifact_path"))
+
+
+def _shorten(text, limit):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _summary_text(details, limit=110):
+    """Behavior_details 를 표에 넣을 한 줄로 (값은 자르기만 하고 바꾸지 않는다)."""
+    text = " ".join(str(details).split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _path_tail(path):
+    """경로의 마지막 조각 (전체 경로는 상세 패널에서 본다)."""
+    if not path or path == EMPTY:
+        return EMPTY
+    return str(path).replace("/", "\\").rstrip("\\").split("\\")[-1] or EMPTY
+
+
+def _read_parser_warnings(result_dir):
+    """각 파서 폴더의 result.json 에서 warnings 목록만 읽는다 (없으면 건너뛴다)."""
+    found = {}
+    try:
+        names = sorted(os.listdir(result_dir))
+    except OSError:
+        return found
+    for name in names:
+        data = _read_json(os.path.join(result_dir, name, PARSER_RESULT_JSON))
+        if isinstance(data, dict):
+            warnings = data.get("warnings")
+            if isinstance(warnings, list):
+                found[name] = [str(w) for w in warnings]
+    return found
+
+
+def evidence_dir_conflict(image_path, out_dir):
+    """Output 이 Evidence 파일이 있는 디렉터리와 같거나 그 하위면 True (대소문자 무시).
+
+    파서(Claude Web 등)가 증거 폴더 안쪽 출력을 거부하므로 실행 전에 막아야 한다.
+    """
+    if not image_path or not out_dir:
+        return False
+    evidence_dir = os.path.normcase(os.path.abspath(os.path.dirname(os.path.abspath(image_path))))
+    target = os.path.normcase(os.path.abspath(out_dir))
+    return target == evidence_dir or target.startswith(evidence_dir + os.sep)
+
+
+def _order_key(value):
+    try:
+        return (0, int(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def artifact_type_of(details):
+    """Artifact_details 안에 'artifact_type=' 가 실제로 있으면 그 값, 없으면 '-' (추론하지 않는다)."""
+    for part in str(details).split("|"):
+        part = part.strip()
+        if part.startswith("artifact_type="):
+            return part.split("=", 1)[1].strip() or EMPTY
+    return EMPTY
+
+
+def _error_text(err):
+    where = " ".join(str(x) for x in (err.get("file"), err.get("row") and "row %s" % err["row"], err.get("field")) if x)
+    text = "%s%s" % (where + ": " if where else "", err.get("message", ""))
+    if err.get("actual") is not None or err.get("expected") is not None:
+        text += " (actual=%s, expected=%s)" % (err.get("actual"), err.get("expected"))
+    return text
+
+
+def _processing_result(status):
+    return {"success": "적재됨", "failed": "파서 실행 실패 — 결과 미적재",
+            "contract_violation": "계약 위반 — 결과 미적재", "normalization_error": "정규화 실패 — 결과 미적재",
+            "db_error": "DB 적재 실패", "output_error": "병합 출력 실패"}.get(status, status or "-")
+
+
+def find_result_dirs(root):
+    """선택한 폴더가 결과 폴더인지, 아니면 그 안의 evidence_id 폴더들이 결과인지 찾는다."""
+    root = os.path.abspath(root)
+    if os.path.isfile(os.path.join(root, REPORT_JSON)) or os.path.isfile(os.path.join(root, TIMELINE_CSV)):
+        return [root]
+    found = []
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            sub = os.path.join(root, name)
+            if os.path.isdir(sub) and (os.path.isfile(os.path.join(sub, REPORT_JSON))
+                                       or os.path.isfile(os.path.join(sub, TIMELINE_CSV))):
+                found.append(sub)
+    return found

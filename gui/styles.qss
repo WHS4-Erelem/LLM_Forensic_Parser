@@ -1,0 +1,549 @@
+/* ARTINEX — Dark DFIR desktop theme
+   Background #121820 / Shell #171f29 / Panel #1b2430 / Card #1f2937 / Card hover #26323f
+   Border #2c3947 / Rail #31404f / Text #e6edf3 / Dim #b9c6d2 / Muted #8294a5
+   Accent Teal #4cc2d6 / Blue #6ea8e8 / Green #5ec98b / Yellow #e3b341 / Red #ef6b6b
+   (delegate 가 직접 그리는 색은 main_window.DARK 와 같은 값이다) */
+
+QWidget {
+    background: #121820;
+    color: #e6edf3;
+    font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+    font-size: 10pt;
+}
+
+QMainWindow, #CentralArea, QStackedWidget {
+    background: #121820;
+}
+
+/* ------------------------------------------------------------------ TopBar */
+#TopBar {
+    background: #171f29;
+    border-bottom: 1px solid #2c3947;
+}
+
+#AppTitle {
+    font-size: 13.5pt;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    color: #e6edf3;
+}
+
+#AppSubtitle {
+    font-size: 8.5pt;
+    color: #8294a5;
+    letter-spacing: 0.4px;
+}
+
+#GlobalSearch {
+    min-width: 300px;
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    padding: 6px 10px;
+    color: #e6edf3;
+}
+
+#GlobalSearch:focus {
+    border: 1px solid #4cc2d6;
+}
+
+/* ------------------------------------------------------------------ Panels */
+QFrame#Panel {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 4px;
+}
+
+QFrame#PanelSoft, QLabel#PanelSoft {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    color: #b9c6d2;
+}
+
+#PanelHeader {
+    background: #171f29;
+    border-bottom: 1px solid #2c3947;
+    font-weight: 600;
+    padding: 8px 12px;
+}
+
+#PanelTitle {
+    font-weight: 600;
+    font-size: 10.5pt;
+    color: #e6edf3;
+    background: transparent;
+}
+
+#SectionLabel {
+    color: #8294a5;
+    font-size: 8.5pt;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    background: transparent;
+}
+
+#Muted, QLabel#Muted {
+    color: #8294a5;
+    background: transparent;
+}
+
+#Mono {
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9pt;
+    color: #b9c6d2;
+    background: transparent;
+}
+
+#MetricCard {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+#MetricValue {
+    font-size: 18pt;
+    font-weight: 700;
+    color: #4cc2d6;
+    background: transparent;
+}
+
+#MetricLabel {
+    color: #8294a5;
+    font-size: 8.5pt;
+    background: transparent;
+}
+
+QLabel {
+    background: transparent;
+}
+
+/* ------------------------------------------------------- Timeline 필터 바 */
+#FilterBar {
+    background: #171f29;
+    border: 1px solid #2c3947;
+    border-radius: 4px;
+}
+
+#ServicePill {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 11px;
+    padding: 4px 13px;
+    color: #b9c6d2;
+    font-size: 9pt;
+}
+
+#ServicePill:hover {
+    background: #26323f;
+    border: 1px solid #4cc2d6;
+}
+
+#ServicePill:checked {
+    background: #14353d;
+    border: 1px solid #4cc2d6;
+    color: #4cc2d6;
+    font-weight: 600;
+}
+
+#FilterCombo {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    padding: 4px 8px;
+    min-width: 92px;
+    color: #e6edf3;
+}
+
+#FilterCombo::drop-down {
+    border: none;
+    width: 18px;
+}
+
+QComboBox QAbstractItemView {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    color: #e6edf3;
+    selection-background-color: #14353d;
+    selection-color: #4cc2d6;
+}
+
+/* ------------------------------------------------- Timeline 카드 리스트 뷰 */
+#TimelineView {
+    background: #121820;
+    border: 1px solid #2c3947;
+    border-radius: 4px;
+    outline: none;
+}
+
+#TimelineView::item {
+    border: none;
+}
+
+/* ------------------------------------------------------------------ Inputs */
+QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    padding: 5px 7px;
+    color: #e6edf3;
+    selection-background-color: #14353d;
+    selection-color: #4cc2d6;
+}
+
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:focus {
+    border: 1px solid #4cc2d6;
+}
+
+QLineEdit:disabled, QPlainTextEdit:disabled {
+    background: #1b2430;
+    color: #66798a;
+}
+
+QCheckBox, QRadioButton {
+    background: transparent;
+    spacing: 7px;
+    color: #b9c6d2;
+}
+
+QCheckBox:disabled, QRadioButton:disabled {
+    color: #66798a;
+}
+
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #3a4b5c;
+    background: #1f2937;
+}
+
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background: #4cc2d6;
+    border: 1px solid #4cc2d6;
+}
+
+QRadioButton::indicator {
+    border-radius: 7px;
+}
+
+/* ----------------------------------------------------------------- Buttons */
+QPushButton {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    padding: 6px 14px;
+    color: #e6edf3;
+}
+
+QPushButton:hover {
+    background: #26323f;
+    border: 1px solid #4cc2d6;
+}
+
+QPushButton:pressed {
+    background: #14353d;
+}
+
+QPushButton:disabled {
+    color: #66798a;
+    border: 1px solid #243040;
+    background: #1b2430;
+}
+
+QPushButton#Primary {
+    background: #1f7f91;
+    color: #f2fbfd;
+    border: 1px solid #4cc2d6;
+    font-weight: 600;
+    padding: 7px 18px;
+}
+
+QPushButton#Primary:hover {
+    background: #27a0b6;
+}
+
+QPushButton#Primary:pressed {
+    background: #186a79;
+}
+
+QPushButton#Primary:disabled {
+    background: #233440;
+    border: 1px solid #2c3947;
+    color: #66798a;
+}
+
+/* -------------------------------------------------------------------- Tabs */
+QTabWidget::pane {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: #171f29;
+    color: #8294a5;
+    border: 1px solid #2c3947;
+    border-bottom: none;
+    border-top-left-radius: 3px;
+    border-top-right-radius: 3px;
+    padding: 7px 16px;
+    margin-right: 2px;
+}
+
+QTabBar::tab:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    font-weight: 600;
+    border-bottom: 1px solid #14353d;
+}
+
+QTabBar::tab:hover:!selected {
+    background: #1f2937;
+    color: #b9c6d2;
+}
+
+/* ------------------------------------------------------------------ Tables */
+QTableView, QTreeView, QListView {
+    background: #1b2430;
+    alternate-background-color: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    gridline-color: #27333f;
+    color: #e6edf3;
+    selection-background-color: #14353d;
+    selection-color: #4cc2d6;
+    outline: none;
+}
+
+QTableView::item {
+    padding: 3px 5px;
+}
+
+QTableView::item:hover {
+    background: #26323f;
+}
+
+QTableView::item:selected, QListView::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+}
+
+QHeaderView::section {
+    background: #171f29;
+    color: #8294a5;
+    border: none;
+    border-right: 1px solid #27333f;
+    border-bottom: 1px solid #2c3947;
+    padding: 6px 7px;
+    font-weight: 600;
+}
+
+QListWidget {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+QListWidget::item {
+    padding: 8px 10px;
+    border-bottom: 1px solid #27333f;
+    color: #b9c6d2;
+}
+
+QListWidget::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    border-left: 2px solid #4cc2d6;
+}
+
+QTextBrowser {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    color: #e6edf3;
+}
+
+/* ---------------------------------------------------------------- Log view */
+#LogView {
+    background: #10161d;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 9pt;
+    color: #b9c6d2;
+}
+
+/* ------------------------------------------------------------- ProgressBar */
+QProgressBar {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+    height: 16px;
+    text-align: center;
+    color: #8294a5;
+}
+
+QProgressBar::chunk {
+    background: #4cc2d6;
+    border-radius: 2px;
+}
+
+/* --------------------------------------------------------------- Splitters */
+QSplitter::handle {
+    background: #121820;
+}
+
+QSplitter::handle:horizontal {
+    width: 4px;
+}
+
+QSplitter::handle:vertical {
+    height: 4px;
+}
+
+/* ------------------------------------------------------------- ScrollBars */
+QScrollBar:vertical {
+    background: #171f29;
+    width: 11px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #35475a;
+    border-radius: 5px;
+    min-height: 24px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #4a6075;
+}
+
+QScrollBar:horizontal {
+    background: #171f29;
+    height: 11px;
+    margin: 0;
+}
+
+QScrollBar::handle:horizontal {
+    background: #35475a;
+    border-radius: 5px;
+    min-width: 24px;
+}
+
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+}
+
+/* ------------------------------------------------------------------ Badges */
+#BadgeNeutral, #BadgeGreen, #BadgeYellow, #BadgeRed, #BadgeBlue, #BadgeTeal {
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 8.5pt;
+    font-weight: 600;
+}
+
+#BadgeNeutral { background: #233040; color: #8294a5; border: 1px solid #2c3947; }
+#BadgeGreen   { background: #1e3a2b; color: #5ec98b; border: 1px solid #2f5a41; }
+#BadgeYellow  { background: #3a3220; color: #e3b341; border: 1px solid #5a4d2a; }
+#BadgeRed     { background: #3a2424; color: #ef6b6b; border: 1px solid #5c3434; }
+#BadgeBlue    { background: #1e2d40; color: #6ea8e8; border: 1px solid #2f4868; }
+#BadgeTeal    { background: #14353d; color: #4cc2d6; border: 1px solid #276b78; }
+
+/* ------------------------------------------------------------------ Dialog */
+QMessageBox {
+    background: #1b2430;
+}
+
+QToolTip {
+    background: #1f2937;
+    color: #e6edf3;
+    border: 1px solid #4cc2d6;
+    padding: 4px 7px;
+}
+
+/* --------------------------------------------- 전역 서비스 필터 (왼쪽 목록) */
+#ServiceRow {
+    border: 1px solid transparent;
+    border-radius: 3px;
+    padding: 1px 4px;
+}
+
+#ServiceRow:hover {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+}
+
+#ServiceRow[selected="true"] {
+    background: #14353d;
+    border: 1px solid #4cc2d6;
+}
+
+/* ------------------------------------------------ Artifacts 필터 / 복사 버튼 */
+#TypeFilterList {
+    background: #1f2937;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+#TypeFilterList::item {
+    padding: 6px 9px;
+    border-bottom: 1px solid #27333f;
+    color: #b9c6d2;
+}
+
+#TypeFilterList::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    border-left: 2px solid #4cc2d6;
+}
+
+#CopyButton {
+    padding: 2px 9px;
+    font-size: 8.5pt;
+    color: #8294a5;
+}
+
+#CopyButton:hover {
+    color: #4cc2d6;
+    border: 1px solid #4cc2d6;
+}
+
+#SessionList::item {
+    padding: 8px 10px;
+}
+
+/* ----------------------------------------------- Conversations (채팅 뷰) */
+#SessionList {
+    background: #1b2430;
+    border: 1px solid #2c3947;
+    border-radius: 3px;
+}
+
+#SessionList::item {
+    padding: 9px 11px;
+    border-bottom: 1px solid #27333f;
+    color: #b9c6d2;
+}
+
+#SessionList::item:hover {
+    background: #1f2937;
+}
+
+#SessionList::item:selected {
+    background: #14353d;
+    color: #4cc2d6;
+    border-left: 2px solid #4cc2d6;
+}
+
+#ChatView {
+    background: #151c25;
+    border: 1px solid #2c3947;
+    border-radius: 4px;
+    outline: none;
+}
+
+#ChatView::item {
+    border: none;
+}
