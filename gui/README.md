@@ -32,13 +32,13 @@ Runner 의 `[Report]` 출력 경로에서 얻는다. 그 줄을 놓친 경우에
 ## 실행
 
 ```powershell
-cd C:\Users\ksy_0\Documents\LLM_Forensic_Parser
-python -m pip install PyQt6          # 설치되어 있으면 생략
+cd <repository-root>
+python -m pip install -r gui\requirements.txt
 python gui\main.py
 ```
 
-파서를 실제로 돌리려면 저장소 README 대로 파서별 가상환경이 먼저 있어야 한다
-(`integration\setup.ps1` → `.venv312`, `.venv314`). 가상환경이 없으면 통합 Runner 는 각 파서를
+파서를 실제로 돌리려면 저장소 루트 README 안내에 따라 최초 1회
+`integration\setup.ps1`을 실행해 공용 `.venv312` 환경을 준비해야 한다. 가상환경이 없으면 통합 Runner 는 각 파서를
 `PARSER_EXECUTION_ERROR` 로 기록하고 끝까지 진행하며, GUI 는 그 실패를 Errors 탭에 보여 준다.
 
 ## 화면 흐름
@@ -59,6 +59,7 @@ Errors / Artifacts 표도 같은 패널을 쓴다.
 | 경로 | 역할 |
 |---|---|
 | `gui/main.py` | 진입점. QApplication · QSS 적용 |
+| `gui/requirements.txt` | GUI 실행에 필요한 Python 의존성 |
 | `gui/main_window.py` | TopBar + 4단계 화면, 결과 3분할 워크스페이스, 상세 패널 |
 | `gui/integration_runner.py` | `QProcess` 로 통합 Runner 실행, 표준출력 파싱(모듈 상태·결과 폴더) |
 | `gui/result_loader.py` | 결과 폴더 읽기 전용 로더 (CSV·보고서 → 지표·세션·아티팩트·오류) |
