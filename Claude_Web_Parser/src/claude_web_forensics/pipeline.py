@@ -247,7 +247,7 @@ def _run(
                     logger.exception("Downloads collection failed")
                     log.failed("Downloads", "filesystem_file", exc)
 
-        if folder:
+        if folder and not volume.has_mft:
             log.parse([ParseStatus(artifact="$MFT", family="mft", status=ST_SKIPPED, message="folder input has no $MFT")])
         else:
             try:

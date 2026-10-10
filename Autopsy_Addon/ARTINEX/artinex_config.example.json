@@ -1,4 +1,4 @@
 {
   "python": "C:/path/to/llm-parser/integration/.venv312/Scripts/python.exe",
-  "parser_dir": "C:/path/to/llm-parser/ChatGPT_APP_Parser"
+  "repo_root": "C:/path/to/llm-parser"
 }

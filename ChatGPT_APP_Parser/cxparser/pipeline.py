@@ -208,6 +208,16 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             records.extend(usn_mod.to_records(info, recs_usn, image_desc, rb, loc,
                                               max_excerpt=max_excerpt))
             usn_summary.append({**loc, "status": "ok", **info})
+    elif usn and isinstance(vfs, DirectoryVfs) and os.path.isfile(j_path := os.path.join(vfs.root, "$Extend", "$UsnJrnl:$J")):
+        # 폴더 입력: 호스트 도구가 원본 $J 를 볼륨 루트 기준 경로(ADS)로 꺼내 준 경우 같은 판정에 쓴다
+        loc = {"path": "/$Extend/$UsnJrnl:$J"}
+        try:
+            info, recs_usn = usn_mod.read_journal_file(j_path, max_bytes=usn_max_bytes)
+            records.extend(usn_mod.to_records(info, recs_usn, image_desc, rb, loc, max_excerpt=max_excerpt))
+            usn_summary = [{**loc, "status": "ok", **info}]
+        except OSError as exc:
+            errors.append({"path": loc["path"], "code": "USN_READ_FAILED", "message": "%s: %s" % (type(exc).__name__, exc)})
+            usn_summary = [{**loc, "status": "read_failed", "message": str(exc)}]
 
     # --- 3b'. 패키지 폴더 생성 시각 → 설치 (폴더는 iter_files 에 안 나오므로 발견 목록에서 루트를 찾아 직접 연다) --------
     records.extend(pkg_art.records_from_inventory(vfs, inventory, image_desc, rb))

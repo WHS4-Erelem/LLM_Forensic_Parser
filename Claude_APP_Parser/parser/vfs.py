@@ -3,6 +3,7 @@
 
 import fnmatch
 import hashlib
+import json
 import os
 import platform
 import struct
@@ -342,13 +343,50 @@ def _filetime(v):
     return _iso(datetime(1601, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=v // 10))
 
 
+HOST_META_NAME = "_host_metadata.json"     # ChatGPT Desktop 파서(cxparser.vfs)와 같은 약속
+
+
 class DirectoryVfs:
-    """추출된 파일 트리(개발/중간 테스트용). MFT 정보는 없음."""
+    """추출된 파일 트리. 파일만 있으면 MFT 정보는 없음.
+
+    호스트 DFIR 도구(Autopsy 등)가 루트에 `_host_metadata.json` 을 같이 두면 그 도구가 읽어 둔
+    파일시스템 메타데이터(MFT 레코드·순번·$SI 시각)를 근거로 쓴다 — 복사본의 시각은 쓰지 않는다.
+      {"provider": "...", "entries": {"<소문자 경로>": {"path", "dir", "mft_record", "mft_seq",
+                                                    "times": {created, modified, mft_modified, accessed}, "deleted"}}}
+    삭제 파일은 현존 파일과 겹치지 않게 `_deleted/<MFT#>/<원래 경로>` 에 두고 entries 에 deleted=True 와 원래 path 를 적는다."""
 
     def __init__(self, root):
         self.root = os.path.abspath(root)
         if not os.path.isdir(self.root):
             raise FilesystemError("디렉터리가 아닙니다", path=self.root)
+        self.host_provider, self.host_meta = None, {}
+        meta_path = os.path.join(self.root, HOST_META_NAME)
+        if os.path.isfile(meta_path):
+            with open(meta_path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            self.host_provider, self.host_meta = doc.get("provider"), doc.get("entries") or {}
+        mft = os.path.join(self.root, "$MFT")         # 호스트가 원본 $MFT 를 넘기면 $SI 시각은 거기서 (마이크로초까지)
+        self._mft = open(mft, "rb") if self.host_meta and os.path.isfile(mft) else None
+
+    def _si_times(self, m):
+        """MFT 레코드의 $STANDARD_INFORMATION 4시각. 원본 $MFT 가 없거나 레코드가 재사용됐으면 호스트가 준 시각."""
+        if self._mft is None or m.get("mft_record") is None:
+            return m.get("times")
+        self._mft.seek(m["mft_record"] * 1024)       # ponytail: 레코드 크기 1024 가정 (4K 레코드 볼륨은 boot 섹터에서 읽어야 함)
+        b = self._mft.read(1024)
+        if b[:4] != b"FILE" or (m.get("mft_seq") is not None and not m.get("deleted")          # 삭제 시 NTFS 가 순번을 올린다
+                                and struct.unpack_from("<H", b, 0x10)[0] != m["mft_seq"]):
+            return m.get("times")
+        off = struct.unpack_from("<H", b, 0x14)[0]
+        while off + 24 <= len(b):
+            kind, length = struct.unpack_from("<II", b, off)
+            if kind == 0xFFFFFFFF or length == 0:
+                break
+            if kind == 0x10:
+                c, mo, r, a = struct.unpack_from("<QQQQ", b, off + struct.unpack_from("<H", b, off + 0x14)[0])
+                return {"created": _filetime(c), "modified": _filetime(mo), "mft_modified": _filetime(r), "accessed": _filetime(a)}
+            off += length
+        return m.get("times")
 
     def iter_files(self):
         for dirpath, _dirs, files in os.walk(self.root):
@@ -359,13 +397,36 @@ class DirectoryVfs:
                 except OSError:
                     continue
                 rel = "/" + os.path.relpath(full, self.root).replace(os.sep, "/")
-                yield VfsFile(path=rel, size=st.st_size, source=self, native_path=full)
+                if rel == "/" + HOST_META_NAME:
+                    continue
+                m = self.host_meta.get(rel.lower()) or {}
+                deleted = rel.lower().startswith("/_deleted/")
+                if deleted and not m.get("deleted"):
+                    continue
+                yield VfsFile(path=m["path"] if deleted else rel, size=st.st_size, source=self, native_path=full,
+                              mft_record=m.get("mft_record"), sequence=m.get("mft_seq"), si_times=self._si_times(m),
+                              allocated=not deleted)
+
+    def scanned_dirs(self):
+        """호스트 메타데이터의 폴더 중 SCAN_ROOTS 아래 것 -> {(MFT#, 순번): 경로} — TskImageVfs.scanned_dirs 와 같은 모양 (USN 대조용)."""
+        roots = [r.lower().split("/") for r in SCAN_ROOTS]
+        dirs = {}
+        for e in self.host_meta.values():
+            parts = e.get("path", "").strip("/").split("/")
+            low = [x.lower() for x in parts]
+            if (e.get("dir") and e.get("mft_record") is not None and e.get("mft_seq") is not None
+                    and any(len(low) >= len(r) and all(fnmatch.fnmatch(a, b) for a, b in zip(low, r)) for r in roots)):
+                dirs[(e["mft_record"], e["mft_seq"])] = "/" + "/".join(parts)
+        return dirs
 
     def _read_file(self, vfile):
         with open(vfile.native_path, "rb") as fh:
             return fh.read()
 
     def describe(self):
+        if self.host_meta:
+            return {"filesystem": "host-directory", "root": self.root, "host_metadata_provider": self.host_provider,
+                    "note": "호스트 DFIR 도구가 꺼낸 파일 트리 — MFT 근거는 호스트가 넘긴 %s" % HOST_META_NAME}
         return {"filesystem": "host-directory", "root": self.root,
                 "note": "디스크 이미지가 아닌 추출 파일 트리 — MFT 근거 없음"}
 

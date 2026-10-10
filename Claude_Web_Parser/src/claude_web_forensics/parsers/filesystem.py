@@ -172,7 +172,7 @@ def parse_paths(
     records: list[EvidenceRecord] = []
     errors: list[str] = []
     for path in paths:
-        record = volume.get(path)
+        record = volume.mft_record(path)
         if record is None:
             continue
         try:
@@ -365,8 +365,9 @@ def collect_files(
             if not basis:
                 continue
 
-        entry = read_entry(volume, record, image_path)
-        if volume.info.filesystem != "directory":  # folder input has no $MFT: host stat() is not image evidence
+        mft_record = volume.mft_record(image_path)
+        entry = read_entry(volume, mft_record or record, image_path)
+        if mft_record is not None:  # folder input without the original $MFT: host stat() is not image evidence
             mft_evidence = entry_to_evidence(entry, image_path, volume.info.identifier, note="downloads candidate")
             records.append(mft_evidence)
             evidence_ids.append(mft_evidence.evidence_id)

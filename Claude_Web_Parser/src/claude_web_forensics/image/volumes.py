@@ -1,6 +1,7 @@
 """Partition discovery, BitLocker handling and NTFS access."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
@@ -53,6 +54,10 @@ class NtfsVolume:
 
     def exists(self, path: str) -> bool:
         return self.get(path) is not None
+
+    def mft_record(self, path: str) -> Any | None:
+        """MFT record for a path ($MFT evidence). On an image this is the record itself."""
+        return self.get(path)
 
     def listdir(self, path: str) -> dict[str, Any]:
         record = self.get(path)
@@ -322,6 +327,31 @@ class DirectoryVolume(NtfsVolume):
             VolumeInfo(index=0, offset=0, size=0, name=str(self.root),
                        filesystem="directory"), fs=None,
         )
+        # A host DFIR tool (Autopsy) may pass the original $MFT plus _host_metadata.json (path -> MFT record/sequence):
+        # $MFT evidence then comes from the original records, looked up by number (no full-table scan).
+        self._mft, self._mft_refs = None, {}
+        meta, mft = self.root / "_host_metadata.json", self.root / "$MFT"
+        if meta.is_file() and mft.is_file():
+            from dissect.ntfs import NTFS
+            self._mft = NTFS(mft=mft.open("rb")).mft
+            entries = json.loads(meta.read_text(encoding="utf-8")).get("entries") or {}
+            self._mft_refs = {k: (e["mft_record"], e.get("mft_seq")) for k, e in entries.items() if e.get("mft_record") is not None}
+
+    @property
+    def has_mft(self) -> bool:
+        return self._mft is not None
+
+    def mft_record(self, path: str) -> Any | None:
+        ref = self._mft_refs.get(path.lower())
+        if ref is None:
+            return None
+        try:
+            record = self._mft.get(ref[0])
+            if ref[1] is not None and int(record.header.SequenceNumber) != ref[1]:
+                return None                                   # record reused since the host read it
+            return record
+        except Exception:
+            return None
 
     def get(self, path: str) -> _DirRecord | None:
         host = self.root.joinpath(*path.strip("/").split("/")) if path.strip("/") else self.root

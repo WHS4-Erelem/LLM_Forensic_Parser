@@ -46,7 +46,7 @@ python -m claude_web_forensics analyze --image \\.\C: --output D:\results\local 
 | 옵션 | 용도 |
 |---|---|
 | `--image` | E01 계열 또는 raw/dd 이미지, 또는 라이브 NTFS 볼륨 장치 경로(`\\.\C:`, VSS 스냅샷 `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN`). `--dir` 과 둘 중 하나 **필수** |
-| `--dir` | 복사된 볼륨 트리 폴더. 폴더 바로 아래에 `Users\` 가 있어야 하며 `Users\<사용자>\AppData\Local\Google\Chrome\User Data`, `Users\<사용자>\Downloads`, `$Recycle.Bin` 을 읽음. `$MFT`·`$UsnJrnl:$J` 는 없으므로 `skipped`/`not_found` 로 보고 |
+| `--dir` | 복사된 볼륨 트리 폴더. 폴더 바로 아래에 `Users\` 가 있어야 하며 `Users\<사용자>\AppData\Local\Google\Chrome\User Data`, `Users\<사용자>\Downloads`, `$Recycle.Bin` 을 읽음. 폴더 루트에 원본 `$MFT` 와 `_host_metadata.json`(Autopsy add-on)이 있으면 `$MFT` 근거를 읽고, 없으면 `skipped`. `$UsnJrnl:$J` 는 `not_found` 로 보고 |
 | `--elevate` | `--image` 가 라이브 볼륨인데 관리자 권한이 없으면 UAC 창을 띄워 자신을 다시 실행하고 끝날 때까지 기다린 뒤 로그와 종료 코드를 돌려줌 |
 | `--output` | 결과 CSV 2개를 저장할 폴더 (**필수**). 이미지·라이브 볼륨 입력은 위치 제한 없음(ARTINEX 통합 실행기가 이미지 옆 `out\<evidence_id>\claude_web` 에 써도 됨). `--dir` 입력은 그 폴더 자체·안쪽·상위를 거부(결과가 다음 실행에서 증거로 읽히지 않도록) |
 | `--partition-offset` / `--partition-index` | 자동 탐색이 모호할 때 파티션 지정 |
@@ -209,7 +209,7 @@ catalogue에 정의된 행위 24개마다 등록된 detector가 하나씩 존재
 ## 알려진 한계
 
 * **단일 스냅샷.** 전/후 비교는 범위 밖입니다. 두 번의 수집 간 변화로만 확인할 수 있는 행위는 `판단불가`로 남습니다.
-* **폴더 입력(`--dir`)에는 `$MFT`·`$UsnJrnl:$J` 가 없습니다.** 다운로드 파일의 MFT 시각, USN rename/delete 체인, 휴지통 항목의 FRN 연결이 빠지므로 다운로드·삭제 관련 행의 판정과 `Artifact_path` 가 이미지 입력과 다를 수 있습니다. 호스트 파일의 stat() 시각은 증거로 쓰지 않습니다. 라이브 볼륨 입력(`\\.\C:`)은 원시 NTFS 를 읽으므로 이 제약이 없습니다.
+* **폴더 입력(`--dir`)에는 `$MFT`·`$UsnJrnl:$J` 가 없습니다** (원본 `$MFT` 와 `_host_metadata.json` 을 함께 넘긴 경우는 `$MFT` 근거만 읽음). 다운로드 파일의 MFT 시각, USN rename/delete 체인, 휴지통 항목의 FRN 연결이 빠지므로 다운로드·삭제 관련 행의 판정과 `Artifact_path` 가 이미지 입력과 다를 수 있습니다. 호스트 파일의 stat() 시각은 증거로 쓰지 않습니다. 라이브 볼륨 입력(`\\.\C:`)은 원시 NTFS 를 읽으므로 이 제약이 없습니다.
 * **`$UsnJrnl`은 부분적인 기록입니다.** Journal wrap 또는 truncation으로 오래된 레코드가 사라질 수 있습니다. create+delete 쌍은 cross-volume move로 보고하지 않으며, 파일명만으로 파일을 연결하지 않습니다.
 * **`$Recycle.Bin`은 Shift+Delete, 비워진 휴지통, 덮어써진 cluster를 포착하지 못합니다.** `$I`는 삭제 metadata이며 파일 바이트는 내보내지 않습니다.
 * **CCL은 live 레코드와 old/deleted LevelDB 레코드를 함께 반환할 수 있습니다.** 상태를 `LIVE` / `HISTORICAL_OR_DELETED` / `UNKNOWN`으로 보존하며 "current"로 합치지 않습니다. old와 deleted를 구분할 수 없는 경우에는 어느 쪽이라고도 단정하지 않습니다.

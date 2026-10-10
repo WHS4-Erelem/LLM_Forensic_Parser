@@ -601,6 +601,16 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
             records.extend(usn_mod.to_records(info, recs_usn, image_desc, rb, loc,
                                               max_excerpt=max_excerpt))
             usn_summary.append({**loc, "status": "ok", **info})
+    elif usn and isinstance(vfs, DirectoryVfs) and os.path.isfile(j_path := os.path.join(vfs.root, "$Extend", "$UsnJrnl:$J")):
+        # 폴더 입력: 호스트 도구가 원본 $J 와 폴더 MFT 번호(_host_metadata.json)를 넘긴 경우 같은 대조에 쓴다
+        say("$UsnJrnl:$J 읽는 중…")
+        loc = {"path": "/$Extend/$UsnJrnl:$J"}
+        try:
+            info, recs_usn = usn_mod.read_journal_file(j_path, max_bytes=usn_max_bytes, claude_dirs=vfs.scanned_dirs())
+            records.extend(usn_mod.to_records(info, recs_usn, image_desc, rb, loc, max_excerpt=max_excerpt))
+            usn_summary = [{**loc, "status": "ok", **info}]
+        except OSError as exc:
+            usn_summary = [{**loc, "status": "not_found", "message": "%s: %s" % (type(exc).__name__, exc)}]
 
     merged = _merge_snapshots(records)
     if merged:

@@ -71,7 +71,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `--format` | `csv`(기본, 팀 공통 CSV 2종) / `json`(cx_result.json 전체 레코드) / `both` |
 | `--kinds` | `rollout,rollout_loose,session_index,global_state,auth,sqlite,prefetch,recent_lnk,webcache` 중 선택 (기본 전체) |
 | `--max-file-mb` | 파싱 대상 파일 하나의 크기 상한(MB, 기본 1024). 넘으면 그 파일만 `FILE_TOO_LARGE` 로 건너뛴다 |
-| `--no-usn` | `$UsnJrnl:$J` 파싱 생략 (기본: 이미지 입력이면 파싱) |
+| `--no-usn` | `$UsnJrnl:$J` 파싱 생략 (기본: 이미지 입력, 또는 추출 폴더에 `$Extend/$UsnJrnl:$J` 가 있으면 파싱) |
 | `--usn-max-bytes` | `$J` 에서 읽을 최대 바이트 (기본 전체) |
 | `--max-excerpt` | 근거 발췌 최대 문자 수 (기본 500) |
 | `--key-material` | BitLocker 볼륨의 키: `recovery:<48자리 복구 키>` / `passphrase:<암호>` / `bek:<.BEK 경로>` / `fvek:<hex>`. 일시 중단·활성화 대기(clear key) 상태는 키 없이 풀린다. 환경변수 `ERELM_KEY_MATERIAL` 로 줘도 된다 |
@@ -99,7 +99,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 | `global_state` | `~/.codex/.codex-global-state.json` | E04-01 `prompt-history.chatgpt-global`, `chatgpt-last-selected-model-v1` 은 NA-00 관찰(선택 모델 상태값, E09-01 근거로 쓰지 않음), E07-02/03 `client-thread-bindings-v1`, 계정 UUID 열거 |
 | `auth` | `~/.codex/auth.json` | E01-01/02/03 (토큰 값은 출력하지 않음) |
 | `sqlite` | `~/.codex/state_5.sqlite`(threads) · `thread_history_1.sqlite`(thread_items) · `logs_2.sqlite`(logs) | E03-01/02 대화 생성·보관, E04-01 프롬프트 — **행마다 시각이 있음**, E01-02 `account/logout` 로그 |
-| (이미지 전용) | `$Extend/$UsnJrnl:$J` | 파일 생성·삭제 시각 — 분석표의 "로그아웃 지문 = auth.json FILE_DELETE" 등 |
+| (이미지, 또는 추출 폴더에 있을 때) | `$Extend/$UsnJrnl:$J` | 파일 생성·삭제 시각 — 분석표의 "로그아웃 지문 = auth.json FILE_DELETE" 등 |
 | `prefetch` (0.3.6) | `Windows/Prefetch/CODEX.EXE-*.pf` | E08-01 애플리케이션 실행 — OS 가 기록한 최근 8회 실행 시각. MAM 압축 해제는 Windows 에서만 |
 | `recent_lnk` (0.3.6) | `Users/*/AppData/Roaming/Microsoft/Windows/Recent/*.lnk` | E06-02 생성 이미지 다운로드(대상이 `Codex 이미지 …` = 확정 / 그 밖의 이미지 = 추정), E05-05 문서 다운로드(문서 확장자·머리 바이트 + 대상이 같은 시각에 새로 생김). 종류를 알 수 없는 저장도 E05-05 로 내고 Behavior_details 에 '종류 미확인' 을 적는다 (0.3.23) |
 | `webcache` (0.3.7) | `…\Packages\OpenAI.Codex_…\LocalCache\Roaming\Codex\web\Codex\Default\Cache\Cache_Data\` (index·data_0~3·f_*) | **채팅 모드** 대화 전체 — conversation 응답 JSON: E03-01 대화 생성, E04-01 프롬프트(본문·시각), E05-01/03 첨부 업로드(metadata.attachments 파일명·MIME), E06-01 이미지 생성(image_asset_pointer·image_gen_title), E03-03/04 분기(대화 수정·재시도), E10-01 임시 채팅(is_temporary_chat), E09-01 모델 변경(default_model_slug 변화, 추정), `estuary/content?…&fn=` 요청 = E05-05/E06-02 파일 내려받기. assistant 응답은 recovered_conversations 로. Chrome Blockfile Cache Reader 는 팀 ChatGPT Web 파서(cache.py)를 옮겨 온 것 (`webcache.py`). **앱을 삭제하면 통째로 사라진다** |
