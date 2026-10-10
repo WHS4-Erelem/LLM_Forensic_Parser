@@ -3604,25 +3604,40 @@ def conversation_rows(ctx: AnalysisContext) -> list[list[str]]:
     return result
 
 
-def write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+def write_csv(path: Path, header: Sequence[str], rows: Sequence[Sequence[str]], *,
+              overwrite: bool = False) -> None:
+    with path.open("w" if overwrite else "x", encoding="utf-8-sig", newline="") as fh:
         writer = csv.writer(fh, lineterminator="\r\n", quoting=csv.QUOTE_MINIMAL)
         writer.writerow([spreadsheet_safe(value) for value in header])
         for row in rows:
             writer.writerow([spreadsheet_safe(value) for value in row])
 
 
-def write_outputs(ctx: AnalysisContext, output: Path) -> None:
+def preflight_outputs(output: Path, *, overwrite: bool = False, validate: bool = False) -> None:
+    """Check every planned result before any result file is written."""
+    names = ("timeline.csv", "recovered_conversations.csv") + (("validation.json",) if validate else ())
+    targets = [output / name for name in names]
+    existing = [target for target in targets if target.exists() or target.is_symlink()]
+    if existing and not overwrite:
+        raise FileExistsError("기존 결과 파일이 존재합니다: " + ", ".join(str(target) for target in existing)
+                              + ". 다른 --output 경로를 지정하거나 --overwrite로 명시적으로 교체하십시오.")
+    for target in targets:
+        if target.is_symlink() or target.resolve().parent != output.resolve() or (target.exists() and target.stat().st_nlink > 1):
+            raise ValueError(f"출력 대상이 link 또는 외부 경로입니다: {target}")
+    for target in existing:
+        if not target.is_file():
+            raise ValueError(f"출력 대상이 일반 파일이 아닙니다: {target}")
+
+
+def write_outputs(ctx: AnalysisContext, output: Path, *, overwrite: bool = False,
+                  validate: bool = False) -> None:
     error = validate_live_output(ctx, output) if ctx.live else validate_paths(ctx.input_path, output)
     if error:
         raise ValueError(error)
+    preflight_outputs(output, overwrite=overwrite, validate=validate)
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("timeline.csv", "recovered_conversations.csv"):
-        target = output / name
-        if target.is_symlink() or target.resolve().parent != output.resolve() or (target.exists() and target.stat().st_nlink > 1):
-            raise ValueError("출력 대상이 link 또는 외부 경로입니다.")
-    write_csv(output / "timeline.csv", TIMELINE_HEADER, timeline_rows(ctx))
-    write_csv(output / "recovered_conversations.csv", CONVERSATION_HEADER, conversation_rows(ctx))
+    write_csv(output / "timeline.csv", TIMELINE_HEADER, timeline_rows(ctx), overwrite=overwrite)
+    write_csv(output / "recovered_conversations.csv", CONVERSATION_HEADER, conversation_rows(ctx), overwrite=overwrite)
 
 
 # ---------------------------------------------------------------------------
@@ -3671,6 +3686,40 @@ def validate_live_output(ctx: AnalysisContext, output: Path) -> str:
         if is_inside(output, protected) or is_inside(protected, output):
             return "Live 출력 경로가 수집 대상 directory와 겹칩니다. 별도 output directory를 지정하십시오."
     return ""
+
+
+def select_output_directory(ctx: AnalysisContext, output: Path, *, overwrite: bool = False,
+                            validate: bool = False, before_path: Path | None = None) -> Path:
+    """Reuse an unoccupied output, or reserve the first unused numbered sibling."""
+    def check_path(candidate: Path) -> None:
+        error = validate_live_output(ctx, candidate) if ctx.live else validate_paths(ctx.input_path, candidate)
+        if before_path is not None:
+            error = error or validate_paths(before_path, candidate)
+        if error:
+            raise ValueError(error)
+
+    check_path(output)
+    try:
+        preflight_outputs(output, overwrite=overwrite, validate=validate)
+    except FileExistsError:
+        if overwrite:
+            raise
+    else:
+        return output
+
+    index = 1
+    while True:
+        candidate = output.with_name(f"{output.name}_{index:03d}")
+        index += 1
+        if candidate.exists() or candidate.is_symlink():
+            continue
+        check_path(candidate)
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        preflight_outputs(candidate, validate=validate)
+        return candidate
 
 
 def terminal_text(value: str) -> str:
@@ -3898,7 +3947,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description="Windows LM Studio forensic artifact parser (read-only evidence access)",
     )
     parser.add_argument("input", nargs="?", type=Path, help=".lmstudio, User Profile, Windows root, DD/RAW/IMG (including split .001), or E01")
-    parser.add_argument("--output", type=Path, help="Directory for timeline.csv and recovered_conversations.csv")
+    parser.add_argument("--output", type=Path, help="Result directory; existing results use a new _001, _002, ... sibling")
+    parser.add_argument("--overwrite", action="store_true", help="Replace results in the requested directory instead of selecting a new sibling")
     parser.add_argument("--before", type=Path, help="Explicit earlier snapshot of the same subject; no folder-name inference")
     parser.add_argument("--validate", action="store_true", help="Analyze twice and validate CSV, security, integrity, and determinism")
     parser.add_argument("--self-test", action="store_true", help="Run the embedded regression suite")
@@ -3941,7 +3991,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     has_credential = bool(args.bitlocker_recovery_prompt or args.bitlocker_passphrase_prompt
                           or args.bitlocker_bek is not None or args.bitlocker_fvek is not None)
     if args.self_test:
-        if args.input is not None or args.output is not None or args.before is not None or args.validate or args.live or args.live_root is not None or has_credential:
+        if args.input is not None or args.output is not None or args.overwrite or args.before is not None or args.validate or args.live or args.live_root is not None or has_credential:
             print("오류: --self-test는 다른 분석 인자와 함께 사용할 수 없습니다.", file=sys.stderr)
             return 2
         return run_self_tests()
@@ -3964,7 +4014,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if has_credential and not is_image_path(input_path):
         print("오류: BitLocker credential은 forensic image 입력에만 사용됩니다.", file=sys.stderr)
         return 2
-    output_path = args.output.resolve()
+    requested_output = args.output.resolve()
+    output_path = requested_output
     input_kind = "Windows Live" if args.live else (input_path.suffix.upper().lstrip('.') + " image" if is_image_path(input_path) else "directory/file")
     emit_progress(1, f"입력 검증: {input_path}; 입력 유형={input_kind}")
     if args.live:
@@ -3978,6 +4029,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if path_error:
         print(f"오류: {path_error}", file=sys.stderr)
         return 2
+    try:
+        preflight_outputs(output_path, overwrite=args.overwrite, validate=args.validate)
+    except FileExistsError:
+        # Select a fresh directory after analysis, before any result is written.
+        pass
+    except (OSError, ValueError) as exc:
+        print("오류: " + terminal_text(str(exc)), file=sys.stderr)
+        return 3
     before = image_stat(input_path)
     before_snapshot_stat = image_stat(args.before.resolve()) if args.before is not None else None
     try:
@@ -3993,9 +4052,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         emit_progress(7, "CSV 출력")
-        write_outputs(ctx, output_path)
-    except (OSError, ValueError):
-        print("오류: 출력 CSV를 작성할 수 없습니다.", file=sys.stderr)
+        output_path = select_output_directory(ctx, requested_output, overwrite=args.overwrite, validate=args.validate,
+                                               before_path=args.before.resolve() if args.before is not None else None)
+        if output_path != requested_output:
+            print("기존 분석 결과 보존: " + terminal_text(str(requested_output)), flush=True)
+        print("결과 저장 경로: " + terminal_text(str(output_path)), flush=True)
+        write_outputs(ctx, output_path, overwrite=args.overwrite, validate=args.validate)
+    except (OSError, ValueError) as exc:
+        print("오류: 출력 CSV를 작성할 수 없습니다. " + terminal_text(str(exc)), file=sys.stderr)
         return 3
     after = image_stat(input_path)
     if args.before is not None and before_snapshot_stat != image_stat(args.before.resolve()):
@@ -4015,7 +4079,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             validation = validate_analysis(ctx, input_path, output_path, before, credential=credential,
                                            before_path=args.before.resolve() if args.before is not None else None)
             validation_path = output_path / "validation.json"
-            validation_path.write_text(json.dumps(validation, ensure_ascii=False, indent=2), encoding="utf-8")
+            with validation_path.open("w" if args.overwrite else "x", encoding="utf-8") as fh:
+                fh.write(json.dumps(validation, ensure_ascii=False, indent=2))
             print("검증 PASS: " + terminal_text(str(validation_path)), flush=True)
         except (AssertionError, OSError, ValueError) as exc:
             print("검증 FAIL: " + terminal_text(str(exc)), file=sys.stderr)
@@ -4281,8 +4346,9 @@ class OutputContractTests(unittest.TestCase):
         parser.write_outputs(ctx1, output)
         first = {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in ("timeline.csv", "recovered_conversations.csv")}
         ctx2 = parser.analyze(root)
-        parser.write_outputs(ctx2, output)
-        second = {name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in ("timeline.csv", "recovered_conversations.csv")}
+        repeat_output = output.with_name("repeat_output")
+        parser.write_outputs(ctx2, repeat_output)
+        second = {name: hashlib.sha256((repeat_output / name).read_bytes()).hexdigest() for name in ("timeline.csv", "recovered_conversations.csv")}
         self.assertEqual(first, second)
 
     def test_sensitive_account_values_not_retained(self) -> None:
@@ -4306,6 +4372,319 @@ class OutputContractTests(unittest.TestCase):
         root.mkdir()
         error = parser.validate_paths(root, root / "output")
         self.assertTrue(error)
+
+
+class OutputCollisionTests(unittest.TestCase):
+    _fixture = OutputContractTests._fixture
+
+    def _run_cli(self, root: Path, output: Path, *options: str) -> tuple[int, str, str]:
+        from contextlib import redirect_stdout, redirect_stderr
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = parser.main([str(root), "--output", str(output), *options])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def _snapshot(self, output: Path) -> dict[str, tuple[bytes, str]]:
+        snapshot = {}
+        for path in output.iterdir():
+            if path.is_file():
+                content = path.read_bytes()
+                snapshot[path.name] = (content, hashlib.sha256(content).hexdigest())
+        return snapshot
+
+    def test_cli_creates_missing_output(self) -> None:
+        _, root, output = self._fixture()
+        self.assertFalse(output.exists())
+        code, _, stderr = self._run_cli(root, output)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual({"timeline.csv", "recovered_conversations.csv"}, set(self._snapshot(output)))
+
+    def test_existing_directory_and_unplanned_files_are_preserved(self) -> None:
+        _, root, output = self._fixture()
+        output.mkdir()
+        for name in ("unrelated.txt", "validation.json"):
+            (output / name).write_bytes(b"SYNTHETIC_UNPLANNED_RESULT")
+        before = self._snapshot(output)
+        code, _, stderr = self._run_cli(root, output)
+        self.assertEqual(0, code, stderr)
+        after = self._snapshot(output)
+        self.assertEqual(before, {name: after[name] for name in before})
+        self.assertEqual(set(before) | {"timeline.csv", "recovered_conversations.csv"}, set(after))
+
+    def test_cli_accepts_empty_existing_output_directory(self) -> None:
+        for validate in (False, True):
+            with self.subTest(validate=validate):
+                _, root, output = self._fixture()
+                output.mkdir()
+                code, _, stderr = self._run_cli(root, output, *(["--validate"] if validate else []))
+                self.assertEqual(0, code, stderr)
+                expected = {"timeline.csv", "recovered_conversations.csv"} | ({"validation.json"} if validate else set())
+                self.assertEqual(expected, set(self._snapshot(output)))
+
+    def test_all_collision_subsets_preserve_content_hashes_and_prevent_partial_output(self) -> None:
+        for validate in (False, True):
+            names = ("timeline.csv", "recovered_conversations.csv") + (("validation.json",) if validate else ())
+            for mask in range(1, 1 << len(names)):
+                with self.subTest(validate=validate, mask=mask):
+                    _, root, output = self._fixture()
+                    output.mkdir()
+                    existing = [name for index, name in enumerate(names) if mask & (1 << index)]
+                    for name in existing + ["unrelated.txt"]:
+                        (output / name).write_bytes(("기존 분석 결과: " + name + "\n보존").encode("utf-8"))
+                    before = self._snapshot(output)
+                    directory_mtime = output.stat().st_mtime_ns
+                    selected = output.with_name(output.name + "_001")
+                    with patch.object(parser, "write_outputs", wraps=parser.write_outputs) as writer:
+                        code, stdout, stderr = self._run_cli(root, output, *(["--validate"] if validate else []))
+                    self.assertEqual(0, code, stderr)
+                    self.assertIn("기존 분석 결과 보존: " + str(output), stdout)
+                    self.assertIn("결과 저장 경로: " + str(selected), stdout)
+                    self.assertEqual(before, self._snapshot(output))
+                    self.assertEqual(directory_mtime, output.stat().st_mtime_ns)
+                    self.assertEqual(set(names), set(self._snapshot(selected)))
+                    self.assertTrue(all(call.args[1] != output for call in writer.call_args_list))
+                    self.assertEqual(selected, writer.call_args_list[0].args[1])
+                    if validate:
+                        result = json.loads((selected / "validation.json").read_text(encoding="utf-8"))
+                        self.assertEqual("PASS", result["status"])
+                        self.assertEqual(str(selected), result["output"])
+                        self.assertTrue(result["repeat_byte_identical"])
+
+    def test_repeated_runs_group_all_results_in_numbered_directories(self) -> None:
+        _, root, output = self._fixture()
+        snapshots = {}
+        csv_hashes = None
+        for index in range(3):
+            selected = output if index == 0 else output.with_name(f"{output.name}_{index:03d}")
+            code, stdout, stderr = self._run_cli(root, output, "--validate")
+            self.assertEqual(0, code, stderr)
+            self.assertIn("결과 저장 경로: " + str(selected), stdout)
+            for previous, snapshot in snapshots.items():
+                self.assertEqual(snapshot, self._snapshot(previous))
+            snapshot = self._snapshot(selected)
+            self.assertEqual({"timeline.csv", "recovered_conversations.csv", "validation.json"}, set(snapshot))
+            result = json.loads((selected / "validation.json").read_text(encoding="utf-8"))
+            self.assertEqual("PASS", result["status"])
+            self.assertEqual(str(selected), result["output"])
+            self.assertTrue(result["repeat_byte_identical"])
+            if csv_hashes is not None:
+                self.assertEqual(csv_hashes, result["sha256"])
+            csv_hashes = result["sha256"]
+            snapshots[selected] = snapshot
+
+    def test_numbered_directory_skips_existing_directories_and_files(self) -> None:
+        for occupied_kind in ("results", "empty", "unrelated", "file"):
+            with self.subTest(occupied_kind=occupied_kind):
+                _, root, output = self._fixture()
+                output.mkdir()
+                (output / "timeline.csv").write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+                before = self._snapshot(output)
+                occupied = output.with_name(output.name + "_001")
+                if occupied_kind == "file":
+                    occupied.write_bytes(b"SYNTHETIC_OCCUPIED_PATH")
+                    occupied_before = occupied.read_bytes()
+                else:
+                    occupied.mkdir()
+                    if occupied_kind != "empty":
+                        name = "recovered_conversations.csv" if occupied_kind == "results" else "unrelated.txt"
+                        (occupied / name).write_bytes(b"SYNTHETIC_OCCUPIED_DIRECTORY")
+                    occupied_before = self._snapshot(occupied)
+                occupied_mtime = occupied.stat().st_mtime_ns
+                selected = output.with_name(output.name + "_002")
+                code, stdout, stderr = self._run_cli(root, output)
+                self.assertEqual(0, code, stderr)
+                self.assertIn("결과 저장 경로: " + str(selected), stdout)
+                self.assertEqual(before, self._snapshot(output))
+                self.assertEqual(occupied_before, occupied.read_bytes() if occupied_kind == "file" else self._snapshot(occupied))
+                self.assertEqual(occupied_mtime, occupied.stat().st_mtime_ns)
+                self.assertEqual({"timeline.csv", "recovered_conversations.csv"}, set(self._snapshot(selected)))
+
+    def test_numbered_directory_uses_first_available_suffix(self) -> None:
+        _, root, output = self._fixture()
+        output.mkdir()
+        (output / "timeline.csv").write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+        occupied = output.with_name(output.name + "_002")
+        occupied.mkdir()
+        (occupied / "unrelated.txt").write_bytes(b"SYNTHETIC_KEEP")
+        before = self._snapshot(occupied)
+        code, stdout, stderr = self._run_cli(root, output)
+        self.assertEqual(0, code, stderr)
+        self.assertIn("결과 저장 경로: " + str(output.with_name(output.name + "_001")), stdout)
+        self.assertEqual(before, self._snapshot(occupied))
+
+    def test_numbered_directory_reservation_retries_a_creation_collision(self) -> None:
+        _, root, output = self._fixture()
+        output.mkdir()
+        (output / "timeline.csv").write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+        before = self._snapshot(output)
+        competing = output.with_name(output.name + "_001")
+        original_mkdir = Path.mkdir
+        content = b"SYNTHETIC_COMPETING_DIRECTORY"
+        def competing_mkdir(path, *args, **kwargs):
+            if path == competing:
+                original_mkdir(path, *args, **kwargs)
+                (path / "unrelated.txt").write_bytes(content)
+                raise FileExistsError("SYNTHETIC_DIRECTORY_CREATED_CONCURRENTLY")
+            return original_mkdir(path, *args, **kwargs)
+        with patch.object(Path, "mkdir", competing_mkdir):
+            code, stdout, stderr = self._run_cli(root, output)
+        self.assertEqual(0, code, stderr)
+        selected = output.with_name(output.name + "_002")
+        self.assertIn("결과 저장 경로: " + str(selected), stdout)
+        self.assertEqual(before, self._snapshot(output))
+        self.assertEqual({"unrelated.txt": (content, hashlib.sha256(content).hexdigest())}, self._snapshot(competing))
+        self.assertEqual({"timeline.csv", "recovered_conversations.csv"}, set(self._snapshot(selected)))
+
+    def test_numbered_directory_creation_failure_preserves_existing_results(self) -> None:
+        _, root, output = self._fixture()
+        output.mkdir()
+        (output / "timeline.csv").write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+        before = self._snapshot(output)
+        selected = output.with_name(output.name + "_001")
+        original_mkdir = Path.mkdir
+        def denied_mkdir(path, *args, **kwargs):
+            if path == selected:
+                raise PermissionError("SYNTHETIC_OUTPUT_CREATION_DENIED")
+            return original_mkdir(path, *args, **kwargs)
+        with patch.object(Path, "mkdir", denied_mkdir), patch.object(parser, "write_csv") as writer:
+            code, _, stderr = self._run_cli(root, output)
+        self.assertEqual(3, code)
+        self.assertIn("SYNTHETIC_OUTPUT_CREATION_DENIED", stderr)
+        self.assertEqual(before, self._snapshot(output))
+        self.assertFalse(selected.exists())
+        writer.assert_not_called()
+
+    def test_write_outputs_preflights_all_planned_results(self) -> None:
+        for name, validate in (("timeline.csv", False), ("recovered_conversations.csv", False),
+                               ("validation.json", True)):
+            with self.subTest(name=name):
+                _, root, output = self._fixture()
+                ctx = parser.analyze(root)
+                output.mkdir()
+                (output / name).write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+                before = self._snapshot(output)
+                with patch.object(parser, "write_csv") as writer:
+                    with self.assertRaisesRegex(FileExistsError, re.escape(name)):
+                        parser.write_outputs(ctx, output, validate=validate)
+                writer.assert_not_called()
+                self.assertEqual(before, self._snapshot(output))
+
+    def test_cli_rechecks_collisions_after_analysis_before_writing(self) -> None:
+        _, root, output = self._fixture()
+        ctx = parser.analyze(root)
+        content = b"SYNTHETIC_RESULT_CREATED_DURING_ANALYSIS"
+        def analyze_and_create_result(*args, **kwargs):
+            output.mkdir()
+            (output / "recovered_conversations.csv").write_bytes(content)
+            return ctx
+        with patch.object(parser, "analyze", side_effect=analyze_and_create_result), \
+             patch.object(parser, "write_csv", wraps=parser.write_csv) as writer:
+            code, stdout, stderr = self._run_cli(root, output)
+        self.assertEqual(0, code, stderr)
+        selected = output.with_name(output.name + "_001")
+        self.assertIn("결과 저장 경로: " + str(selected), stdout)
+        self.assertEqual([selected / "timeline.csv", selected / "recovered_conversations.csv"],
+                         [call.args[0] for call in writer.call_args_list])
+        self.assertEqual({"recovered_conversations.csv": (content, hashlib.sha256(content).hexdigest())},
+                         self._snapshot(output))
+
+    def test_cli_explicit_overwrite_replaces_only_planned_results(self) -> None:
+        for validate in (False, True):
+            with self.subTest(validate=validate):
+                _, root, output = self._fixture()
+                ctx = parser.analyze(root)
+                output.mkdir()
+                for name in ("timeline.csv", "recovered_conversations.csv", "validation.json", "unrelated.txt"):
+                    (output / name).write_bytes(b"SYNTHETIC_PRIOR_RESULT")
+                before = self._snapshot(output)
+                options = ["--overwrite"] + (["--validate"] if validate else [])
+                code, _, stderr = self._run_cli(root, output, *options)
+                self.assertEqual(0, code, stderr)
+                parser._read_and_validate_csv(output / "timeline.csv", parser.TIMELINE_HEADER, parser.timeline_rows(ctx))
+                parser._read_and_validate_csv(output / "recovered_conversations.csv", parser.CONVERSATION_HEADER,
+                                              parser.conversation_rows(ctx))
+                after = self._snapshot(output)
+                self.assertFalse(output.with_name(output.name + "_001").exists())
+                self.assertEqual(set(before), set(after))
+                self.assertEqual(before["unrelated.txt"], after["unrelated.txt"])
+                for name in ("timeline.csv", "recovered_conversations.csv"):
+                    self.assertNotEqual(before[name], after[name])
+                if validate:
+                    result = json.loads((output / "validation.json").read_text(encoding="utf-8"))
+                    self.assertEqual("PASS", result["status"])
+                    self.assertTrue(result["repeat_byte_identical"])
+                    self.assertEqual({name: after[name][1] for name in ("timeline.csv", "recovered_conversations.csv")},
+                                     result["sha256"])
+                else:
+                    self.assertEqual(before["validation.json"], after["validation.json"])
+
+    def test_csv_writer_requires_explicit_overwrite(self) -> None:
+        _, _, output = self._fixture()
+        output.mkdir()
+        target = output / "timeline.csv"
+        content = b"SYNTHETIC_PRIOR_RESULT"
+        target.write_bytes(content)
+        with self.assertRaises(FileExistsError):
+            parser.write_csv(target, ["header"], [["새 결과"]])
+        self.assertEqual(content, target.read_bytes())
+        self.assertEqual(hashlib.sha256(content).hexdigest(), hashlib.sha256(target.read_bytes()).hexdigest())
+        parser.write_csv(target, ["header"], [["새 결과"]], overwrite=True)
+        parser._read_and_validate_csv(target, ["header"], [["새 결과"]])
+
+    def test_korean_multiline_formula_csv_and_determinism_with_validation(self) -> None:
+        _, root, output = self._fixture()
+        fixture = root / "conversations" / "TEST.conversation.json"
+        data = json.loads(fixture.read_text(encoding="utf-8"))
+        text = '=한국어 질문\n둘째 줄, "따옴표"'
+        data["name"] = "한국어 대화"
+        data["messages"][0]["versions"][0]["content"][0]["text"] = text
+        fixture.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        code, _, stderr = self._run_cli(root, output, "--validate")
+        self.assertEqual(0, code, stderr)
+        ctx = parser.analyze(root)
+        rows, _ = parser._read_and_validate_csv(output / "recovered_conversations.csv", parser.CONVERSATION_HEADER,
+                                               parser.conversation_rows(ctx))
+        self.assertEqual("한국어 대화", rows[1][3])
+        self.assertEqual("'" + text, rows[1][8])
+        parser._read_and_validate_csv(output / "timeline.csv", parser.TIMELINE_HEADER, parser.timeline_rows(ctx))
+        result = json.loads((output / "validation.json").read_text(encoding="utf-8"))
+        self.assertTrue(result["repeat_byte_identical"])
+
+    def test_overwrite_cannot_bypass_link_or_directory_safety(self) -> None:
+        for name in ("timeline.csv", "recovered_conversations.csv", "validation.json"):
+            for linked in (False, True):
+                with self.subTest(name=name, linked=linked):
+                    _, root, output = self._fixture()
+                    output.mkdir()
+                    target = output / name
+                    if linked:
+                        source = output / "unrelated.txt"
+                        source.write_bytes(b"SYNTHETIC_LINK_SOURCE")
+                        os.link(source, target)
+                    else:
+                        target.mkdir()
+                    before = self._snapshot(output)
+                    with patch.object(parser, "write_csv") as writer:
+                        code, _, stderr = self._run_cli(root, output, "--overwrite", "--validate")
+                    self.assertEqual(3, code)
+                    self.assertIn(name, stderr)
+                    writer.assert_not_called()
+                    self.assertEqual(before, self._snapshot(output))
+                    self.assertEqual({name, "unrelated.txt"} if linked else {name},
+                                     {path.name for path in output.iterdir()})
+                    code, stdout, stderr = self._run_cli(root, output, "--validate")
+                    self.assertEqual(0, code, stderr)
+                    selected = output.with_name(output.name + "_001")
+                    self.assertIn("결과 저장 경로: " + str(selected), stdout)
+                    self.assertEqual(before, self._snapshot(output))
+                    self.assertEqual({"timeline.csv", "recovered_conversations.csv", "validation.json"},
+                                     set(self._snapshot(selected)))
+
+    def test_self_test_rejects_overwrite_analysis_option(self) -> None:
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()), patch.object(parser, "run_self_tests") as tests:
+            self.assertEqual(2, parser.main(["--self-test", "--overwrite"]))
+        tests.assert_not_called()
 
 
 def message(role="user", text="TEST text", **fields):
@@ -5341,8 +5720,13 @@ class FinalContractTests(FixtureCase):
         output.mkdir()
         (output / 'recovered_conversations.csv').write_text('legacy')
         (output / 'unrelated.txt').write_text('keep')
-        parser.write_outputs(ctx, output)
+        with self.assertRaises(FileExistsError):
+            parser.write_outputs(ctx, output)
+        self.assertEqual('legacy', (output / 'recovered_conversations.csv').read_text())
+        self.assertFalse((output / 'timeline.csv').exists())
+        parser.write_outputs(ctx, output, overwrite=True)
         self.assertTrue((output / 'recovered_conversations.csv').exists())
+        self.assertNotEqual('legacy', (output / 'recovered_conversations.csv').read_text(encoding='utf-8-sig'))
         self.assertFalse((output / 'recovered_conversation.csv').exists())
         self.assertEqual('keep', (output / 'unrelated.txt').read_text())
 
@@ -5681,6 +6065,35 @@ class WindowsLiveTests(unittest.TestCase):
             rc = parser.main(["--live", "--live-root", str(self.root), "--output", str(self.base / "out")])
         self.assertEqual(0, rc)
         self.assertTrue((self.base / "out" / "recovered_conversations.csv").exists())
+
+    def test_live_output_collision_preserves_result_until_explicit_overwrite(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        self.profile()
+        output = self.base / "out"
+        output.mkdir()
+        target = output / "recovered_conversations.csv"
+        content = b"SYNTHETIC_PRIOR_LIVE_RESULT"
+        target.write_bytes(content)
+        options = ["--live", "--live-root", str(self.root), "--output", str(output)]
+        stdout = io.StringIO()
+        with patch.object(sys, "platform", "win32"), redirect_stdout(stdout), redirect_stderr(io.StringIO()):
+            self.assertEqual(0, parser.main(options))
+        selected = output.with_name(output.name + "_001")
+        self.assertIn("결과 저장 경로: " + str(selected), stdout.getvalue())
+        self.assertEqual(content, target.read_bytes())
+        self.assertEqual(hashlib.sha256(content).hexdigest(), hashlib.sha256(target.read_bytes()).hexdigest())
+        self.assertEqual({target.name}, {path.name for path in output.iterdir()})
+        ctx = self.analyze_live()
+        parser._read_and_validate_csv(selected / target.name, parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+        self.assertTrue((selected / "timeline.csv").exists())
+        selected_before = {path.name: path.read_bytes() for path in selected.iterdir()}
+        with patch.object(sys, "platform", "win32"), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(0, parser.main(options + ["--overwrite"]))
+        ctx = self.analyze_live()
+        parser._read_and_validate_csv(target, parser.CONVERSATION_HEADER, parser.conversation_rows(ctx))
+        self.assertTrue((output / "timeline.csv").exists())
+        self.assertEqual(selected_before, {path.name: path.read_bytes() for path in selected.iterdir()})
+        self.assertFalse(output.with_name(output.name + "_002").exists())
 
     def test_non_windows_rejected(self):
         from contextlib import redirect_stderr
