@@ -84,7 +84,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
   - Model=`chatgpt-desktop`, Timestamp=`YYYY-MM-DD HH:MM:SS.ffffff KST`, User_behavior=분석표 카탈로그 행위명, Behavior_details=`<흔적 성격>_<내용>`,
     Verdict=확정/의심 (판단 불가·NA-00 은 JSON 에만), Artifact_path=`C:\Users\…` 표기 (드라이브 문자는 이미지의 `SYSTEM\MountedDevices` 로 확인한 값, 0.3.24 — 확인 못 하면 `C:` 가정), Artifact_details=`[Rollout|SQLite|GlobalState|…] 유형=…, 대화 UUID=…, 위치=…, MFT=…, 규칙=E04-01, 패키지=…`
 - `recovered_conversations.csv` — 팀 공통 ②: `Model, timestamp, conversation_uuid, conversation_title, message_uuid, parent_message_uuid, message order, role, content, Artifact_path`
-  - rollout·thread_items 의 user/assistant 메시지. 같은 (역할, 본문) 이 2초 안에 양쪽에 있으면 rollout 1행만. 대화별 message order 1..n, parent 는 직전 메시지(첫 메시지는 `00000000-0000-4000-8000-000000000000`)
+  - rollout·thread_items 의 user/assistant 메시지. 같은 (역할, 본문) 이 2초 안에 있고 **같은 대화 ID 이거나 다른 아티팩트(rollout ↔ SQLite)** 면 같은 메시지의 사본으로 보고 rollout 1행만 둔다. 같은 아티팩트 안의 다른 대화에 같은 본문이 있으면 별개 메시지로 남긴다 (0.3.28). 대화별 message order 1..n, parent 는 직전 메시지(첫 메시지는 `00000000-0000-4000-8000-000000000000`)
 - `cx_result.json` (`--format json|both`) — 전체 레코드(시각·행위·근거 3항목, 판단 불가·NA-00 포함) + 스캔정보 + 스키마 관찰 + USN 요약 + 경고/오류
 - 팀 파서 공통 관례: 출력 폴더에 기존 결과가 있으면 거부(`--overwrite`), 셀이 `= + - @` 로 시작하면 `'` 접두(Excel 수식 방지)
 
@@ -108,6 +108,7 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 첨부 업로드 = 프롬프트 본문의 `# Files mentioned by the user` 목록 / 애플리케이션 실행·종료 = `logs_2.sqlite` 의 `process_uuid` 구간 시작·끝 (종료는 정상·강제 구분 불가라 추정).
 2026-08-29 S3 스냅샷(앱 미삭제)으로 검증: 임시 채팅 03:31:36, 이미지 업로드 02:29:41, 문서 업로드 02:32:09, 이미지 생성 03:35:34, 생성 이미지 다운로드 03:40:53, 모델 변경 03:29:17(auto→gpt-5-6), 대화 수정 02:26:47, 재시도 02:27:07 — 8월 분석 보고서의 정답 창과 모두 일치.
 타임라인 정리 규칙(`output.py`): 같은 프롬프트가 rollout·SQLite·캐시·global-state 여러 곳에 있으면 시각 있는 행 하나에 접는다. Prefetch 실행 중 앱 프로세스 구간 안의 것은 보조 프로세스 기동이라 타임라인에서 빼고, 60초 안의 여러 .pf 실행은 하나로 접는다(JSON 에는 남음).
+0.3.28 (2026-10-10, 대화 CSV 중복 판정이 다른 대화의 메시지를 지우던 문제): `recovered_conversations.csv` 는 같은 메시지가 rollout 과 SQLite 양쪽에 있을 때 한 행만 두는데, 판정 키가 (역할, 본문, ±2초) 뿐이라 **다른 대화**의 같은 본문(같은 프롬프트를 두 대화에 보낸 경우 등)도 지워졌다. 대화 ID 를 판정에 넣되, 분기 스레드는 rollout(원본 ID)·SQLite(분기 ID)의 ID 가 달라 "같은 대화 ID 이거나 다른 아티팩트" 를 사본 조건으로 한다 — 같은 아티팩트 안의 다른 대화는 남긴다. 자체 검사(`python -m cxparser.output`)에 사본·다른 대화·2초 밖 사례 추가. 시나리오 이미지 2장은 해당 사례가 없어 출력 동일.
 0.3.27 (2026-10-08, 설치 시각 정의 — 팀 결정 '설치 = 다운로드(패키지 쓰기) 완료'): 애플리케이션 설치(E02-01)의 시각을 패키지 폴더의 **생성 시각(받기 시작)** 에서 **마지막 수정 시각(패키지 쓰기 완료)** 으로 바꿨다(`package_install.py`). Store 는 받기 시작할 때 폴더를 만들고 다 받으면 폴더 수정 시각이 갱신되며, 패키지 폴더는 설치 뒤 바뀌지 않고 업데이트는 새 버전 폴더를 만들어 수정 시각이 뒤로 밀리지 않는다. 근거(details)에 `download_started_utc`(생성)·`installed_utc`(수정)·`version` 을 함께 적고, 사용자 데이터 폴더 관찰(NA-00)은 "최초 설치(첫 등록) 시점 추정" 으로 표기. image2: 11:27:19 → 11:35:24 (시트 '다운로드 완료' 11:35:30, 6초 차) — 정답 9건 9/0/0. image1: 03:54:19 → 03:57:09 (시트는 첫 실행 04:34:26 을 설치로 적어 여전히 부분) — 12/2/5 그대로. Autopsy 경유(호스트 메타데이터) 출력도 같게 바뀜.
 
 0.3.26 (2026-10-08, image2 검증 — 다운로드 중복 행): 같은 파일 다운로드가 채팅 모드 웹 캐시(내려받기 요청, 확인)와 최근 항목 바로가기(저장된 파일, 추정) 두 행으로 나와 한 행위가 두 건으로 세어졌다(image2 `CD_고객안내_승인대기.pdf` 11:47:34 / 11:47:42). 파일명이 같고(확장자·중복 번호 `(n)` 제외) 60초 안이면 웹 캐시 행 하나만 남기고 바로가기 시각과 저장 파일 생성 시각을 그 행의 `Artifact_details` 에 접는다(`output._fold_downloads`, 앱 실행의 Prefetch 접기와 같은 방식). 바로가기만 있는 경우(에이전트 모드, image1)는 그대로. image1 58행 동일, image2 13 → 12행, 정답 대조 8/1/0 그대로.

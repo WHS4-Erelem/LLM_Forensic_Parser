@@ -281,18 +281,23 @@ def write_conversations_csv(path, records):
     분기(대화 수정) 스레드는 rollout 파일명은 원본 ID, SQLite 는 분기 ID 라 대화 ID 로 묶지 않는다.
     부모 메시지는 원본에 포인터가 없어 같은 대화의 직전 메시지(선형), 첫 메시지는 ROOT_PARENT."""
     titles = _titles(records)
-    msgs, seen = [], {}      # seen: (role, text) -> [utc]
+    msgs, seen = [], {}      # seen: (role, text) -> [(utc, thread_id, artifact)]
     for r in records:
         det = r.get("details") or {}
         role = _ROLE.get(det.get("role") or det.get("item_type"))
         if role is None or not det.get("text"):
             continue
         utc = r["timestamp"].get("utc")
+        tid, art = det.get("thread_id") or "", det.get("artifact")
         key = (role, " ".join(det["text"].split()))
-        if any(u and utc and abs(_secs(u) - _secs(utc)) <= 2 for u in seen.get(key, ())):
+        # 같은 메시지의 사본만 접는다: 같은 대화 ID 이거나, 다른 아티팩트(rollout ↔ SQLite — 분기 스레드는
+        # 두 쪽의 대화 ID 가 달라 ID 로 묶지 못한다). 같은 아티팩트 안의 다른 대화에 같은 본문이 2초 안에
+        # 있으면 별개 메시지다 (0.3.28: 대화 ID 를 보지 않아 다른 대화의 메시지가 지워지던 문제).
+        if any(u and utc and abs(_secs(u) - _secs(utc)) <= 2 and (t == tid or a != art)
+               for u, t, a in seen.get(key, ())):
             continue
-        seen.setdefault(key, []).append(utc)
-        msgs.append((det.get("thread_id") or "", utc or "", r["record_id"], role, det, r))
+        seen.setdefault(key, []).append((utc, tid, art))
+        msgs.append((tid, utc or "", r["record_id"], role, det, r))
     msgs.sort(key=lambda m: (m[0], m[1], m[2]))
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
         w = _writer(fh)
@@ -323,4 +328,19 @@ if __name__ == "__main__":  # python -m cxparser.output — 프롬프트 이력 
     assert ids == ["r1", "r5", "r7", "r8"], ids                       # 대화행 1 + global 만 1 + 삭제본만 1 + 무관 1
     assert notes["r1"] == "삭제된 이전 버전(MFT 9)에도 동일; global 목록에도 기록; 삭제된 이전 버전(MFT 9)의 global 목록에도 동일", notes["r1"]
     assert notes["r5"] == "삭제된 이전 버전(MFT 9)의 global 목록에도 동일" and "r7" not in notes, notes.get("r5")
+
+    import csv as _csv, tempfile                                       # 대화 CSV 중복 판정: 사본만 접고 다른 대화는 남긴다
+    def _msg(rid, art, tid, text, utc):
+        return {"record_id": rid, "timestamp": {"utc": utc}, "evidence": {"location": {"path": "/Users/a/x"}},
+                "details": {"artifact": art, "thread_id": tid, "role": "user", "text": text, "message_id": rid}}
+    with tempfile.TemporaryDirectory() as td:
+        p = write_conversations_csv(td + "/c.csv", [
+            _msg("m1", "rollout_jsonl", "T1", "hello", "2026-09-23T04:00:00Z"),
+            _msg("m2", "codex_sqlite", "T1-branch", "hello", "2026-09-23T04:00:01Z"),   # SQLite 사본(분기 ID) → 접힘
+            _msg("m3", "rollout_jsonl", "T2", "hello", "2026-09-23T04:00:01Z"),        # 다른 대화, 같은 아티팩트 → 별개
+            _msg("m4", "rollout_jsonl", "T1", "hello", "2026-09-23T04:00:01Z"),        # 같은 대화 안의 사본 → 접힘
+            _msg("m5", "rollout_jsonl", "T3", "hello", "2026-09-23T04:00:05Z")])       # 2초 밖 → 별개
+        with open(p, encoding="utf-8-sig", newline="") as fh:
+            got = sorted(row[4] for row in list(_csv.reader(fh))[1:])
+    assert got == ["m1", "m3", "m5"], got
     print("output self-check ok")
