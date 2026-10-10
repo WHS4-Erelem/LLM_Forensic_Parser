@@ -12,6 +12,7 @@ from .artifacts import package_install as pkg_art
 from .artifacts import prefetch as prefetch_art
 from .artifacts import recent_lnk as lnk_art
 from .artifacts import rollout as rollout_art
+from .artifacts import sentry_scope as sentry_art
 from .artifacts import session_index as si_art
 from .artifacts import sqlitedb as sqlite_art
 from .artifacts import webcache_conv as webcache_art
@@ -29,10 +30,11 @@ PARSERS = {
     "prefetch": prefetch_art.parse,
     "recent_lnk": lnk_art.parse,
     "webcache": webcache_art.parse,
+    "sentry_scope": sentry_art.parse,
 }
 
 DEFAULT_KINDS = ("rollout", "rollout_loose", "session_index", "global_state", "auth",
-                 "sqlite", "prefetch", "recent_lnk", "webcache")
+                 "sqlite", "prefetch", "recent_lnk", "webcache", "sentry_scope")
 
 
 def _pid_of(process_uuid):
@@ -242,7 +244,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         status_counts[s] = status_counts.get(s, 0) + 1
 
     result = Result({
-        "tool": {"name": "cxparser", "version": "0.3.30",
+        "tool": {"name": "cxparser", "version": "0.3.31",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
                            "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,

@@ -41,6 +41,7 @@ _PATTERNS = [
     ("documents_output", re.compile(r"/users/(?P<user>[^/]+)/documents/codex/(?P<rest>.+)$")),
     ("webcache",       re.compile(r"/appdata/local/packages/" + PACKAGE_FAMILY + r"/localcache/roaming/codex/web/codex/default/cache/cache_data/index$")),
     ("webcache_part",  re.compile(r"/appdata/local/packages/" + PACKAGE_FAMILY + r"/localcache/roaming/codex/web/codex/default/cache/cache_data/(?P<fn>data_[0-3]|f_[0-9a-f]{6})$")),
+    ("sentry_scope",   re.compile(r"/appdata/local/packages/" + PACKAGE_FAMILY + r"/localcache/roaming/codex/web/codex/sentry/scope_v3\.json$")),
     ("package_userdata", re.compile(r"/users/(?P<user>[^/]+)/appdata/local/packages/" + PACKAGE_FAMILY + r"/(?P<rest>.+)$")),
     ("package_binary",  re.compile(r"/program files/windowsapps/openai\.codex_(?P<ver>[^/]+)/(?P<rest>.+)$")),
     ("package_registration", re.compile(r"/programdata/packages/" + PACKAGE_FAMILY + r"(/(?P<rest>.+))?$")),
