@@ -154,7 +154,11 @@ def detect_prompt_draft(records: list[ArtifactRecord], coverages: list[Coverage]
 #   3.   conversationDrafts 가 non-empty → empty 로 바뀐 전이   → 초안이 비워진 사실만 (전송·취소 구분 못 함)
 #   4·5. 대화 상태 갱신 · loggedInUserMessageCount 는 단독 근거로 쓰지 않는다
 #        (loggedInUserMessageCount 는 현재 Local Storage 허용 key 목록 밖이라 Reader 가 읽지 않는다)
-# user 메시지는 "전송 이후 서버가 돌려준 대화 상태" 라 전송 시각·전송 단말을 직접 증명하지 못한다 → CANDIDATE.
+# user 메시지는 "전송 이후 서버가 돌려준 대화 상태" 라 전송 시각·전송 단말을 직접 증명하지 못한다.
+# 판정(팀 최종 기준 2026-10-09): 근거 유형이 "서버가 반환한 응답의 사본"(Cache 의 대화 API 응답) 이면 DETECTED.
+#   전송된 메시지 자체가 그 응답 본문 안에 있어 추가 추론 없이 "이 메시지가 전송되었다" 가 읽힌다.
+#   시각·단말에 대한 한계는 그대로 남는다 (limitations) — 확정되는 것은 전송 사실이지 전송 시각이 아니다.
+#   본문을 복구하지 못한 Cache entry(URL·header 만, decode/JSON 실패)와 초안이 비워진 전이는 CANDIDATE 그대로다.
 
 PROMPT_SEND_RULE_ID = "CHATGPT_PROMPT_SEND_001"
 REASON_USER_MESSAGE_PRESENT = "USER_MESSAGE_PRESENT"
@@ -215,7 +219,7 @@ def _draft_cleared_transitions(records: list[ArtifactRecord]) -> list[tuple[Arti
 
 def detect_prompt_send(records: list[ArtifactRecord],
                        coverages: list[Coverage] | tuple[Coverage, ...] = ()) -> list[Event]:
-    """대화에 남은 user 메시지 (없으면 초안이 비워진 전이) → PROMPT_SEND (CANDIDATE)."""
+    """대화에 남은 user 메시지 → PROMPT_SEND (서버 응답 사본이면 DETECTED). 초안이 비워진 전이는 CANDIDATE."""
     sha_by_source = {c.source_path: c.source_sha256 for c in coverages}
     grouped: dict[tuple, list[tuple[ArtifactRecord, dict[str, Any]]]] = {}
     for record in records:
@@ -263,7 +267,7 @@ def detect_prompt_send(records: list[ArtifactRecord],
             event_id=f"event:{PROMPT_SEND_RULE_ID}:{record.record_id}:message={finding['message_id']}",
             record=record, primary=primary, supporting=supporting, timestamp=timestamp, reasons=reasons,
             inference=_PROMPT_SEND_INFERENCE, limitations=limitations, confidence=confidence,
-            device_attribution="SERVER_SIDE_CACHE", warnings=warnings))
+            device_attribution="SERVER_SIDE_CACHE", warnings=warnings, server_response_copy=True))
 
     for older, newer in _draft_cleared_transitions(records):
         if (newer.os_user, newer.browser_profile) in profiles_with_message:
