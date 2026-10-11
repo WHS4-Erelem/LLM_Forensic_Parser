@@ -38,8 +38,8 @@ Runner 의 `[Report]` 출력 경로에서 얻는다. 그 줄을 놓친 경우에
 PowerShell 을 열고 그대로 입력한다.
 
 ```powershell
-python -m pip install -r gui\requirements.txt
-python gui\main.py
+powershell -ExecutionPolicy Bypass -File integration\setup.ps1   # 최초 1회: 파서와 GUI(PyQt6)가 함께 쓰는 .venv312 생성
+integration\.venv312\Scripts\python.exe gui\main.py
 ```
 
 저장소를 아직 받지 않았다면 먼저 받고 그 폴더로 이동한다.
@@ -51,8 +51,9 @@ cd LLM_Forensic_Parser
 
 `gui\main.py` 는 어느 폴더에서 실행해도 되지만, 위 상대 경로 예시는 저장소 루트를 기준으로 한다.
 
-파서를 실제로 돌리려면 저장소 루트 README 안내에 따라 최초 1회
-`integration\setup.ps1`을 실행해 공용 `.venv312` 환경을 준비해야 한다. 가상환경이 없으면 통합 Runner 는 각 파서를
+`setup.ps1` 은 uv 가 없으면 먼저 설치하고, 파서 6개의 의존성과 `gui\requirements.txt` 를 같은 `.venv312` 에 설치한다.
+GUI 는 자신을 실행한 Python 으로 통합 Runner 를 띄운다. 다른 Python 에 PyQt6 만 설치해 GUI 를 띄워도 되지만, 파서는 항상
+`.venv312` 에서 실행되므로 이 환경은 있어야 한다. 가상환경이 없으면 통합 Runner 는 각 파서를
 `PARSER_EXECUTION_ERROR` 로 기록하고 끝까지 진행하며, GUI 는 그 실패를 Errors 탭에 보여 준다.
 
 ## 화면 흐름
@@ -88,11 +89,11 @@ Overview 의 **증거·무결성** 패널은 `evidence_manifest.json` / `integra
 | `gui/styles.qss` | Dark DFIR 테마 (Teal accent). delegate 가 직접 그리는 색은 `main_window.DARK` 와 같은 값이다 |
 | `gui/tests/test_gui_integration.py` | GUI ↔ 통합 계약 회귀 테스트 (CLI 인자 · console 파싱 · 결과 로딩 · 플러그인 격리) |
 
-테스트는 GUI 와 같은 해석기(PyQt6 가 있는 Python 3.13)로 돌린다. 파서용 `.venv312` 에는 PyQt6 가 없다.
+테스트는 GUI 와 같은 해석기(PyQt6 가 설치된 `.venv312`)로 돌린다.
 
 ```powershell
 $env:QT_QPA_PLATFORM = "offscreen"
-python -B -m unittest discover -s gui/tests
+integration\.venv312\Scripts\python.exe -B -m unittest discover -s gui/tests
 ```
 
 ## 통합 Runner 계약 (GUI 가 맞추는 대상)

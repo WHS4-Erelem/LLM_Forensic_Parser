@@ -7,7 +7,7 @@ ARTINEX 는 LLM 서비스 6종(ChatGPT Desktop, ChatGPT Web, Claude Desktop, Cla
 ## 실행
 
 ```
-powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 생성 (uv 필요)
+powershell -ExecutionPolicy Bypass -File setup.ps1            # 최초 1회: .venv312 생성 (uv 가 없으면 먼저 설치)
 python llm_forensic.py -i <이미지.E01|.dd> -o out              # 전체 실행
 python llm_forensic.py -i <이미지> -o out --only chatgpt_desktop,lmstudio
 python llm_forensic.py -i <이미지> -o out --quick              # 이미지 전체 해시 생략 (개발용)
@@ -119,4 +119,4 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 
 ## 실행 환경
 
-`setup.ps1` 이 `.venv312`(Python 3.12) 하나를 만들고 파서 6개의 requirements 를 모두 설치한다. 3.12 로 고정한 이유는 `pytsk3`, `libewf-python` 의 Windows 휠이 3.12 까지만 있고, Claude Web 파서의 zstd 가 3.14 에서는 MSVC 빌드를 요구하기 때문이다. Autopsy 애드온(`../Autopsy_Addon`)도 같은 환경을 쓴다.
+`setup.ps1` 은 uv 가 없으면 공식 설치 스크립트로 먼저 설치한 뒤, `.venv312`(Python 3.12) 하나를 만들고 파서 6개의 requirements 와 GUI 의 `gui/requirements.txt`(PyQt6)를 모두 설치한다. 이미 `.venv312` 가 있으면 새로 만들지 않고 패키지만 맞추며, 설치가 하나라도 실패하면 그 자리에서 멈춘다. 3.12 로 고정한 이유는 `pytsk3`, `libewf-python` 의 Windows 휠이 3.12 까지만 있고, Claude Web 파서의 zstd 가 3.14 에서는 MSVC 빌드를 요구하기 때문이다. Autopsy 애드온(`../Autopsy_Addon`)도 같은 환경을 쓴다.

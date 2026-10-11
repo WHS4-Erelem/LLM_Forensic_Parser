@@ -31,12 +31,13 @@ WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」
 
 ## 빠른 시작 (ARTINEX 통합 실행)
 
-[uv](https://docs.astral.sh/uv/) 가 필요하다.
+`setup.ps1` 은 [uv](https://docs.astral.sh/uv/) 가 없으면 먼저 설치하고, 파서 6개와 GUI(PyQt6)가 함께 쓰는 `.venv312` 를 만든다.
 
 ```powershell
 cd integration
-powershell -ExecutionPolicy Bypass -File setup.ps1        # 최초 1회: .venv312 생성
+powershell -ExecutionPolicy Bypass -File setup.ps1        # 최초 1회: uv 확인·설치 → .venv312 생성
 python llm_forensic.py -i <이미지.E01|.dd> -o out          # 파서 6개 실행 → out\<evidence_id>\
+.venv312\Scripts\python.exe ..\gui\main.py                # 또는 GUI 로 실행
 python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --key validation\scenario_keys\plain_2026-09-15.csv   # 개발 검증 전용 (정답 시트가 있을 때만)
 ```
 
