@@ -38,7 +38,7 @@ from org.sleuthkit.autopsy.ingest.IngestModule import IngestModuleException
 from org.sleuthkit.datamodel import BlackboardArtifact, BlackboardAttribute, TimelineEventType, TskData
 
 MODULE_NAME = "ARTINEX"
-MODULE_VERSION = "0.4.0"
+MODULE_VERSION = "0.4.1"
 MODULE_DIR = os.path.dirname(os.path.abspath(inspect.getsourcefile(lambda: 0)))
 PARSER_TIMEOUT_SEC = 3600                  # integration/parsers.json 의 최대 timeout_sec
 ERRORS = (Exception, java.lang.Exception)  # Jython 에서 Java 예외는 Python Exception 의 하위가 아니다 — 둘 다 잡아야 한 파일 오류가 전체를 멈추지 않는다
@@ -97,6 +97,7 @@ FILE_QUERIES = (
      r"|(state_5|thread_history_1|logs_2)\.sqlite(-wal|-shm)?)$", None),
     ("%", "/Packages/OpenAI.Codex_2p2nqsd0c76g0/LocalCache/Roaming/Codex/web/codex/Default/Cache/Cache_Data/", "chatgpt_desktop",
      r"/cache_data/(index|data_[0-3]|f_[0-9a-f]{6})$", None),
+    ("scope_v3.json", "/Packages/OpenAI.Codex_2p2nqsd0c76g0/LocalCache/Roaming/Codex/web/codex/sentry/", "chatgpt_desktop", None, None),
     ("%.pf", "/Windows/Prefetch/", "chatgpt_desktop", r"/(codex|chatgpt)\.exe-[0-9a-f]{8}\.pf$", None),
     ("%.lnk", "/AppData/Roaming/Microsoft/Windows/Recent/", "~chatgpt_desktop", r"/recent/[^/]+\.lnk$", None),
     # Claude Desktop — parser/locate.py SCAN_ROOTS × _PATTERNS (하위 폴더는 keep 과 무관하게 기록되어 USN 부모 대조에 쓰인다)
@@ -141,6 +142,7 @@ PARSER_NTFS = dict((p["name"], p.get("ntfs", ())) for p in PARSERS)
 # NTFS 메타파일을 원본 그대로 볼륨 루트에 둔다 (1GB 초과만 제외). 그것을 읽는 파서(PARSERS ntfs)를 그 볼륨에서 돌릴 때만 꺼낸다.
 NTFS_META = (("$MFT", "/"), ("$UsnJrnl:$J", "/$Extend/"))
 NTFS_META_MAX_BYTES = 1024 * 1024 * 1024
+BIG_WARNING = u"불완전 입력: $MFT 또는 $J가 1GB 상한을 초과하여 분석 입력에서 제외됨"
 # 내용은 꺼내지 않고 메타데이터(MFT 번호·순번·시각)만 _host_metadata.json 에 넘기는 폴더: (이름, 부모, 실행 근거가 되는 파서)
 META_DIR_QUERIES = (
     ("OpenAI.Codex_%", "/Program Files/WindowsApps/", "chatgpt_desktop"),   # 패키지 폴더 = 설치 행 (설치 파일이 없어도 나온다)
@@ -156,6 +158,10 @@ META_DIR_QUERIES = (
 # 저장 위치의 파일 메타데이터 — ChatGPT Desktop(최근 항목 바로가기 대상의 생성 시각·크기·첫 8바이트), Claude Web(받은 파일의 $MFT 근거)
 META_FILE_PARENTS = ("/Downloads/", "/Desktop/", "/Documents/")
 META_FILE_LIMIT = 20000                    # ponytail: 저장 위치 3곳·2만 개 상한. 다른 드라이브·폴더 저장은 놓친다 → 필요 시 파서가 요청 목록을 내는 2단계로
+META_FILE_READERS = ("~chatgpt_desktop", "~claude_web")
+META_LIMIT_WARNING = u"불완전 입력: Downloads·Desktop·Documents 메타데이터가 %d개 제한을 초과하여 일부 수집되지 않음" % META_FILE_LIMIT
+NOT_RUN_REASON = u"실행 조건에 해당하는 관련 입력을 찾지 못함"
+FALLBACK_WORK_DIR = r"C:\artinex_work"     # 사건 폴더가 쓰기·ADS 불가일 때의 대체 작업 위치 (설정 work_dir 로 바꿀 수 있음)
 HOST_META_NAME = "_host_metadata.json"     # 파서들(DirectoryVfs 등)과 약속한 파일명
 DELETED_DIR = "_deleted"                   # 삭제 파일 트리 (Claude Desktop parser/vfs.py DirectoryVfs 와 약속). 다른 파서는 볼륨 루트의 Users/… 부터 찾으므로 보지 않는다
 DELETED_PARSER = "claude_desktop"          # 폴더 입력에서 삭제 파일 내용을 읽는 파서. 다른 파서의 삭제 파일은 내용 대신 실행 근거(USN·MFT 로 찾을 흔적)로만 센다
@@ -200,8 +206,8 @@ def host_entry(f, rel, with_head=False):
 
 def load_config():
     """artinex_config.json (모듈 폴더) + 환경변수 ARTINEX_PYTHON·ARTINEX_REPO_ROOT·ARTINEX_WORK_DIR. 필요한 값은 python 과 repo_root(저장소 루트, 파서 폴더 6개가 그 아래) 둘뿐.
-    선택 work_dir: 추출·결과 작업 폴더의 루트 (기본은 사건의 ModuleOutput). 사건 폴더가 exFAT 외장 드라이브처럼 ADS 를 못 쓰는
-    곳이면 NTFS 경로를 주어야 Zone.Identifier 가 파서에 전달된다.
+    선택 work_dir: 대체 작업 위치 (기본 C:\\artinex_work). 작업 위치는 실행마다 사건의 ModuleOutput\\ARTINEX 를 먼저 쓰고,
+    그곳이 쓰기 또는 ADS(Zone.Identifier·$J) 불가일 때만 이 위치를 쓴다 (pick_work_root).
     선택 keep_export: true 면 정상 완료여도 추출본(export·in_<파서>)을 지우지 않는다 (cleanup 참조).
     모듈을 저장소 안(Autopsy_Addon/ARTINEX)에서 그대로 쓰면 설정 없이 저장소와 integration/.venv312 를 쓴다."""
     cfg = {}
@@ -281,10 +287,13 @@ def fs_key(f):
         return 0
 
 
-def count_missing(v, parsers):
-    """이 볼륨에서 parsers('~' 접두 포함)가 읽을 입력 하나를 넘기지 못했다 — Inbox 의 incomplete input."""
+def count_missing(v, parsers, warning=None):
+    """이 볼륨에서 parsers('~' 접두 포함)가 읽을 입력 하나를 넘기지 못했다 — Inbox 의 incomplete input. warning: Inbox 에 덧붙일 사유."""
     for p in parsers:
-        v["missing"][p.lstrip("~")] = v["missing"].get(p.lstrip("~"), 0) + 1
+        p = p.lstrip("~")
+        v["missing"][p] = v["missing"].get(p, 0) + 1
+        if warning:
+            v["warnings"].setdefault(p, set()).add(warning)
 
 
 def link_or_copy(src, dst):
@@ -296,15 +305,19 @@ def link_or_copy(src, dst):
         Files.copy(src, dst)
 
 
-def ads_supported(folder):
-    """작업 폴더 파일시스템이 대체 데이터 스트림(ADS)을 쓸 수 있는지 — 시험 파일에 Zone.Identifier 스트림을 써 본다."""
+def work_problem(folder):
+    """작업 위치로 쓸 수 없는 사유, 쓸 수 있으면 None — 폴더를 만들고 시험 파일과 그 Zone.Identifier 스트림(ADS)을 써 본다."""
     probe = File(folder, "artinex_ads_probe.txt")
     try:
+        File(folder).mkdirs()
         FileOutputStream(probe).close()
+    except ERRORS as exc:
+        return "not writable (%s)" % exc
+    try:
         FileOutputStream(probe.getPath() + ":Zone.Identifier").close()
-        return True
-    except ERRORS:
-        return False
+        return None
+    except ERRORS as exc:
+        return "no alternate data streams, not NTFS? (%s)" % exc
     finally:
         probe.delete()
 
@@ -354,18 +367,14 @@ class ArtinexIngestModule(DataSourceIngestModule):
                          "run": {파서: {실행 근거: 수}}, "missing": {파서: 꺼내지 못한 입력 수}}}, 건너뛴 수)."""
         fm = Case.getCurrentCase().getServices().getFileManager()
         vols, notes, failed = {}, [], set()             # failed: 꺼내지 못한 파일 — 다른 항목으로 다시 걸려도 다시 세지 않는다
-        skipped = {"deleted": 0, "slack": 0, "derived": 0, "presence": 0, "ads": 0, "ads_unsupported": 0, "error": 0}
+        skipped = {"deleted": 0, "slack": 0, "derived": 0, "presence": 0, "ads": 0, "error": 0}
         ORIGINAL = (TskData.TSK_DB_FILES_TYPE_ENUM.FS, TskData.TSK_DB_FILES_TYPE_ENUM.LOCAL)   # 이미지 파일시스템·논리 파일 세트의 원본
-        ads_ok = ads_supported(work)
-        if not ads_ok:                       # 작업 폴더 파일시스템이 ADS 를 못 쓴다 (exFAT 등) — 파일마다 시도하지 않고 한 번만 판정
-            notes.append("ads_unsupported\t%s\twork folder cannot hold alternate data streams: Zone.Identifier/$J not passed" % work)
-            self.log(Level.WARNING, "work folder %s cannot hold alternate data streams (not NTFS?)" % work)
 
         def vol(f):
             k = fs_key(f)
             if k not in vols:
                 vols[k] = {"key": k, "dir": os.path.join(work, "vol%s" % k, "export"), "by_path": {}, "orig": {}, "entries": {},
-                           "store": {}, "readers": {}, "presence": set(), "views": {}, "run": {}, "missing": {}}
+                           "store": {}, "readers": {}, "presence": set(), "views": {}, "run": {}, "missing": {}, "warnings": {}}
             return vols[k]
 
         def rel_of(f):
@@ -390,26 +399,29 @@ class ArtinexIngestModule(DataSourceIngestModule):
             count_missing(v, parsers)
             notes.append("%s\t%s" % (why, rel))
 
-        def put(v, f, rel, parsers, content=None, why="file", foreign=False):
+        pending = []                                 # ADS 는 주 파일을 모두 쓴 뒤에 쓴다 (put now=True)
+
+        def put(v, f, rel, parsers, content=None, why="file", foreign=False, now=False):
             """파일 하나를 v 의 추출 폴더에 꺼낸다. 이미 꺼냈으면 읽는 파서·실행 근거만 더한다 — 단 존재 파일(0바이트)을
             내용이 필요한 요청이 다시 가리키면 원본으로 다시 쓴다. foreign: 다른 볼륨의 파일 — 이 볼륨의 $MFT 와 맞지 않으므로
-            MFT 번호를 _host_metadata.json 에 적지 않는다 (볼륨 식별 정보는 넘기지 않으므로 그 파일의 $MFT 근거는 생략)."""
+            MFT 번호를 _host_metadata.json 에 적지 않는다 (볼륨 식별 정보는 넘기지 않으므로 그 파일의 $MFT 근거는 생략).
+            ADS 는 미뤄 두었다가 마지막에 쓴다 — Autopsy 는 'x.pdf:Zone.Identifier' 를 x.pdf 보다 먼저 돌려줄 수 있고,
+            주 파일을 나중에 쓰면(FileOutputStream = CREATE_ALWAYS) Windows 가 그 파일의 ADS 를 지운다."""
             ads = ":" in f.getName()
+            if ads and not now:
+                basis(v, parsers, why)
+                pending.append((v, f, rel, parsers, content, why, foreign))
+                return
             store = rel                              # 추출 폴더 안 위치 (삭제 파일은 원래 경로와 다르다)
             if why == "deleted file":
                 store = "/%s/%d%s" % (DELETED_DIR, f.getMetaAddr(), rel)   # 현존 파일과 겹치지 않게 MFT 번호별 별도 트리
             key = store.lower()
-            if (v["key"], key) in failed:
+            if (v["key"], key) in failed or (ads and (v["key"], key.split(":")[0]) in failed):   # 주 파일을 못 꺼냈으면 그 ADS 도 쓰지 않는다 (빈 주 파일이 생기지 않게)
                 return
             match = rel.lower().split(":")[0]
             presence = content is not None and not ads and not content.search(match)
             upgrade = key in v["presence"] and not presence      # 존재 파일 -> 원본 승격
             if key not in v["by_path"] or upgrade:
-                if ads and not ads_ok:
-                    failed.add((v["key"], key))
-                    skipped["ads_unsupported"] += 1
-                    lost(v, parsers, rel, "ads_unsupported")
-                    return
                 target = File(v["dir"], store.lstrip("/"))   # 'x.pdf:Zone.Identifier' 는 NTFS 작업 폴더에 실제 ADS 로 써진다 (파서들이 그렇게 읽는다)
                 try:
                     target.getParentFile().mkdirs()
@@ -450,7 +462,8 @@ class ArtinexIngestModule(DataSourceIngestModule):
                         v["entries"][key]["deleted"] = True
                         notes.append("deleted_exported\t%s\t%s" % (rel, store))
             v["readers"].setdefault(key, set()).update(p.lstrip("~") for p in parsers)
-            basis(v, parsers, why)
+            if not now:
+                basis(v, parsers, why)
 
         for name, parent, parsers in META_DIR_QUERIES:
             for f in fm.findFiles(dataSource, name, parent):
@@ -459,15 +472,20 @@ class ArtinexIngestModule(DataSourceIngestModule):
                     vol(f)["entries"][rel.lower()] = host_entry(f, rel)
                     index(vol(f), rel, f)                    # 설치 행이 패키지 폴더에 붙게
                     basis(vol(f), parsers.split(), "package folder")
-        n_meta = 0
+        n_meta, over = 0, False
         for parent in META_FILE_PARENTS:
             for f in fm.findFiles(dataSource, "%", parent):
-                if n_meta >= META_FILE_LIMIT or self.context.dataSourceIngestIsCancelled():
-                    break
+                if self.context.dataSourceIngestIsCancelled():
+                    return vols, skipped
                 rel = rel_of(f)
                 if rel and f.isFile() and live(f):
+                    if n_meta >= META_FILE_LIMIT:    # 상한 다음 대상이 실제로 있을 때만 초과 (정확히 상한 개수면 경고 없음)
+                        over = True
+                        break
                     vol(f)["entries"][rel.lower()] = host_entry(f, rel, with_head=True)
                     n_meta += 1
+            if over:
+                break
         for name, parent, parsers, keep, content in FILE_QUERIES:
             for f in fm.findFiles(dataSource, name, parent):
                 if self.context.dataSourceIngestIsCancelled():
@@ -531,10 +549,23 @@ class ArtinexIngestModule(DataSourceIngestModule):
                 users = [p for p in v["run"] if name in PARSER_NTFS.get(p, ())]   # 이 볼륨에서 돌릴 파서 중 이 메타파일을 읽는 것
                 if not users:
                     continue
-                if f.getSize() > NTFS_META_MAX_BYTES:
-                    lost(v, users, "%s\t%d" % (rel, f.getSize()), "big")
+                if f.getSize() > NTFS_META_MAX_BYTES:  # 이 메타파일을 읽는 파서에만 경고
+                    count_missing(v, users, BIG_WARNING)
+                    notes.append("big\tvol%s\t%s\tsize=%d\tlimit=%d\tparsers=%s" % (
+                        v["key"], rel, f.getSize(), NTFS_META_MAX_BYTES, ",".join(users)))
                     continue
                 put(v, f, rel, ["~" + p for p in users])
+        for args in pending:
+            put(*args, now=True)
+        if over:                                      # 어느 볼륨의 대상이 빠졌는지 모르므로 모든 볼륨의 해당 파서에 경고
+            notes.append("meta_limit\tall volumes\tlimit=%d\tcollected=%d\tDownloads/Desktop/Documents file metadata beyond the limit "
+                         "not collected (ChatGPT Desktop recent_lnk targets, Claude Web $MFT evidence)\tparsers=%s"
+                         % (META_FILE_LIMIT, n_meta, ",".join(p.lstrip("~") for p in META_FILE_READERS)))
+            self.log(Level.WARNING, "metadata limit %d exceeded in %s" % (META_FILE_LIMIT, META_FILE_PARENTS))
+            for v in vols.values():
+                count_missing(v, META_FILE_READERS, META_LIMIT_WARNING)
+        for v in sorted(vols.values(), key=lambda v: v["key"]) or [{"key": "-", "run": {}}]:
+            notes.extend(u"parser_not_run\tvol%s\t%s\t%s" % (v["key"], p["label"], NOT_RUN_REASON) for p in PARSERS if p["name"] not in v["run"])
         for v in vols.values():
             if v["run"]:
                 File(v["dir"]).mkdirs()
@@ -543,7 +574,7 @@ class ArtinexIngestModule(DataSourceIngestModule):
                                          "entries": v["entries"]}, ensure_ascii=True).encode("ascii"))
                 for p in v["run"]:
                     v["views"][p] = self.input_view(v, p, notes)
-        if notes:                                                    # 꺼내지 못한·존재만 둔 파일 목록 — 파서 결과에 빠진 근거를 추적할 수 있게
+        if notes:                                                    # 추출 제외·실패·특수 처리와 파서 미실행 사유 — 파서 결과에 빠진 근거를 추적할 수 있게
             with open(os.path.join(work, "export_skipped.txt"), "wb") as fh:
                 fh.write((u"\n".join(notes) + u"\n").encode("utf-8"))
         return vols, skipped
@@ -745,7 +776,9 @@ class ArtinexIngestModule(DataSourceIngestModule):
         progressBar.switchToDeterminate(2 + len(PARSERS))
         case = Case.getCurrentCase()
         stamp = SimpleDateFormat("yyyyMMdd_HHmmss").format(Date())      # 실행별 작업 폴더 — 이전 추출 파일·CSV 와 섞이지 않게
-        root = self.cfg.get("work_dir") or os.path.join(case.getModuleDirectory(), "ARTINEX")
+        root = self.pick_work_root(case)
+        if not root:
+            return IngestModule.ProcessResult.ERROR
         work = os.path.join(root, "%s_ds_%d" % (case.getName(), dataSource.getId()), stamp)
         os.makedirs(work)
         self.log(Level.INFO, "work folder %s" % work)
@@ -775,7 +808,8 @@ class ArtinexIngestModule(DataSourceIngestModule):
                     continue
                 why = ", ".join("%s %d" % kv for kv in sorted(why.items()))
                 gap = v["missing"].get(p["name"])
-                gap = " [incomplete input: %d not exported, see export_skipped.txt]" % gap if gap else ""
+                gap = u" [incomplete input: %d not exported, see export_skipped.txt%s]" % (
+                    gap, u"".join(u"; " + w for w in sorted(v["warnings"].get(p["name"], ())))) if gap else u""
                 warn = warn or bool(gap)
                 counts = {"behaviors": 0, "timeline_events": 0, "messages": 0, "duplicates": 0, "unlinked": 0}
                 stage = "run"
@@ -846,6 +880,19 @@ class ArtinexIngestModule(DataSourceIngestModule):
         kind = IngestMessage.MessageType.ERROR if failed else IngestMessage.MessageType.WARNING if warn else IngestMessage.MessageType.DATA
         self.message(kind, summary)
         return IngestModule.ProcessResult.ERROR if failed else IngestModule.ProcessResult.OK
+
+    def pick_work_root(self, case):
+        """작업 루트: 사건의 ModuleOutput\\ARTINEX 를 먼저, 쓰기·ADS 가 안 되면 대체 위치(work_dir, 기본 C:\\artinex_work).
+        다른 드라이브는 고르지 않는다. 둘 다 안 되면 사유를 남기고 None (실행 중단)."""
+        tried = []
+        for root in (os.path.join(case.getModuleDirectory(), "ARTINEX"), self.cfg.get("work_dir") or FALLBACK_WORK_DIR):
+            why = work_problem(root)
+            if not why:
+                self.log(Level.INFO, "work root %s%s" % (root, " (fallback: %s)" % "; ".join(tried) if tried else " (case folder)"))
+                return root
+            tried.append("%s: %s" % (root, why))
+        self.message(IngestMessage.MessageType.ERROR, "No usable work location (needs write + alternate data streams): %s" % "; ".join(tried))
+        return None
 
     def cleanup(self, vols, work, problem):
         """추출본(vol<n>/export, vol<n>/in_<파서>)은 파서 입력일 뿐이라 정상 완료면 지운다 — 원본은 이미지에, 결과 CSV·run.log·
