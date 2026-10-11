@@ -283,11 +283,19 @@ Event 1건 = 1 row, 시각순 정렬. 컬럼 이름·순서는 **팀 공통 CSV 
 
 ### 서버가 반환한 응답의 사본 (팀 최종 기준, 2026-10-09)
 
-근거가 **서버가 반환한 응답의 사본**이면 그 행위는 `DETECTED`(`확정`) 로 판정한다. 대표 예가
+근거가 **서버가 반환한 응답의 사본**이면 그 행위를 `DETECTED`(`확정`) 로 판정할 수 있다. 대표 예가
 HTTP Cache 에 저장된 대화 API 응답이다 — 전송된 메시지 자체가 응답 본문 안에 있어 추가 추론 없이 읽힌다.
 
-판정 코드는 `detectors/common.py` 의 `is_server_response_copy()` 이며, **Cache 라는 것만으로는
-확정이 되지 않는다.** 네 조건을 모두 만족해야 한다.
+판정은 `detectors/common.py` 의 `_candidate_event()` 가 하며, **세 조건을 모두 만족할 때만**
+`DETECTED` 가 된다. 하나라도 어긋나면 `CANDIDATE` 다.
+
+```
+① Rule 이 이 기준을 쓰겠다고 명시했다          server_response_copy=True
+② 그 Record 가 실제로 서버 응답 사본이다        is_server_response_copy(record) == True
+③ 그 Event 의 confidence 가 LOW 가 아니다       confidence != "LOW"
+```
+
+②의 `is_server_response_copy()` 는 **Cache 라는 것만으로 True 가 되지 않는다.** 네 조건을 모두 본다.
 
 ```
 artifact_type == "cache"
@@ -301,8 +309,14 @@ decoded_sha256 가 있고 observed["conversation"] 이 dict      # 본문을 실
 Local Storage 초안 · 초안이 비워진 전이 · timestamp 없는 추론 · 간접 흔적 ·
 그 응답을 바탕으로 **한 단계 더 추론해야 하는 행위**(대화 수정·삭제 등).
 
-확정되는 것은 **전송 사실**이고 **전송 시각이 아니다.** `create_time` 은 서버가 메시지를 만든 시각이며,
-단말도 `device_attribution=SERVER_SIDE_CACHE` 로 남는다 (같은 계정을 다른 기기에서 썼을 수 있다).
+③ 때문에 **서버 응답 사본이 있어도 확정되지 않는 경우가 있다.** 응답 본문은 정상인데 그 안의 메시지 시각을
+UTC/KST 로 변환하지 못하면 confidence 가 `LOW` 가 되고, `DETECTED` 조건에서 탈락해 `CANDIDATE` / `LOW` 로
+남는다. 즉 `DETECTED` 는 **"서버 응답 사본 + 변환 가능한 메시지 시각"** 이 함께 있을 때만 나온다.
+
+확정되는 것은 **전송 사실**이고 **전송 시각이 아니다.** 시각 칸에 들어가는 값은
+`Cache.conversation.mapping[].message.create_time` — **서버가 메시지를 만든 시각**이며 사용자가 전송 버튼을
+누른 시각이 아니다 (그래서 confidence_reason 에 `TIMESTAMP_APPROXIMATED` 가 붙는다). 단말도
+`device_attribution=SERVER_SIDE_CACHE` 로 남는다 (같은 계정을 다른 기기에서 썼을 수 있다).
 이 한계는 `DETECTED` 가 되어도 `limitations` 에 그대로 남는다.
 
 현재 이 기준을 쓰는 Rule 은 `CHATGPT_PROMPT_SEND_001` 하나다. 다른 Cache 기반 Rule
@@ -327,12 +341,25 @@ Rule 별 판정 조건과 한계는 `chatgpt_parser/detectors/` 각 Rule 머리�
 이 9개는 그 행위에만 생기는 직접 증거가 현재 자료에서 확인되지 않아, 조건·한계를 Rule 안에 적고
 `CANDIDATE` 로만 판정한다. 근거 Record 가 없으면 **Event 를 만들지 않는다.**
 
-**서버 응답 사본이 있으면 `DETECTED`, 없으면 `CANDIDATE` 인 행위**
+**근거에 따라 `DETECTED` 와 `CANDIDATE` 가 갈리는 행위**
 
-`PROMPT_SEND` — Cache 의 대화 상세 API 응답(HTTP 200, 본문 복구 성공)에 user 메시지가 남아 있으면
-`DETECTED` / `MEDIUM` 이다. 같은 Rule 이라도 본문을 복구하지 못한 Cache entry 나 초안이 비워진 전이
-(`conversationDrafts` non-empty → empty) 만 근거일 때는 `CANDIDATE` 로 남는다
+`PROMPT_SEND` (`CHATGPT_PROMPT_SEND_001`) — 같은 Rule 이지만 근거에 따라 결과가 셋으로 갈린다.
+
+| 근거 | action_status | confidence |
+|---|---|---|
+| 서버 응답 사본(Cache 대화 상세 API 응답, HTTP 200, 본문 복구 성공)에 user 메시지가 있고 그 메시지의 `create_time` 을 UTC/KST 로 변환할 수 있다 | `DETECTED` (`확정`) | `MEDIUM` |
+| 서버 응답 사본은 있으나 메시지 시각을 변환할 수 없다 | `CANDIDATE` (`의심`) | `LOW` |
+| 초안이 비워진 전이(`conversationDrafts` non-empty → empty) 만 있다 | `CANDIDATE` (`의심`) | `LOW` |
+
+`MEDIUM` 이 상한이다 — Rule 이 `PARTIALLY_VERIFIED` 이므로 `HIGH` 는 쓰지 않는다.
+본문을 복구하지 못한 Cache entry(URL·header 만, decode/JSON 실패)는 애초에 서버 응답 사본이 아니라서
+위 표의 첫 줄에 해당하지 않는다.
+
+확정되는 것은 **전송 사실**이고 표의 `Timestamp` 는 **서버가 메시지를 만든 시각**이다 — 사용자가 전송한
+시각이 아니다
 (→ [서버가 반환한 응답의 사본](#서버가-반환한-응답의-사본-팀-최종-기준-2026-10-09)).
+
+또한 같은 Profile 에 전송된 메시지 자체가 남아 있으면, 더 약한 근거인 초안 전이로 Event 를 추가하지 않는다.
 
 **Rule 은 구현돼 있으나 `Scenario_Image.dd` 에서는 근거가 없어 Event 가 0건인 행위**
 
