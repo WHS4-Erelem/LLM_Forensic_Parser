@@ -24,7 +24,7 @@ python llm_forensic.py --self-test
 
 종료코드: 0 전부 성공 / 1 일부 파서 실패 또는 계약 위반 / 2 입력 실패 / 3 DB 또는 병합 출력 오류.
 
-콘솔에는 통합기가 만든 요약(`[Evidence] [DB] [Runner] [Timeline] [Report] [Summary]`)만 나온다. 파서의 stdout/stderr 는 `<파서명>\run.log` 에만 남긴다. 실패하면 `[Runner]` 아래에 첫 오류 한 줄과 `detail:` 경로(실행 실패는 run.log, 계약 위반은 integration_report.json)를 보여 준다.
+콘솔에는 통합기가 만든 요약(`[Evidence] [DB] [Runner] [Timeline] [Report] [Summary]`)만 나온다. 파서의 stdout/stderr 는 `<파서명>\run.log` 에만 남긴다. 실패하면 `[Runner]` 아래에 첫 오류 한 줄과 `detail:` 경로(실행 실패는 run.log, 계약 위반은 integration_report.json)를 보여 준다. 터미널에서 직접 실행하면 해시 계산과 파서 실행 중에 같은 줄에 경과 시간이 1초마다 갱신되고(`[Runner] claude_desktop (3/6)  42s 실행 중...`), 끝나면 결과 줄로 바뀐다. 파일로 리다이렉트하거나 GUI 에서 실행할 때는 이 표시가 없다.
 
 ## 결과 (`out\<evidence_id>\`)
 
