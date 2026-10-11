@@ -23,8 +23,8 @@ from ..models import Event
 from ..recovery.conversations import _CACHE_MESSAGE_TIME_SOURCE, _json_time
 
 
-# ---- 8.12 CHATGPT_FILE_DOWNLOAD_001 (History downloads) ----------------------
-# 근거: Chrome History downloads / downloads_url_chains (§7.1-b Reader 가 만드는 record_kind="download" Record).
+# ---- CHATGPT_FILE_DOWNLOAD_001 (History downloads) -----------------------------------------------
+# 근거: Chrome History downloads / downloads_url_chains (History downloads Reader 가 만드는 record_kind="download" Record).
 # 2026-09-18 Marker E01 (Chrome Stable) 에서 확인한 구조:
 #   - ChatGPT 가 만든 파일의 다운로드 URL = https://chatgpt.com/backend-api/estuary/content?... (서명 query 포함)
 #   - 같은 행의 tab_url = https://chatgpt.com/c/<conversation id> (다운로드를 실행한 탭)
@@ -163,15 +163,15 @@ def detect_file_download(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.16 CHATGPT_FILE_UPLOAD_001 --------------------------------------------
-# 근거: Cache 대화 응답 JSON (§7.4 Reader) 의 user 메시지 metadata.attachments[] 에 source="local" 인 파일 항목.
-#   새 Reader 를 만들지 않고 §7.4 가 이미 보존하는 observed["conversation"]["mapping"] 만 읽는다.
+# ---- CHATGPT_FILE_UPLOAD_001 ---------------------------------------------------------------------
+# 근거: Cache 대화 응답 JSON (Cache Reader) 의 user 메시지 metadata.attachments[] 에 source="local" 인 파일 항목.
+#   새 Reader 를 만들지 않고 Cache Reader 가 이미 보존하는 observed["conversation"]["mapping"] 만 읽는다.
 # 2026-09-20 실제 사본 (C:\WHS_Analysis\PRE_CLEANUP · POST_CLEANUP 의 Cache, read-only) 에서 확인한 것:
 #   같은 대화의 user 메시지 3건에 attachments 1건씩 — image/jpeg 38024 B (create_time 1787223224.127),
 #   application/pdf 26779 B (1787224739.997), text/x-python 100 B (1787226914.536). 모두 source="local" 이고
 #   library_file_id 를 가진다. assistant 가 만든 이미지 (DALL-E) 는 attachments 가 아니라 content 의
 #   image_asset_pointer 로만 나타나 업로드와 구분된다.
-# 판정: FILE_UPLOAD DETECTED / MEDIUM (EVENT_RULES.md CHATGPT_FILE_UPLOAD_001)
+# 판정: FILE_UPLOAD DETECTED / MEDIUM
 #   - Evidence Level 은 DIRECT — 대화 JSON 이 "이 메시지에 로컬 파일을 첨부해 보냈다"를 직접 기술한다.
 #   - backend-api/files/library/nodes 의 file_upload_time 을 읽지 않으므로 업로드 시각 근거가 없고,
 #     규칙대로 MEDIUM + TIMESTAMP_APPROXIMATED 로 둔다. 대표 시각은 첨부한 메시지의 create_time 이다.
@@ -287,8 +287,8 @@ def detect_file_upload(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.19 CHATGPT_FILE_UPLOAD_DELETE_001 ------------------------------------
-# §8.16 FILE_UPLOAD 이 쓰는 같은 구조 (user 메시지 metadata.attachments[] 의 source="local") 를 재사용한다.
+# ---- CHATGPT_FILE_UPLOAD_DELETE_001 --------------------------------------------------------------
+# FILE_UPLOAD 이 쓰는 같은 구조 (user 메시지 metadata.attachments[] 의 source="local") 를 재사용한다.
 # 판정 조건: 같은 Profile · 같은 대화의 Cache 사본 2개 이상에서, 앞선 사본에 있던 로컬 첨부가
 #   뒤의 사본에서 사라지고 다른 첨부는 그대로인 전이.
 # 전송 완료로 초안 첨부가 비워지는 경우와 사용자가 첨부를 직접 지운 경우를 구분하지 못한다 → CANDIDATE / LOW.

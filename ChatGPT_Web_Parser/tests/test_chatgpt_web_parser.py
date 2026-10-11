@@ -329,7 +329,7 @@ class AllowedValueTest(unittest.TestCase):
 # S2 — Timestamp Normalizer
 # =============================================================================
 
-# (raw, timestamp_type, expected_utc, expected_kst) — docs/OUTPUT_SCHEMA.md §10 기준값
+# (raw, timestamp_type, expected_utc, expected_kst)
 REFERENCE_CASES = [
     (13432494600507032, "webkit_us", "2026-08-29T16:30:00.507032Z", "2026-08-30T01:30:00.507032+09:00"),
     (1788021002, "unix_s", "2026-08-29T16:30:02Z", "2026-08-30T01:30:02+09:00"),

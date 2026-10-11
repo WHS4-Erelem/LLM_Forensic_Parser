@@ -23,9 +23,7 @@ from ..output.final_csv import (CSV_RECOVERED_CONVERSATION_COLUMNS, CSV_TIMELINE
                                 timeline_prompt_texts)
 
 
-# =============================================================================
-# 12-1. CSV Export
-# =============================================================================
+# ---- CSV Export ----------------------------------------------------------------------------------
 # JSON 은 전체 정보를 보존하는 canonical output 이고, CSV 는 거기서 파생되는 사람용 / 팀 통합용 output 이다.
 # CSV 는 새로운 분석 결과를 만들지 않는다. 같은 ParseResult 를 그대로 표현하며 행 수가 정확히 일치해야 한다.
 #   coverage.csv / records.csv / events.csv / conversations.csv / messages.csv

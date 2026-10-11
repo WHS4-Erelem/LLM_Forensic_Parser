@@ -22,7 +22,7 @@ from ..models import ArtifactRecord, Coverage
 from ..source import FILE_STATUS_NOT_PRESENT, Source, SourcePathError, normalize_source_path
 
 
-# ---- 7.7 Chrome Preferences Reader (browser.clear_data) ----------------------
+# ---- Chrome Preferences Reader (browser.clear_data) ----------------------------------------------
 # 2026-09-30 E10-04 원자료 (PRE / POST 의 Chrome\User Data\Default\Preferences) 에서 확인한 것:
 #   PRE  (캐시 삭제 전)  browser = {theme, window_placement} — clear_data 키 자체가 없다
 #   POST (캐시 삭제 후)  browser.clear_data = {"browsing_history": false, "cache": true,
@@ -30,7 +30,7 @@ from ..source import FILE_STATUS_NOT_PRESENT, Source, SourcePathError, normalize
 #   두 파일 모두 last_clear_browsing_data_time 같은 시각 필드는 없었다 → Reader 는 시각을 만들지 않는다.
 #   (파일 수정 시각은 Preferences 가 다른 이유로도 계속 쓰이므로 행위 시각으로 쓰지 않는다.)
 # browser.clear_data 는 Chrome '인터넷 사용 기록 삭제' 대화상자의 체크박스가 마지막으로 어떤 상태였는지를
-#   저장한 값이다. 삭제 실행 여부·시각·범위는 이 값만으로는 알 수 없다 (판정은 §8.25 Rule 이 CANDIDATE 로만 한다).
+#   저장한 값이다. 삭제 실행 여부·시각·범위는 이 값만으로는 알 수 없다 (판정은 CHATGPT_CACHE_DELETE_001 이 CANDIDATE 로만 한다).
 # 보안: 이 한 섹션의 bool 값만 Record 로 만든다. Preferences 의 나머지 최상위 키 (계정·동기화·자동완성 등
 #   개인정보) 는 읽지 않는다.
 # Coverage: 파일 없음 NOT_PRESENT / 읽고 JSON 파싱됨 PARSED / 읽기·파싱 실패 PARSE_ERROR.

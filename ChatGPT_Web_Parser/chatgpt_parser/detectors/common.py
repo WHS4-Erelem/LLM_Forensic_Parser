@@ -25,15 +25,15 @@ LOGOUT_PATH = "/auth/logout"
 _UNVERIFIED_TRANSITION_QUALIFIERS = ("CLIENT_REDIRECT", "SERVER_REDIRECT", "FORWARD_BACK")
 
 
-# ---- 8.2 S8 공통 도구 ---------------------------------------------------------
-# S8 Rule (LOGIN / ACCOUNT_SWITCH / CONVERSATION_CREATE / CONVERSATION_ACCESS / PROFILE_ACCESS) 이 함께 쓴다.
+# ---- URL·Session 기반 Rule 의 공통 도구 ----------------------------------------
+# LOGIN / ACCOUNT_SWITCH / CONVERSATION_CREATE / CONVERSATION_ACCESS / PROFILE_ACCESS 가 함께 쓴다.
 #   - URL 은 분해해서 판정한다: https, host 정확히 일치, path 가 패턴과 완전히 일치 (문자열 포함 여부 사용 안 함).
 #   - 같은 source_path + record_location 이 입력에 중복되면 한 번만 본다. 입력 Record 는 수정하지 않는다.
 #   - 여러 방문을 잇는 Rule 은 같은 History (source_path, os_user, browser_profile) 안에서만,
 #     visits.id 순서로 연결한다 (C: History 사본에서 visits.id 순서와 visit_time 순서가 일치함을 관찰).
 #     from_visit 은 쓰지 않는다: 대화 URL 은 from_visit=0 (SPA), 로그인 체인은 중간 Google 방문이 필터로 빠져 끊긴다.
 #   - 근거 없는 시간 창 숫자를 쓰지 않는다. 방문 간격은 limitation 에 기록만 한다.
-# ponytail: LOGOUT(S5) 은 manual artifact 로 검증된 구현을 그대로 두고 이 도구로 옮기지 않았다. Rule 이 더 늘면 합친다.
+# ponytail: LOGOUT 은 manual artifact 로 검증된 구현을 그대로 두고 이 도구로 옮기지 않았다. Rule 이 더 늘면 합친다.
 
 CHATGPT_HOST = "chatgpt.com"
 AUTH_OPENAI_HOST = "auth.openai.com"
@@ -112,7 +112,7 @@ def _is_download_record(record: ArtifactRecord) -> bool:
 def _unique_history_records(records: list[ArtifactRecord]) -> list[ArtifactRecord]:
     """visits 기반 History Record 만, 같은 source_path + record_location 은 첫 번째만 (입력 순서 유지).
 
-    downloads Record 는 visit URL 이 없으므로 visit 기반 Rule 에서 제외한다 (§8.12 Rule 이 따로 읽는다).
+    downloads Record 는 visit URL 이 없으므로 visit 기반 Rule 에서 제외한다 (CHATGPT_FILE_DOWNLOAD_001 이 따로 읽는다).
     """
     seen: set[tuple[str, str]] = set()
     unique: list[ArtifactRecord] = []
@@ -260,7 +260,7 @@ def _detect_visit_rule(
     return events
 
 
-# ---- 8.8 CHATGPT_DATA_EXPORT_REQUEST_001 -------------------------------------
+# ---- CHATGPT_DATA_EXPORT_REQUEST_001 -------------------------------------------------------------
 # 근거: Session Storage (origin https://chatgpt.com/) 의 chatgpt_export_data_pending_confirm PUT.
 # 2026-09-15 D: E07-01 원자료 재확인: PRE 0건 → POST PUT (값 UTF-16LE "1788249242085" = Unix ms, 2026-09-01T16:54:02.085+09:00)
 #   → 같은 키 DELETE (값·시각 없음). 실험 기록 (REPORT E07-01): 설정 → 데이터 제어 → 데이터 내보내기 → 본인 인증 → 최종 확인 → 요청.
@@ -288,8 +288,8 @@ REASON_DIRECT_VALUE = "DIRECT_VALUE"
 REASON_TIMESTAMP_APPROXIMATED = "TIMESTAMP_APPROXIMATED"
 
 
-# ---- 8.17 나머지 행위 Rule 공통 (heuristic Rule 기본값) -----------------------
-# 2026-09-20. 아래 §8.18~§8.26 은 "행위 특이적 직접 증거가 확인되지 않은" 행위들의 Rule 이다.
+# ---- 나머지 행위 Rule 공통 (heuristic Rule 기본값) ---------------------------------------------------------
+# 2026-09-20. 아래 Rule 들은 "행위 특이적 직접 증거가 확인되지 않은" 행위를 다룬다.
 # 원칙:
 #   - Rule 이 존재하는 것과 실제로 Event 가 나오는 것은 다르다. 근거 Record 가 없으면 Event 를 만들지 않는다.
 #   - 기본값은 CANDIDATE / LOW / PARTIALLY_VERIFIED / SUPPORTING 이고, 값을 올리는 것은 개별 Rule 이 근거를 적어 설명한다.

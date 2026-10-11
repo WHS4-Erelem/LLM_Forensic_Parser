@@ -93,8 +93,8 @@ def detect_data_export_request(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.13 CHATGPT_IMAGE_GENERATION_REQUEST_001 (Session Storage imagegen_progress) ----
-# 근거: origin https://chatgpt.com/ 의 imagegen_progress:<uuid> PUT (§7.5 Reader Record).
+# ---- CHATGPT_IMAGE_GENERATION_REQUEST_001 (Session Storage imagegen_progress) --------------------
+# 근거: origin https://chatgpt.com/ 의 imagegen_progress:<uuid> PUT (Session Storage Reader Record).
 # 2026-09-18 실제 마커 DD (llmtest/Default/Session Storage/000003.log) 에서 확인한 것:
 #   - 같은 key 에 PUT 4건 (lastDisplayedPercent 40 → 50 → 61 → 74). startedAtMs·estimatedDurationMs 는 4건 모두 같은 값
 #   - 그 뒤 같은 key 의 DELETE 1건 (값 없음) — 진행 표시가 끝났다는 뜻일 뿐 생성 완료 판정에 쓰지 않는다
@@ -173,8 +173,8 @@ def detect_image_generation_request(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.14 CHATGPT_TEMPORARY_CHAT_001 -----------------------------------------
-# 근거: Sessions (SNSS) navigation entry 의 chatgpt.com URL query 에 temporary-chat=true 가 있는 경우 (§7.7 Reader).
+# ---- CHATGPT_TEMPORARY_CHAT_001 ------------------------------------------------------------------
+# 근거: Sessions (SNSS) navigation entry 의 chatgpt.com URL query 에 temporary-chat=true 가 있는 경우 (Sessions Reader).
 # 2026-09-19 실제 평문 DD (Profile 1/Sessions) 에서 확인한 것:
 #   같은 navigation 1건이 Session_13433848693271468(cmd 6) · Tabs_13433848648354897(cmd 1) ·
 #   Tabs_13433918899064245(cmd 1) 세 파일에 tab_id 만 다르게 중복 저장됐고, index · title("ChatGPT") ·
@@ -272,7 +272,7 @@ def detect_temporary_chat(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.20 CHATGPT_SHARE_LINK_001 --------------------------------------------
+# ---- CHATGPT_SHARE_LINK_001 ----------------------------------------------------------------------
 # 근거: 어떤 Reader 가 만든 Record 든 그 안의 URL 이 ChatGPT 공유 링크 형태인 경우.
 #   /share/<id>            → 공유 링크 화면 (DIRECT 에 가까운 근거)
 #   /backend-api/share...  → 공유 API 경로 (요청 단계만, 생성·해제 구분 못 함)
@@ -355,8 +355,8 @@ def detect_share_link(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.21 CHATGPT_MODEL_CHANGE_001 ------------------------------------------
-# 근거: Cache 대화 응답 mapping 의 assistant 메시지 metadata.model_slug (§7.4 reducer 가 보존).
+# ---- CHATGPT_MODEL_CHANGE_001 --------------------------------------------------------------------
+# 근거: Cache 대화 응답 mapping 의 assistant 메시지 metadata.model_slug (Cache Reader 가 보존).
 # 판정 조건: 같은 대화 안에서 시각 순으로 이어지는 assistant 응답의 model_slug 가 A → B 로 바뀐 전이.
 # models / tpp-models 목록(카탈로그)이 존재한다는 것만으로는 Event 를 만들지 않는다 — 전이가 있어야 한다.
 # 2026-09-20 조사: PRE/POST Cache 전수에서 model_slug 는 같은 값(auto)뿐이라 전이가 관찰되지 않았다 → Event 0건.
@@ -432,7 +432,7 @@ def detect_model_change(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.23 CHATGPT_HISTORY_DELETE_001 ----------------------------------------
+# ---- CHATGPT_HISTORY_DELETE_001 ------------------------------------------------------------------
 # 방문기록 삭제 고유의 흔적은 기존 조사(REPORT REAUDIT F-7)에서 확인되지 않았다. 그래서 단일 신호로는 판정하지 않고,
 # 서로 독립적인 보조 신호가 2개 이상 모일 때만 CANDIDATE / LOW 로 남긴다 (3개 이상이면 MEDIUM 검토).
 #   S1 ChatGPT 대화 목록(conversation-history)에 대화 ID 가 있는데 History 에 그 대화 방문이 하나도 없음
@@ -529,7 +529,7 @@ def detect_history_delete(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.25 CHATGPT_CACHE_DELETE_001 ------------------------------------------
+# ---- CHATGPT_CACHE_DELETE_001 --------------------------------------------------------------------
 # 브라우저 캐시 삭제 고유의 흔적은 없다. 단일 수집본에서 삭제를 가리킬 수 있는 관찰값은 "삭제 대화상자에 캐시가
 # 선택돼 있다" (P1) 하나뿐이고, 그것도 선택 상태일 수 있어 ChatGPT 맥락 신호 (S2 / S3) 가 1개 이상 함께 있을 때만
 # CANDIDATE / LOW 로 남긴다. 판정식은 P1 AND (S2 OR S3) 다. 정상 eviction 과 구분하지 못한다.
@@ -634,7 +634,7 @@ def detect_cache_delete(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.26 CHATGPT_INCOGNITO_001 ---------------------------------------------
+# ---- CHATGPT_INCOGNITO_001 -----------------------------------------------------------------------
 # 시크릿(off-the-record) 창은 디스크에 Profile Artifact 를 남기지 않는 것이 정상이다.
 # 따라서 "일반 Profile 에 기록이 없다"는 이유로 Event 를 만들지 않는다 (흔적의 부재는 행위의 부재도, 존재도 아니다).
 # Rule 은 Record 안에 시크릿 사용을 직접 가리키는 표식이 있을 때만 동작한다 (실행 인자 --incognito,

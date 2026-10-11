@@ -25,7 +25,7 @@ SERVICE = "chatgpt_web"
 DEFAULT_BROWSER = "chrome"
 DISPLAY_TIMEZONE = "+09:00 (KST)"
 
-# 허용 값 목록 (docs/OUTPUT_SCHEMA.md 기준)
+# 허용 값 목록 — JSON·CSV 에 쓸 수 있는 값은 여기 있는 것뿐이다.
 INPUT_KINDS = ("e01", "dd", "directory")
 
 COVERAGE_STATUSES = ("NOT_PRESENT", "EMPTY", "PARSED", "PARTIAL", "PARSE_ERROR", "NOT_SUPPORTED")

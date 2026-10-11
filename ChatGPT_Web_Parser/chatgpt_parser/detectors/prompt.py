@@ -23,8 +23,8 @@ from ..models import Event, EvidenceItem
 from ..recovery.conversations import _CACHE_MESSAGE_TIME_SOURCE, _history_conversation_links, _json_time
 
 
-# ---- 8.9 CHATGPT_PROMPT_DRAFT_001 --------------------------------------------
-# 근거: Local Storage (https://chatgpt.com) oai/apps/conversationDrafts PUT 의 초안 항목 (§7.3 Reader 가 이미 만드는 Record).
+# ---- CHATGPT_PROMPT_DRAFT_001 --------------------------------------------------------------------
+# 근거: Local Storage (https://chatgpt.com) oai/apps/conversationDrafts PUT 의 초안 항목 (Local Storage Reader 가 이미 만드는 Record).
 # 2026-09-15 C: SNAPSHOT_EXTRACT Local Storage .log (uid06 · uid12 · uid15 · uid16 · uid26 · uid31) 에서 확인한 형식:
 #   값 = {"drafts":[{"id", "content", "doc"(ProseMirror, content 와 같은 글자), "timestamp"(13자리 Unix ms)}], "userId"}
 #   PUT 마다 초안 목록 전체를 다시 쓴다. 초안을 비울 때는 DELETE 가 아니라 {"drafts":[],"userId":null} PUT.
@@ -145,7 +145,7 @@ def detect_prompt_draft(records: list[ArtifactRecord], coverages: list[Coverage]
     return events
 
 
-# ---- 8.18 CHATGPT_PROMPT_SEND_001 -------------------------------------------
+# ---- CHATGPT_PROMPT_SEND_001 ---------------------------------------------------------------------
 # PROMPT_DRAFT (초안 저장) 와 PROMPT_SEND (전송) 는 서로 다른 행위다.
 #   PROMPT_DRAFT = Local Storage 의 conversationDrafts 에 입력창 내용이 저장된 상태.
 #   PROMPT_SEND  = 그 내용이 실제로 전송되어 대화에 user 메시지로 남은 행위.

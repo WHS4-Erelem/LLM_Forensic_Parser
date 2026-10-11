@@ -1,7 +1,10 @@
-# ARTINEX — PyQt6 GUI (ERELM LLM Forensic Parser)
+# ARTINEX GUI
 
-기존 통합 Runner(`integration/llm_forensic.py`)와 파서 6개를 **수정하지 않고** 호출하는 데스크톱 UI다.
-GUI 는 새 포렌식 Parser 가 아니며, 판정·Finding 을 만들지 않는다. 화면에 보이는 값은 모두
+**ARTINEX** 는 통합 LLM 포렌식 파서 전체의 이름이다. 이 폴더(`gui/`)는 그 ARTINEX 를 **실행하고
+분석 결과를 보여 주는 PyQt6 데스크톱 인터페이스**다.
+
+GUI 는 통합 Runner(`integration/llm_forensic.py`)와 파서 6개를 **수정하지 않고** 호출한다.
+GUI 자체는 포렌식 Parser 가 아니며 판정·Finding 을 만들지 않는다. 화면에 보이는 값은 모두
 통합 Runner 가 만든 `timeline.csv` / `recovered_conversations.csv` / `integration_report.json` 에서 읽은 것이다.
 
 ```
@@ -31,11 +34,22 @@ Runner 의 `[Report]` 출력 경로에서 얻는다. 그 줄을 놓친 경우에
 
 ## 실행
 
+저장소를 받은 폴더(`llm_forensic.py` 가 있는 `integration` 과 `gui` 가 나란히 보이는 곳)에서
+PowerShell 을 열고 그대로 입력한다.
+
 ```powershell
-cd <repository-root>
 python -m pip install -r gui\requirements.txt
 python gui\main.py
 ```
+
+저장소를 아직 받지 않았다면 먼저 받고 그 폴더로 이동한다.
+
+```powershell
+git clone https://github.com/WHS4-Erelem/LLM_Forensic_Parser.git
+cd LLM_Forensic_Parser
+```
+
+`gui\main.py` 는 어느 폴더에서 실행해도 되지만, 위 상대 경로 예시는 저장소 루트를 기준으로 한다.
 
 파서를 실제로 돌리려면 저장소 루트 README 안내에 따라 최초 1회
 `integration\setup.ps1`을 실행해 공용 `.venv312` 환경을 준비해야 한다. 가상환경이 없으면 통합 Runner 는 각 파서를
@@ -47,12 +61,19 @@ python gui\main.py
 |---|---|
 | 1. Case Setup | 사건명 / 사건번호 / 분석가 / 메모. **새 분석 시작** 또는 **기존 분석 불러오기** |
 | 2. Evidence Setup | 증거 이미지(E01·DD) · 결과 폴더 · Run All / Manual Selection(`--only`) · `--quick` · 입력 검증 |
-| 3. Analysis Progress | 모듈별 상태, 실시간 stdout/stderr 로그. 진행률은 Runner 가 비율을 내지 않아 indeterminate |
+| 3. Analysis Progress | 모듈별 상태, 실시간 stdout/stderr 로그, **분석 중단** 버튼. 진행률은 Runner 가 비율을 내지 않아 indeterminate |
 | 4. Results Workspace | 왼쪽 개요 · 가운데 Overview/Timeline/Conversations/Artifacts/Errors · 오른쪽 근거 상세 |
 
 Timeline 행을 선택하면 오른쪽 **근거 상세** 패널이 그 행의 값으로 즉시 바뀐다
 (행위 · Verdict · Timestamp · Behavior Details · Artifact Path · Artifact Details · provenance).
 Errors / Artifacts 표도 같은 패널을 쓴다.
+
+**분석 중단** 은 실행 중인 Runner 프로세스를 kill 한다. 그 시점까지 Runner 가 이미 쓴 결과 파일은
+그대로 남고 GUI 가 지우지 않는다 — 중단된 실행의 결과는 불완전할 수 있다.
+
+Overview 의 **증거·무결성** 패널은 `evidence_manifest.json` / `integration_report.json` 에 기록된 값만
+표시한다. GUI 는 해시를 다시 계산하지 않는다. `--quick` 으로 돌렸으면 `evidence_sha256` 이 `-` 이고,
+그것이 정상 결과라는 사유를 함께 보여 준다.
 
 ## 파일
 
@@ -64,7 +85,7 @@ Errors / Artifacts 표도 같은 패널을 쓴다.
 | `gui/integration_runner.py` | `QProcess` 로 통합 Runner 실행, 표준출력 파싱(모듈 상태·결과 폴더) |
 | `gui/result_loader.py` | 결과 폴더 읽기 전용 로더 (CSV·보고서 → 지표·세션·아티팩트·오류) |
 | `gui/case_manager.py` | `case_info.json` 저장·읽기 |
-| `gui/styles.qss` | Light DFIR 테마 (Teal accent) |
+| `gui/styles.qss` | Dark DFIR 테마 (Teal accent). delegate 가 직접 그리는 색은 `main_window.DARK` 와 같은 값이다 |
 | `gui/tests/test_gui_integration.py` | GUI ↔ 통합 계약 회귀 테스트 (CLI 인자 · console 파싱 · 결과 로딩 · 플러그인 격리) |
 
 테스트는 GUI 와 같은 해석기(PyQt6 가 있는 Python 3.13)로 돌린다. 파서용 `.venv312` 에는 PyQt6 가 없다.
@@ -110,6 +131,7 @@ python -B -m unittest discover -s gui/tests
 - 통합 Runner 에 **서비스 자동 탐지가 없다** → Run All / Manual Selection 만 제공한다.
 - Runner 가 진행 비율을 내보내지 않는다 → 퍼센트 대신 현재 단계 문구 + indeterminate bar.
 - 입력은 **이미지 파일만** 받는다 (`-i`). 아티팩트 폴더 입력은 Runner 가 지원하지 않는다.
-- Export 는 "결과 폴더 열기"만 있다. CSV/XLSX/HTML/PDF 내보내기는 미구현.
+- 내보내기 기능은 **결과 폴더 열기**와 상세 패널의 값 단위 **복사**(클립보드) 두 가지뿐이다.
+  CSV/XLSX/HTML/PDF 로 다시 저장하는 기능은 없다 — 원본 CSV 는 결과 폴더에 그대로 있다.
 - `근거 파일 위치 열기` 는 경로가 이 PC 에 실제로 존재할 때만 활성화된다
   (대부분의 Artifact Path 는 이미지 내부 경로라 비활성이 정상이다).
