@@ -116,6 +116,8 @@ powershell -ExecutionPolicy Bypass -File <저장소>\Autopsy_Addon\setup.ps1
 | `big` | `big<TAB>vol<fs><TAB>/$MFT 또는 /$Extend/$UsnJrnl:$J<TAB>size=<원본 크기><TAB>limit=1073741824<TAB>parsers=<그 파일을 읽는 파서>` — 1GB 상한 초과로 넘기지 않음 | 예 |
 | `meta_limit` | `meta_limit<TAB>all volumes<TAB>limit=20000<TAB>collected=<수집 수><TAB>…<TAB>parsers=chatgpt_desktop,claude_web` — 2만 개 제한 다음 대상이 있어 그 뒤 메타데이터를 수집하지 않음 | 예 |
 | `error`, `view_error`, `history_targets_failed`, `history_target_ambiguous` | 실제 추출 오류 / 입력 폴더 링크 실패 / History 다운로드 목록 읽기 실패 / 다른 볼륨 후보가 여럿 | 예 |
+| `ads_partial_not_removed` | 추출에 실패한 ADS 의 일부만 써진 복사본을 지우지 못함 (같은 ADS 의 `error` 와 함께 기록). 그 스트림이 주 파일 링크를 따라 파서 입력에 남을 수 있음 | 예 (`error` 로) |
+| `time_restore_failed` | ADS 를 쓴(또는 지운) 뒤 주 파일 복사본의 수정 시각을 원본으로 되돌리지 못함 — 복사본 시각이 분석 PC 시각일 수 있음 | 예 |
 
 실패한 파서가 있거나 `incomplete input` 이 있으면 원인을 볼 수 있게 추출본을 남깁니다. 정상이어도 남기려면 `artinex_config.json` 에 `"keep_export": true` 를 넣습니다.
 취소하면 그때까지의 추출본이 남습니다. 남은 실행시각 폴더는 언제든 지워도 됩니다 (원본은 이미지에, Report 사본은 사건 폴더에 있음).
@@ -194,9 +196,11 @@ autopsy64.exe --createCase --caseName=case1 --caseBaseDir=C:\cases --addDataSour
 ## 원본 메타데이터 전달
 
 - 모든 파일은 Autopsy 의 `ContentUtils.writeToFile` 로 버퍼 단위로 쓰고(파일 전체를 메모리에 올리지 않음), 쓴 크기를 원본 크기와 대조합니다(다르면 오류로 기록하고 그 복사본을 지움).
-  복사본의 수정 시각은 원본 `$STANDARD_INFORMATION` 수정 시각으로 되돌립니다.
+  복사본의 수정 시각은 원본 `$STANDARD_INFORMATION` 수정 시각으로 되돌립니다. ADS 를 쓰거나 지우면 Windows 가 주 파일의 수정 시각을 현재 시각으로 바꾸므로,
+  ADS 처리가 모두 끝난 뒤 그 주 파일의 수정 시각을 같은 방식(원본 수정 시각, 밀리초)으로 다시 맞춥니다. 실패하면 `time_restore_failed` + 그 파일을 읽는 파서에 `incomplete input`.
+  원본 수정 시각이 없는 파일(Autopsy 값 0)은 복사본 시각을 바꾸지 않으며 `_host_metadata.json` 의 시각은 null 입니다.
 - `Zone.Identifier` 는 추출 폴더에 실제 ADS(`파일:Zone.Identifier`)로 씁니다 (텍스트 파일로 바꾸지 않음). 작업 위치는 ADS 를 쓸 수 있는 곳만 고르므로(위 '작업 위치'),
-  개별 파일이 실패하면 그 파일만 `error` 로 기록하고 다음 파일을 계속 꺼냅니다. ADS 는 주 파일을 모두 꺼낸 뒤 마지막에 씁니다 — Autopsy 는 `x.pdf:Zone.Identifier` 를
+  개별 파일이 실패하면 그 파일만 `error` 로 기록하고 다음 파일을 계속 꺼냅니다. 실패한 ADS 의 일부만 써진 복사본은 지워 파서에 넘기지 않습니다(못 지우면 `ads_partial_not_removed`). ADS 는 주 파일을 모두 꺼낸 뒤 마지막에 씁니다 — Autopsy 는 `x.pdf:Zone.Identifier` 를
   `x.pdf` 보다 먼저 돌려줄 수 있는데(인덱스 순서), 주 파일을 나중에 쓰면 Windows 가 그 파일의 ADS 를 지웁니다(0.4.0 까지의 버그, 0.4.1 에서 수정). 주 파일을 못 꺼냈으면 그 ADS 도 쓰지 않습니다.
 - `_host_metadata.json`(원본 경로·MFT 레코드 번호·순번·시각·크기·첫 8바이트·삭제 여부)은 원본 경로와 MFT 레코드를 잇는 보조 정보입니다. 시각·USN 은 파서가 원본 `$MFT`·`$J` 에서 직접 읽습니다.
 - 볼륨마다 추출 폴더를 따로 두고(`vol<fs id>`) 볼륨마다 파서를 따로 실행합니다.
@@ -266,13 +270,14 @@ LM Studio 차이는 폴더 입력 모드의 표기·근거 차이이며 0.2·0.3
 |---|---|
 | 기업 2회차 (첫 실행 직후) | 새 등록 0건, 209건 모두 `already present` |
 | 기업 3회차 (ADS 순서 수정 후) | Claude Web 1행만 새로 등록(값이 바뀐 행 — Zone.Identifier 근거가 추가됨), 나머지 `already present`. Claude Web CSV 가 통합 실행과 완전 일치 |
+| 기업 4회차 (실패 ADS 삭제·ADS 뒤 주 파일 시각 재설정 후) | 새 등록 0건, 209건 모두 `already present`. CSV 12개 모두 3회차와 같음. `error`·`ads_partial_not_removed`·`time_restore_failed` 0. Gemini `gemini_results.json` 의 받은 파일 메타데이터 수정 시각 2건이 분석 실행 시각 → 원본 시각으로 바뀜(Zone.Identifier 가 있는 파일) |
 | 해킹 (오늘 0.4.0 결과가 있는 사건) | ChatGPT Desktop 4행만 새로 등록(0.3.31 Sentry 행위 — 0.4.1 에서 `scope_v3.json` 수집 추가), 나머지 152건 `already present`. Report 3건 추가 |
 
 이 Ingest 에서 발견해 고친 것: Autopsy 는 `Downloads` 의 `x.pdf:Zone.Identifier` 를 `x.pdf` 보다 먼저 돌려주는데(인덱스 순서) ADS 를 먼저 쓰고 주 파일을 나중에 쓰면
 Windows 가 ADS 를 지워, Claude Web 의 Zone.Identifier 근거가 빠졌습니다(0.2 부터 있던 문제). ADS 를 마지막에 쓰도록 수정했습니다.
 0.3.0 Ingest 에서 고친 것: 다른 모듈이 만든 ZIP 안 파생 파일이 `Downloads/%` 에 걸리던 문제 — 원본 파일시스템(`FS`)·논리 파일(`LOCAL`)만 꺼냄(`derived`).
 
-**2. 단위 검증 85건** — Autopsy 동봉 Jython 2.7.4 + sqlite-jdbc, Autopsy API 대역(가짜 볼륨 3개, 가짜 파서 6개, `artifactExists` 는 실제 Autopsy 와 같은 부분집합 비교). 모두 통과.
+**2. 단위 검증 104건** (기존 85 + PR 운영 규칙 7장 보강 19) — Autopsy 동봉 Jython 2.7.4 + sqlite-jdbc, Autopsy API 대역(가짜 볼륨 3개, 가짜 파서 6개, `artifactExists` 는 실제 Autopsy 와 같은 부분집합 비교). 모두 통과.
 
 | 범주 | 확인한 것 |
 |---|---|
@@ -283,6 +288,8 @@ Windows 가 ADS 를 지워, Claude Web 의 Zone.Identifier 근거가 빠졌습�
 | 수집 범위 | 목록용·분류 밖 파일 제외, 하위 폴더 메타데이터 기록, ZIP 안 파생 파일 제외 |
 | 대용량·존재 파일 | 200MB 파일 SHA-256·크기 동일, `.gguf` 0바이트 존재 파일 + 원본 크기 기록 |
 | ADS | ADS 가 주 파일보다 먼저 와도 실제 스트림으로 남음(수정 전 코드에서는 실패 확인), 주 파일 실패 → ADS 안 씀, 개별 실패 기록 후 다음 ADS 계속, 실패해도 주 파일 유지 |
+| ADS·원본 값 (보강) | ADS 없는 파일에 스트림 안 생김, 주 파일·ADS 실패 시 그 근거가 다른 파일에 붙지 않고 연결은 Data Source + `link_notes.txt`, 읽기 도중 실패한 ADS 의 일부 복사본 삭제(못 지우면 `ads_partial_not_removed`), ADS 를 쓴 주 파일의 수정 시각 = 원본(재설정 실패 시 `time_restore_failed` + 그 파일을 읽는 파서에만 `incomplete input`), 같은 ADS 중복 조회·History 재요청에도 1회만 전달·1회만 등록, ADS 내용·원본 경로·MFT 번호·시각 보존, 원본 시각 없음 → null |
+| Sentry (보강) | `scope_v3.json` 있으면 원본 그대로 ChatGPT Desktop 입력에만, 없으면 sentry 폴더 없음·등록 행 수 = 파서 CSV 행 수. 실제 ChatGPT_APP_Parser(합성 폴더 2개): 있으면 `사용자 프롬프트 입력/전송` 확정 1행(전송 요청 시각), 없으면 Sentry 행 0 |
 | History 대상 | Downloads 밖(Desktop) 파일 + Zone.Identifier 추출, 다른 볼륨 파일을 History 볼륨 입력에(그 파일의 MFT 번호는 `_host_metadata.json` 에 넣지 않음), 다른 볼륨 후보 2곳이면 가져오지 않고 기록, 없는 대상 기록, History 를 읽지 못하면 `incomplete input`, LM Studio 존재 파일을 History 가 가리키면 원본으로 승격 |
 | 파서별 입력 폴더 | `Downloads/*.csv` 가 웹 파서에만, `$MFT` 는 읽는 파서에만, 하드 링크, 링크로 ADS 읽힘, 각 폴더에 `_host_metadata.json` |
 | 재실행·정리 | 입력 폴더 경로가 다른 재실행에서 `already present`. 정상 완료 → `export`·`in_*` 삭제, 결과·`export_skipped.txt` 유지 / 실패·`incomplete input`·`keep_export` → 유지 |

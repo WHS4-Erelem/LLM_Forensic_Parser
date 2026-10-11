@@ -440,8 +440,10 @@ class ArtinexIngestModule(DataSourceIngestModule):
                     if upgrade:                              # 승격 실패: 기존 존재 파일 사용자(LM Studio)를 위해 0바이트로 되돌린다
                         target.delete()
                         target.createNewFile()
-                    elif not ads:
-                        target.delete()                      # 덜 써진 파일을 파서가 읽지 않게
+                    else:
+                        target.delete()                      # 덜 써진 파일·ADS 를 파서가 읽지 않게 (ADS 는 그 스트림만 지워진다)
+                        if ads and target.exists():          # 남은 불완전 ADS 는 주 파일 링크를 따라 파서 입력에 들어간다
+                            notes.append("ads_partial_not_removed\t%s" % rel)
                     skipped["error"] += 1
                     lost(v, parsers, "%s\t%s" % (rel, exc), "error")
                     self.log(Level.WARNING, "export failed %s: %s" % (rel, exc))
@@ -557,6 +559,12 @@ class ArtinexIngestModule(DataSourceIngestModule):
                 put(v, f, rel, ["~" + p for p in users])
         for args in pending:
             put(*args, now=True)
+        for vk, main in sorted(set((args[0]["key"], args[2].lower().split(":")[0]) for args in pending)):
+            # ADS 를 쓰거나 지우면 Windows 가 주 파일의 수정 시각을 현재 시각으로 바꾼다 — 원본 $SI 수정 시각으로 다시 맞춘다 (put 과 같은 방식)
+            v, f = vols[vk], vols[vk]["by_path"].get(main)
+            if f is not None and f.getMtime() and not File(v["dir"], v["store"][main].lstrip("/")).setLastModified(f.getMtime() * 1000):
+                count_missing(v, v["readers"].get(main, ()))
+                notes.append("time_restore_failed\t%s" % v["store"][main])
         if over:                                      # 어느 볼륨의 대상이 빠졌는지 모르므로 모든 볼륨의 해당 파서에 경고
             notes.append("meta_limit\tall volumes\tlimit=%d\tcollected=%d\tDownloads/Desktop/Documents file metadata beyond the limit "
                          "not collected (ChatGPT Desktop recent_lnk targets, Claude Web $MFT evidence)\tparsers=%s"
