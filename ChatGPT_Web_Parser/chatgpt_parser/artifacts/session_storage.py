@@ -23,7 +23,7 @@ from ..models import ArtifactRecord
 from ..utils import normalize_timestamp
 
 
-# ---- 7.5 Chrome Session Storage Reader (LevelDB .log) — Data Export 확인 대기 키만 ----
+# ---- Chrome Session Storage Reader (LevelDB .log) — Data Export 확인 대기 키만 -------------------------
 # 2026-09-15 D: E07-01 원자료 (PRE / POST Chrome\Session Storage\000003.log) 에서 byte 로 확인한 형식:
 #   namespace-<namespace id>-<origin> → value = map 번호 (ASCII 숫자)            예: namespace-…-https://chatgpt.com/ = "2"
 #   map-<map 번호>-<key 이름>          → value = UTF-16LE 문자열 (Local Storage 와 달리 prefix byte 없음), key 이름은 1 byte 문자
@@ -37,7 +37,7 @@ from ..utils import normalize_timestamp
 #   imagegen_progress:<uuid> 만 Record.
 #   그 밖의 chatgpt.com key 는 개수만 (값 비출력). 다른 origin (accounts.google.com sessionPrivateKey, auth.openai.com
 #   authapi:client_auth_session_id 등 인증 값) 은 세지도 않는다. namespace id 는 SHA-256 앞 16자리만.
-# Reader 는 판정하지 않는다 (DATA_EXPORT_REQUEST 는 §8.8 Rule).
+# Reader 는 판정하지 않는다 (DATA_EXPORT_REQUEST 는 Rule 의 역할).
 
 SESSION_STORAGE_DIR_PARTS = ("Session Storage",)
 SESSION_STORAGE_ORIGIN = "https://chatgpt.com/"

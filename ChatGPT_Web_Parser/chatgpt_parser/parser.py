@@ -38,13 +38,11 @@ from .source import DirectorySource, normalize_source_path
 from .utils import UTC, format_utc
 
 
-# =============================================================================
-# 10~12. extract() / detect() / run()
-# =============================================================================
+# ---- extract() / detect() / run() ----------------------------------------------------------------
 # 팀 Controller 가 함수로 호출할 수 있는 진입점.
 #   extract(): Source → ArtifactRecord[] + Coverage[]
 #              history_path 지정 = Explicit Mode (History 1개 + 같은 폴더의 Local Storage/leveldb, 자동 탐색 안 함)
-#              history_path None = Auto Discovery Mode (§6 Chrome Profile 탐색 → Profile 별 History + Local Storage/leveldb)
+#              history_path None = Auto Discovery Mode (Chrome Profile 탐색 → Profile 별 History + Local Storage/leveldb)
 #   detect():  ArtifactRecord[] → Event[]            (History Rule — EVENT_RULES)
 #   run():     extract + detect + extract_conversation_residue + extract_cache_conversations → ParseResult
 
@@ -136,7 +134,7 @@ EVENT_RULES = (
     detect_image_generation_request,  # CHATGPT_IMAGE_GENERATION_REQUEST_001 (Session Storage, 요청 단계만)
     detect_conversation_retry,  # CHATGPT_CONVERSATION_RETRY_001 (Cache 대화 응답 variant, UI 조작 판정 아님)
     detect_file_upload,  # CHATGPT_FILE_UPLOAD_001 (Cache 대화 응답 user 메시지의 source=local 첨부)
-    # 아래 9개는 행위 특이적 직접 증거가 없는 heuristic Rule 이다 (§8.18~§8.26). 근거가 없으면 Event 를 만들지 않는다.
+    # 아래 9개는 행위 특이적 직접 증거가 없는 heuristic Rule 이다. 근거가 없으면 Event 를 만들지 않는다.
     detect_prompt_send,           # CHATGPT_PROMPT_SEND_001 (대화에 남은 user 메시지 / 초안이 비워진 전이)
     detect_file_upload_delete,    # CHATGPT_FILE_UPLOAD_DELETE_001 (Cache 사본 간 로컬 첨부 소멸)
     detect_share_link,            # CHATGPT_SHARE_LINK_001 (chatgpt.com/share/ · backend-api share URL)
@@ -188,9 +186,7 @@ def run(
     )
 
 
-# =============================================================================
-# 12-3. 팀 통합용 진입점 (analyze_chatgpt_web / write_final_outputs)
-# =============================================================================
+# ---- 팀 통합용 진입점 (analyze_chatgpt_web / write_final_outputs) ---------------------------------------
 # 팀 통합 담당자는 Cache carving 이나 Rule 구현을 몰라도 이 두 함수만으로 분석과 출력을 할 수 있다.
 # 새로운 판정을 만들지 않는다. 기존 run() / write_result_csv() 를 그대로 호출한다.
 

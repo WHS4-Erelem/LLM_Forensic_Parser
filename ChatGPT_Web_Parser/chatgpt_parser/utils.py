@@ -19,9 +19,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
-# =============================================================================
-# 3. Timestamp Normalization
-# =============================================================================
+# ---- Timestamp Normalization ---------------------------------------------------------------------
 # 처리 순서: raw → UTC 계산 → UTC 를 KST(+09:00) 로 변환.
 #   - raw 를 KST 로 가정하지 않는다. 분석 PC 의 로컬 시간대·현재 시각을 쓰지 않는다.
 #   - 정수 timestamp 는 float 를 거치지 않고 정수 timedelta 로 계산한다 (정밀도 보존).

@@ -19,7 +19,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
-# ---- 7.2 LevelDB .log Reader ------------------------------------------------
+# ---- LevelDB .log Reader -------------------------------------------------------------------------
 # Chrome Local Storage leveldb 폴더의 *.log (write-ahead log) 만 읽는다. *.ldb (SSTable, Snappy 압축) 는 미지원.
 # 형식 (LevelDB log_format):
 #   32 KiB block. physical record = checksum 4 (masked CRC32C of type+data, LE) + length 2 (LE) + type 1 + data
@@ -221,7 +221,7 @@ def parse_leveldb_write_batch(record: LevelDBLogRecord) -> tuple[list[LevelDBOpe
     return operations, []
 
 
-# ---- 7.2b LevelDB .ldb (SSTable) Reader --------------------------------------
+# ---- LevelDB .ldb (SSTable) Reader ---------------------------------------------------------------
 # 2026-09-16 실제 .ldb (C: uid07 000005·000007, POST_CLEANUP 000010, D: E03-02 000005·000008) 에서 byte 로 확인한 형식:
 #   파일 끝 48 byte footer = metaindex handle + index handle (각각 varint64 offset·size) + padding + magic 0xdb4775248b80fb57 (LE)
 #   block = data + 1 byte compression type (0 none / 1 Snappy raw) + 4 byte masked CRC32C(data + compression type byte)

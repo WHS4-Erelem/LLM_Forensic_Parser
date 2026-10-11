@@ -23,13 +23,11 @@ from ..source import FILE_STATUS_EMPTY, FILE_STATUS_NOT_A_FILE, FILE_STATUS_NOT_
 from ..utils import normalize_timestamp
 
 
-# =============================================================================
-# 7. Artifact Readers
-# =============================================================================
+# ---- Artifact Readers ----------------------------------------------------------------------------
 # Reader 는 Source 에서 bytes 를 읽어 ArtifactRecord(관찰 사실)와 Coverage 를 만든다.
-# 사용자 행위 판정(Event)은 하지 않는다 — §8 Event Rules 의 역할.
+# 사용자 행위 판정(Event)은 하지 않는다 — detectors/ 의 Rule 이 할 일이다.
 
-# ---- 7.1 Chrome History ------------------------------------------------------
+# ---- Chrome History ------------------------------------------------------------------------------
 #   - 원본 경로로 sqlite3.connect 하지 않는다: Source.read_bytes → open_sqlite_bytes (메모리, query_only).
 #   - Visit 1건 = ArtifactRecord 1건. 시각은 urls.last_visit_time 이 아니라 visits.visit_time (webkit_us).
 #   - Chrome 버전별 Schema 차이: 필수 테이블·컬럼이 없으면 PARSE_ERROR, 선택 컬럼은 있을 때만 읽는다.
@@ -78,7 +76,7 @@ TRANSITION_QUALIFIERS = (
     (0x20000000, "CHAIN_END"), (0x40000000, "CLIENT_REDIRECT"), (0x80000000, "SERVER_REDIRECT"),
 )
 
-# ---- 7.1-b Chrome History downloads -----------------------------------------
+# ---- Chrome History downloads --------------------------------------------------------------------
 # 2026-09-18 실제 Marker E01 (Chrome Stable, llmtest/Default) History 에서 확인한 Schema:
 #   downloads(id, guid, current_path, target_path, start_time, received_bytes, total_bytes, state, danger_type,
 #             interrupt_reason, hash, end_time, opened, last_access_time, transient, referrer, site_url,
@@ -87,7 +85,7 @@ TRANSITION_QUALIFIERS = (
 #   downloads_url_chains(id, chain_index, url)  — 한 download 에 여러 행, chain_index 순서를 보존한다
 #   start_time / end_time / last_access_time 은 visits.visit_time 과 같은 webkit_us (end_time 0 = 기록 없음)
 # Chrome 버전마다 컬럼이 다를 수 있어 필수 3개만 요구하고 나머지는 있을 때만 읽는다.
-# Reader 는 download 를 사용자 행위로 판정하지 않는다 (ChatGPT 판정은 §8.12 Rule 의 역할).
+# Reader 는 download 를 사용자 행위로 판정하지 않는다 (ChatGPT 판정은 CHATGPT_FILE_DOWNLOAD_001 Rule 의 역할).
 
 HISTORY_DOWNLOAD_REQUIRED_COLUMNS = ("id", "target_path", "start_time")
 HISTORY_DOWNLOAD_OPTIONAL_COLUMNS = (

@@ -22,7 +22,7 @@ from ..detectors.common import AUTH_OPENAI_HOST, CHATGPT_HOST, LOGOUT_PATH, REAS
 from ..models import Event, EvidenceItem
 
 
-# ---- 8.1 CHATGPT_LOGOUT_001 --------------------------------------------------
+# ---- CHATGPT_LOGOUT_001 --------------------------------------------------------------------------
 # DIRECT 근거: History 의 https://chatgpt.com/auth/logout 방문 (수동 실험 E01-02 에서 검증된 형태).
 # URL 판정 (문자열 contains 사용 안 함)
 #   - scheme https, host chatgpt.com, path 정확히 /auth/logout 이어야 한다.
@@ -32,7 +32,7 @@ from ..models import Event, EvidenceItem
 # Confidence
 #   - HIGH   : 검증된 형태 + 시각 설명 가능
 #   - MEDIUM : variant URL + 시각 설명 가능
-#   - LOW    : 시각 변환 실패 (EVENT_RULES §2 "Timestamp 불완전" → LOW) → action_status CANDIDATE
+#   - LOW    : 시각 변환 실패 (Timestamp 를 확정하지 못하면 LOW) → action_status CANDIDATE
 # transition(REDIRECT·RELOAD·FORWARD_BACK)·Sync 메타데이터는 보존만 하고 Confidence 를 바꾸지 않는다.
 # 같은 source_path + record_location(visits.id) 은 Event 1건. 서로 다른 visit 은 각각 Event.
 
@@ -154,7 +154,7 @@ def _build_logout_event(record: ArtifactRecord, match: str, source_sha256: str |
     )
 
 
-# ---- 8.3 CHATGPT_LOGIN_001 ---------------------------------------------------
+# ---- CHATGPT_LOGIN_001 ---------------------------------------------------------------------------
 # 근거: https://chatgpt.com/api/auth/callback/openai 방문 (OAuth 로그인 완료 경로, E01-01 체인에서 관찰).
 # 관찰된 callback 은 code·scope·state query 를 가진다 (Reader 가 code·state 값을 가림) → query 는 variant 아님.
 # PARTIALLY_VERIFIED / MEDIUM: 정상 로그인·세션 재개·로그인 실패·재인증을 구분하는 Negative Control 실험이 없다.
@@ -174,7 +174,7 @@ def detect_login(records: list[ArtifactRecord], coverages: list[Coverage] | tupl
     )
 
 
-# ---- 8.4 CHATGPT_ACCOUNT_SWITCH_001 ------------------------------------------
+# ---- CHATGPT_ACCOUNT_SWITCH_001 ------------------------------------------------------------------
 # 같은 History 안에서 visits.id 순서로 logout → login_with → authorize(auth.openai.com) → callback 이 이어지면
 # CANDIDATE / MEDIUM. 각 단계는 logout 뒤 첫 번째 해당 방문이며, 다음 logout 이 나오면 그 체인은 끊긴다.
 # 이 체인은 인증 전환 절차와 일치할 뿐 "다른 계정으로 실제 변경"을 증명하지 않는다 (같은 계정 재로그인 Negative Control 없음).
@@ -343,7 +343,7 @@ def _account_switch_event(chain: list[ArtifactRecord], source_sha256: str | None
     )
 
 
-# ---- 8.7 CHATGPT_PROFILE_ACCESS_001 ------------------------------------------
+# ---- CHATGPT_PROFILE_ACCESS_001 ------------------------------------------------------------------
 # 근거: https://chatgpt.com/profile 방문 = 프로필 설정 화면 접근. 계정 이름 변경(ACCOUNT_NAME_CHANGE)이 아니다.
 # 근거 원자료(RETEST_FINAL_ANALYSIS)를 C: 에서 재확인하지 못했고 분석용 History 사본에 /profile 방문이 0건이라
 # PARTIALLY_VERIFIED / MEDIUM (2026-09-15 정정). synthetic 테스트 통과는 실제 Artifact 에서 Rule 의미가 검증됐다는 뜻이 아니다.
@@ -366,7 +366,7 @@ def detect_profile_access(records: list[ArtifactRecord],
     )
 
 
-# ---- 8.11 CHATGPT_ACCOUNT_SESSION_001 (Local Storage accountSwitchSessions) ---
+# ---- CHATGPT_ACCOUNT_SESSION_001 (Local Storage accountSwitchSessions) ---------------------------
 # 근거: Local Storage oai/apps/accountSwitchSessions PUT. Reader 가 이미 session 별로
 #   userId SHA-256 앞자리 / sessionToken 존재·길이 / lastLoggedInAt(unix ms) / workspace 수를 뽑아 두지만
 #   지금까지 이 Record 를 읽는 Rule 이 없었다 (History 가 지워진 이미지에서는 로그인·계정 전환 근거가 전부 사라졌다).
@@ -524,7 +524,7 @@ def detect_account_session_switch(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.22 CHATGPT_ACCOUNT_NAME_CHANGE_001 -----------------------------------
+# ---- CHATGPT_ACCOUNT_NAME_CHANGE_001 -------------------------------------------------------------
 # 근거: Local Storage oai/apps/accountSwitchSessions 의 같은 계정(userId 해시) 항목에서 이름 해시가 바뀐 전이.
 #   이름 원문은 저장하지 않고 SHA-256 앞자리만 비교한다 (계정 정보 비노출 정책).
 # 변경 후 이름만 있고 변경 전 값이 없으면 Event 를 만들지 않는다 (값 하나로 '변경'을 판정하지 않는다).

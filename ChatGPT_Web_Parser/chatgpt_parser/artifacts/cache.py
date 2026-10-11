@@ -25,7 +25,7 @@ from ..source import SourcePathError, normalize_source_path
 from ..utils import normalize_timestamp
 
 
-# ---- 7.4 Chrome Blockfile Cache Reader (ChatGPT 대화 API 응답만) ------------------
+# ---- Chrome Blockfile Cache Reader (ChatGPT 대화 API 응답만) ------------------------------------------
 # 2026-09-15 C: POST_CLEANUP / PRE_CLEANUP 사본에서 확인한 형식 (이번 실험 환경 기준. 모든 Chrome 이 이 형식이라는 뜻이 아니다):
 #   Cache/Cache_Data/index (magic 0xC103CAC3) + data_0~3 (block file, magic 0xC104CAC3, header 8192 B) + f_XXXXXX (external)
 #   index: header 368 B 뒤 table_len 개의 CacheAddr hash table → EntryStore 의 next 로 이어진 체인을 따라 entry 를 열거한다.
@@ -234,8 +234,8 @@ def _reduce_message(message: Any) -> dict[str, Any] | None:
                "create_time": message.get("create_time"), "update_time": message.get("update_time"),
                "status": message.get("status"), "recipient": message.get("recipient"),
                "message_type": metadata.get("message_type"), "content": message.get("content"),
-               "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (§8.16)
-               "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (§8.20)
+               "attachments": metadata.get("attachments"),  # 업로드 파일 메타데이터 (FILE_UPLOAD Rule)
+               "model_slug": metadata.get("model_slug")}  # 응답을 만든 모델 (MODEL_CHANGE Rule)
     # has_versions: 응답 URL 의 include_has_versions=true 로 서버가 붙이는 "이 메시지에 다른 버전이 있는가" 표시.
     # 키가 실제로 있을 때만 남긴다 (없는 응답의 observed 를 바꾸지 않는다). 이 값으로 행위를 판정하지 않는다 —
     # 지금은 증거 보존만 하고, 분기(mapping 트리)가 실제로 캐시된 이미지를 확보한 뒤 판정을 검토한다.
@@ -435,12 +435,9 @@ def cache_data_dir(source: Source, profile_path: str, warnings: list[str] | None
     return _profile_subdir(source, profile_path, CACHE_DIR_PARTS, warnings)
 
 
-# =============================================================================
-# 8. Event Rules
-# =============================================================================
+# ---- Event Rules ---------------------------------------------------------------------------------
 # Rule 은 ArtifactRecord (와 선택적으로 Coverage 요약)만 입력으로 받는다. 파일·SQLite·이미지를 읽지 않는다.
 # 입력 ArtifactRecord 는 수정하지 않고 Event 를 새로 만든다 (Observation ≠ User Action).
-# 기준 문서: docs/EVENT_RULES.md
 
 REASON_RULE_VERIFIED = "RULE_VERIFIED"
 REASON_DIRECT_URL = "DIRECT_URL"

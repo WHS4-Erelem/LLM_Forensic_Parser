@@ -24,7 +24,7 @@ from ..models import Event, EvidenceItem
 from ..recovery.conversations import _CACHE_MESSAGE_TIME_SOURCE, _json_time
 
 
-# ---- 8.5 CHATGPT_CONVERSATION_CREATE_001 / 8.6 CHATGPT_CONVERSATION_ACCESS_001 ----------
+# ---- CHATGPT_CONVERSATION_CREATE_001 / CHATGPT_CONVERSATION_ACCESS_001 ---------------------------
 # 관찰 (REPORT bundle3, C: PRE/POST_CLEANUP History 사본): 새 대화 시작 시 /c/WEB:<클라이언트 임시 ID> 가 먼저 기록되고
 # 바로 다음 ChatGPT 방문이 /c/<서버 대화 ID> 이다 (+3.154초, +1.980초). 두 ID 는 서로 다른 값이고 from_visit=0.
 # 따라서 같은 ID 로는 연결할 수 없다 → 같은 History 안에서 WEB: 방문 바로 다음 ChatGPT host 방문이 /c/<id> 이면 연결.
@@ -129,7 +129,7 @@ def detect_conversation_access(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.10 Conversation Removed From List Rule -------------------------------
+# ---- Conversation Removed From List Rule ---------------------------------------------------------
 # 2026-09-17 D:\WHS_RETEST\E03-02_CONV_DELETE_RETEST (RUN_20260913_034139 + 루트 09-02 RUN) 에서 확인한 전이:
 #   conversation-history 의 연속된 물리 version 에서 sequence 가 더 큰 쪽에 기존 대화 ID 하나만 빠지고
 #   나머지 ID 집합은 그대로였다. 주 RUN 은 POST 수집본 하나 안에서 seq 137 (15건, 대상 포함, 03:42:25)
@@ -277,8 +277,8 @@ def detect_conversation_removed_from_list(
     return events
 
 
-# ---- 8.15 CHATGPT_CONVERSATION_RETRY_001 -------------------------------------
-# 근거: Cache 대화 응답 JSON (§7.4 Reader) 의 mapping 에서 같은 부모 아래 assistant 응답이 2개 이상이고
+# ---- CHATGPT_CONVERSATION_RETRY_001 --------------------------------------------------------------
+# 근거: Cache 대화 응답 JSON (Cache Reader) 의 mapping 에서 같은 부모 아래 assistant 응답이 2개 이상이고
 #   그 중 하나의 metadata.message_type 이 "variant" 인 구조. 새 Reader 를 만들지 않고 기존 Record 의
 #   observed["conversation"]["mapping"] 만 읽는다.
 # 2026-09-20 실제 사본 (C:\WHS_Analysis\PRE_CLEANUP · POST_CLEANUP 의 Cache, read-only) 에서 확인한 것:
@@ -416,7 +416,7 @@ def detect_conversation_retry(records: list[ArtifactRecord],
     return events
 
 
-# ---- 8.24 CHATGPT_CONVERSATION_DELETE_001 -----------------------------------
+# ---- CHATGPT_CONVERSATION_DELETE_001 -------------------------------------------------------------
 # CONVERSATION_REMOVED_FROM_LIST 와 같은 전이를 근거로 쓰지만 뜻이 다르다:
 #   CONVERSATION_REMOVED_FROM_LIST = 관찰된 사실 (목록에서 빠진 상태가 저장됨)
 #   CONVERSATION_DELETE            = 그 사실에 대한 사용자 행위 해석 (사용자가 대화를 지웠다)
