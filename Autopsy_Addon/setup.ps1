@@ -1,9 +1,9 @@
 ﻿# ARTINEX — Autopsy 애드온 설치 스크립트 (한 번 실행으로 실행 환경 준비 + 설치)
 #   1. 저장소 루트·파서 진입점 확인   2. 통합파서 전용 가상환경(integration\.venv312) 검사 → 없거나 의존성 부족이면 uv 준비 후
-#      integration\setup.ps1 로 환경 생성 → 재검사   3. Autopsy python_modules 폴더 찾기   4. ADS 를 쓸 수 있는 작업 위치 확인
+#      integration\setup.ps1 로 환경 생성 → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
 #   5. 모듈 복사 + artinex_config.json 갱신(기존 설정 보존)
 # 사용: powershell -ExecutionPolicy Bypass -File setup.ps1 [-PluginDir <Autopsy python_modules 폴더>]
-#   자동으로 정할 수 없는 경로(플러그인 폴더 후보 0개·여러 개, NTFS 작업 위치 없음)만 묻는다.
+#   자동으로 정할 수 없는 경로(플러그인 폴더 후보 0개·여러 개)만 묻는다.
 param([string]$PluginDir)
 $ErrorActionPreference = "Stop"
 $addon = $PSScriptRoot
@@ -83,8 +83,8 @@ if (-not $PluginDir) {
 if (-not (Test-Path $PluginDir)) { throw "plugin folder not found: $PluginDir" }
 Write-Host "[3/5] plugin folder: $PluginDir"
 
-# 4. 작업 위치: Zone.Identifier 를 실제 ADS 로 넘기려면 NTFS 여야 한다. 기존 설정 work_dir, 없으면 기본 위치(사건 폴더 = Autopsy 의
-#    사건 기본 폴더 아래)를 검사하고, ADS 를 못 쓰면 쓰기·ADS 가 되는 고정 NTFS 드라이브의 \artinex_work 를 고른다.
+# 4. 대체 작업 위치 준비: 작업 위치는 Ingest 때 실제 사건의 ModuleOutput\ARTINEX 를 먼저 시험해 정한다 (설치 때는 사건 경로를 모른다).
+#    여기서는 사건 폴더를 못 쓸 때의 대체 위치(기존 설정 work_dir, 없으면 C:\artinex_work)를 만들고 쓰기·ADS 를 시험만 한다 — 설정에 적지 않는다.
 $dest = Join-Path $PluginDir "ARTINEX"
 $cfgPath = Join-Path $dest "artinex_config.json"
 $oldCfg = Join-Path $PluginDir "ERELM_LLM_Parser\erelm_config.json"   # 이름 바꾸기 전(ERELM) 설치본의 설정 — 새 설정이 없으면 옮겨 온다
@@ -103,37 +103,9 @@ function Test-Ads($dir) {
         finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
     } catch { return $false }
 }
-function Get-Fs($dir) { try { ([IO.DriveInfo]::new([IO.Path]::GetPathRoot($dir))).DriveFormat } catch { "unknown" } }
-if ($cfg.work_dir) {
-    $ok = Test-Ads $cfg.work_dir
-    $where = "work_dir $($cfg.work_dir)"
-} else {
-    $base = [Environment]::GetFolderPath("MyDocuments")   # Autopsy 사건 기본 폴더 (마지막으로 쓴 값이 있으면 그것)
-    $props = Join-Path (Split-Path $PluginDir -Parent) "config\Case.properties"
-    if (Test-Path $props) {
-        $line = Select-String -Path $props -Pattern '^LBL_BaseCase_PATH=(.+)' | Select-Object -First 1
-        if ($line) { $base = $line.Matches[0].Groups[1].Value -replace '\\(.)', '$1' }
-    }
-    $fs = Get-Fs $base
-    $ok = $fs -eq "NTFS"
-    $where = "case folder default ($base, $fs)"
-}
-if ($ok) { Write-Host "[4/5] work location: $where - ADS ok" }
-else {
-    Write-Host "  $where cannot hold alternate data streams - looking for an NTFS location" -ForegroundColor Yellow
-    $work = $null
-    foreach ($d in ([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq "Fixed" -and $_.IsReady -and $_.DriveFormat -eq "NTFS" } |
-                    Sort-Object AvailableFreeSpace -Descending)) {
-        $c = Join-Path $d.RootDirectory.FullName "artinex_work"
-        if (Test-Ads $c) { $work = $c; break }
-    }
-    while (-not $work) {
-        $c = Read-Host "No writable NTFS work location found. Enter an NTFS folder for ARTINEX work files"
-        if ($c -and (Test-Ads $c)) { $work = $c } else { Write-Host "  $c : not writable or no ADS support" }
-    }
-    $cfg.work_dir = $work
-    Write-Host "[4/5] work location: $work (NTFS, set as work_dir)"
-}
+$fallback = if ($cfg.work_dir) { $cfg.work_dir } else { "C:\artinex_work" }
+if (Test-Ads $fallback) { Write-Host "[4/5] fallback work location: $fallback - writable, ADS ok" }
+else { Write-Host "[4/5] fallback work location: $fallback - not writable or no ADS (used only if the case folder also fails)" -ForegroundColor Yellow }
 
 # 5. 설치: 모듈 파일만 복사 (파서는 저장소에 그대로 두고 경로만 적는다). 이름 바꾸기 전 모듈(ERELM_*)은 같은 일을 하므로 지운다.
 New-Item -ItemType Directory -Force $dest | Out-Null
@@ -151,5 +123,5 @@ Write-Host ""
 Write-Host "  python      : $py"
 Write-Host "  plugin      : $dest"
 Write-Host "  config      : $cfgPath"
-Write-Host "  work folder : $(if ($cfg.work_dir) { $cfg.work_dir } else { '<case folder>\ModuleOutput\ARTINEX' })"
+Write-Host "  work folder : <case folder>\ModuleOutput\ARTINEX (fallback $fallback if it cannot hold files or ADS)"
 Write-Host "Restart Autopsy, then select 'ARTINEX' in the ingest module list."
