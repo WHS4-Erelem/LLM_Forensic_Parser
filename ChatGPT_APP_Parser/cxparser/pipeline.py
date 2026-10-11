@@ -183,7 +183,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
         except OSError as exc:            # 라이브 분석: 실행 중인 앱이 잠근 파일, 권한 없는 파일 — 그 파일만 건너뛴다
             errors.append({"path": vfile.path, "code": "READ_FAILED",
                            "message": "%s: %s" % (type(exc).__name__, exc)})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append({"path": vfile.path, "code": "UNEXPECTED",
                            "message": "%s: %s" % (type(exc).__name__, exc)})
 
@@ -197,7 +197,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
                    "partition_offset_bytes": vd["offset_bytes"]}
             try:
                 info, recs_usn = usn_mod.read_journal(fs, max_bytes=usn_max_bytes)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 msg = "%s: %s" % (type(exc).__name__, exc)
                 if "path not found" in str(exc) or isinstance(exc, FileNotFoundError):
                     # 이 볼륨에 저널이 없음 — 오류가 아니라 상태로 기록
@@ -246,7 +246,7 @@ def run(input_path, input_type="auto", kinds=DEFAULT_KINDS, max_excerpt=500,
     result = Result({
         "tool": {"name": "cxparser", "version": "0.3.31",
                  "target": "MS Store 패키지 OpenAI.Codex_2p2nqsd0c76g0 "
-                           "(분석표 기준 26.825.4187.0, ChatGPT 채팅 + Codex 작업 모드)"},
+                           "(앱 26.825.4187.0 기준, ChatGPT 채팅 + Codex 작업 모드)"},
         "input": image_desc,
         "filesystem": fs_desc,
         "scan": {

@@ -1,10 +1,8 @@
 """MS Store 패키지 폴더의 마지막 수정 시각 = 애플리케이션 설치 완료 (E02-01). 생성 시각(받기 시작)은 근거로 함께 적는다.
 
-조사(2026-09-28, 삭제 제외 raw 표본): Program Files\\WindowsApps\\OpenAI.Codex_26.917.6896.0_x64__2p2nqsd0c76g0 폴더 생성 03:54:19·수정 03:57:09,
-  Packages\\OpenAI.Codex_2p2nqsd0c76g0 (사용자 데이터 루트) 생성 03:57:13. 패키지 안 파일들의 시각은 빌드 시각(2026-03)이라 쓸 수 없고 폴더만 쓴다.
-  실험 시트의 '설치 04:34:26' 은 첫 실행 시각과 같아 실제 Store 설치 완료(03:57)와 37분 차이 — 시트가 설치 '확인' 시점을 적은 것으로 보임.
-조사(2026-10-06, image2 'LLM 내부정보 유출' E01): 폴더 생성 11:27:19, 수정 11:35:24, 시트 '다운로드 완료' 11:35:30 → 수정 시각이 설치 완료와 6초 차이.
-  팀 결정(2026-10-08): 설치 = 다운로드(패키지 쓰기) 완료 시각.
+Store 는 받기 시작할 때 패키지 폴더를 만들고 다 받으면 폴더 수정 시각이 갱신된다. 패키지 안 파일들의 시각은 빌드 시각이라 쓸 수 없고 폴더만 쓴다.
+사용자 데이터 루트(Packages 아래 사용자 데이터 폴더)의 생성 시각은 첫 실행에 가까워 '최초 설치 시점 추정' 관찰로만 남긴다.
+설치 시각은 다운로드(패키지 쓰기)가 끝난 시각으로 본다.
 앱을 삭제한 이미지에서는 폴더가 없어 잡히지 않는다 (삭제는 USN 저널이 그 구간을 덮을 때만).
 """
 
@@ -42,7 +40,7 @@ def records_from_inventory(vfs, inventory, image_desc, rb):
             try:
                 f = fs.open(root)
                 meta = f.info.meta
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
             created, modified = _iso(meta.crtime), _iso(meta.mtime)
             found.append((kind, root, created, modified,
@@ -65,8 +63,7 @@ def records_from_inventory(vfs, inventory, image_desc, rb):
     for kind, root, created, modified, loc in found:
         name = root.rsplit("/", 1)[-1]
         if kind == "package":
-            # 설치 시각 = 폴더의 마지막 수정 시각(파일을 다 써서 설치가 끝난 때). 생성 시각은 Store 가 받기 시작한 때라
-            # 네트워크에 따라 몇 분 앞선다 (image2: 생성 11:27:19, 수정 11:35:24, 시트 '다운로드 완료' 11:35:30).
+            # 설치 시각 = 폴더의 마지막 수정 시각(파일을 다 써서 설치가 끝난 때). 생성 시각은 Store 가 받기 시작한 때라 몇 분 앞선다.
             # Store 패키지 폴더는 설치 뒤 내용이 바뀌지 않고 업데이트는 새 버전 폴더를 만들므로 수정 시각이 뒤로 밀리지 않는다.
             m = re.match(r"(?i)openai\.codex_(?P<ver>[\d.]+)_", name)
             out.append(model.Record(

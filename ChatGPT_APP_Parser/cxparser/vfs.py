@@ -91,7 +91,7 @@ class TskImageVfs:
         try:
             vs = pytsk3.Volume_Info(img)
             bs = vs.info.block_size
-            scheme = {int(pytsk3.TSK_VS_TYPE_DOS): "MBR", int(pytsk3.TSK_VS_TYPE_GPT): "GPT"}.get(int(vs.info.vstype), str(vs.info.vstype))   # GPT 는 0x10 (0.3.24 까지 8 로 적어 '16' 으로 나왔다)
+            scheme = {int(pytsk3.TSK_VS_TYPE_DOS): "MBR", int(pytsk3.TSK_VS_TYPE_GPT): "GPT"}.get(int(vs.info.vstype), str(vs.info.vstype))   # TSK 의 GPT 상수는 0x10
             parts = [(p.start * bs, p.len * bs, p.desc.decode("utf-8", "replace"), scheme)
                      for p in vs if int(p.flags) & int(pytsk3.TSK_VS_PART_FLAG_ALLOC)]
         except TSK_ERRORS:
@@ -124,9 +124,9 @@ class TskImageVfs:
             vd.update(filesystem="NTFS", cluster_size=fs.info.block_size)
             self.volumes.append((vd, fs))
 
-        # 잠긴 볼륨이 있어도 읽을 수 있는 볼륨에 Windows 시스템 볼륨(\Users)이 있으면 계속한다 — 평문 OS 볼륨 +
-        # 잠긴 데이터 볼륨 조합이 통째로 막히던 문제(0.3.29). 복구·예약 파티션 같은 평문 NTFS 만 읽히면
-        # "앱 미사용" 으로 잘못 결론 내리지 않도록 그때만 중단한다. 잠긴 볼륨은 pipeline 이 경고로 남긴다.
+        # 잠긴 볼륨이 있어도 읽을 수 있는 볼륨에 Windows 시스템 볼륨(\Users)이 있으면 계속한다 (평문 OS 볼륨 + 잠긴 데이터 볼륨).
+        # 복구·예약 파티션 같은 평문 NTFS 만 읽히면 "앱 미사용" 으로 잘못 결론 내리지 않도록 그때만 중단한다.
+        # 잠긴 볼륨은 pipeline 이 경고로 남긴다.
         if lock_abort(self.locked, [("unlock_method" in vd, _has_users(fs)) for vd, fs in self.volumes]):
             raise VolumeLockedError(self.locked[0]["reason"], volumes=self.locked)
         if not self.volumes:
@@ -137,7 +137,7 @@ class TskImageVfs:
         from . import mounted_devices      # 볼륨 → 드라이브 문자 (vd['drive']). 못 찾으면 출력은 종전대로 C: 가정
         try:
             self.drive_letters = mounted_devices.assign(img, parts[0][3], bs if parts[0][3] != "NONE" else 512, self.volumes)
-        except Exception as exc:  # noqa: BLE001 — 드라이브 문자 판정 실패는 분석을 멈출 이유가 아니다
+        except Exception as exc:  # 드라이브 문자 판정 실패는 분석을 멈출 이유가 아니다
             self.drive_letters = {"status": "드라이브 문자 판정 실패 (%s) — C: 로 가정" % str(exc)[:100]}
 
     def iter_files(self):
@@ -604,7 +604,7 @@ if __name__ == "__main__":  # python -m cxparser.vfs — 폴더 입력의 탐색
         d = DirectoryVfs(td); d.host_meta = {"/users/a/downloads/x": {"size": 1}}
         assert d.host_stat("C:" + win) == {"size": 1} and "drive" not in next(d.iter_files()).location()
     assert _registered_package_roots() is not None                                               # 레지스트리가 없어도 예외 없이 목록
-    locked = [{"offset_bytes": 1}]                                                               # 잠긴 볼륨이 있을 때 중단 여부 (0.3.29)
+    locked = [{"offset_bytes": 1}]                                                               # 잠긴 볼륨이 있을 때 중단 여부
     assert lock_abort(locked, [(False, True)]) is False                   # 평문 OS 볼륨(\Users 있음) + 잠긴 데이터 볼륨 → 계속
     assert lock_abort(locked, [(True, False)]) is False                   # BitLocker 를 푼 볼륨이 있음 → 계속
     assert lock_abort(locked, [(False, False)]) is True                   # 복구·예약 파티션만 읽힘 → 중단

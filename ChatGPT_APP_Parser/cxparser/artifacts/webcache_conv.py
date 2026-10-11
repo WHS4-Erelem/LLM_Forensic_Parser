@@ -1,22 +1,20 @@
 """채팅창 HTTP 캐시(Cache_Data) 안의 ChatGPT API 응답 → 채팅 모드 행위·대화 복원.
 
-~/.codex 는 Codex 에이전트 모드만 남기고, ChatGPT 채팅 모드의 대화는 채팅창(Chromium)의 HTTP 캐시에만 남는다 (8월 분석 보고서 계통 B).
-2026-09-23 S3 스냅샷(2026-08-29 실험)으로 확인한 지문 — 정답 시각과 대조:
-  conversation/<id> 응답 JSON  : create_time(대화 생성), mapping(메시지 트리: 시각·role·본문·첨부·model_slug), is_temporary_chat,
-                                 default_model_slug. 임시 채팅 [MRK_E1001] 03:31:36 → is_temporary_chat=True ✓
-  user 메시지 metadata.attachments : (name, mime_type) → 이미지/문서 업로드 02:29:41 png · 02:32:09 pdf ✓
-  tool 메시지 image_asset_pointer + metadata.image_gen_title : 이미지 생성 03:35:34 (정답 03:35:30~03:36:30) ✓
-  mapping 분기 : 같은 부모 아래 user 2개 = 대화 수정(02:26:47 ✓) / 같은 user 아래 assistant 2개 = 대화 재시도(02:27:07 ✓)
-  default_model_slug 변화 (auto → gpt-5-6, 03:29:17 이후 대화) : 모델 변경 (정답 03:28~03:30) ✓
-  estuary/content?…&fn=<파일명> : 파일을 이름 붙여 내려받은 요청 03:40:53 → 생성 이미지 다운로드 (정답 03:40~03:41) ✓
+~/.codex 는 Codex 에이전트 모드만 남기고, ChatGPT 채팅 모드의 대화는 채팅창(Chromium)의 HTTP 캐시에만 남는다.
+  conversation/<id> 응답 JSON  : create_time(대화 생성), mapping(메시지 트리: 시각·role·본문·첨부·model_slug),
+                                 is_temporary_chat(임시 채팅), default_model_slug
+  user 메시지 metadata.attachments : (name, mime_type) → 이미지/문서 업로드
+  tool 메시지 image_asset_pointer + metadata.image_gen_title : 이미지 생성
+  mapping 분기 : 같은 부모 아래 user 2개 = 대화 수정 / 같은 user 아래 assistant 2개 = 대화 재시도
+  default_model_slug 변화 : 모델 변경(추정)
+  estuary/content?…&fn=<파일명> : 파일을 이름 붙여 내려받은 요청 → 다운로드
   files/download/<id>?conversation_id= 는 표시용 fetch(JSON) 라 관찰로만.
 계정 이름 변경·공유 링크는 캐시에 흔적 없음 (POST 는 캐시되지 않음).
 
-2026-10-04 앱 26.928 (WHS_project_FINAL.E01, 실험 2026-10-02) — 대화 응답의 주소와 형식이 바뀌었다:
+앱 26.928 부터 대화 응답의 주소와 형식이 바뀌었다:
   conversations/<id>?num_turns=10&include_has_versions=true  (복수형 + 쿼리)
   본문은 mapping(트리) 대신 messages(목록). 메시지 필드(author·create_time·content.parts·metadata.attachments)는 같고,
   부모는 metadata.parent_id (user 메시지는 없음). page_info.has_previous_page=true 면 앞쪽 turn 이 응답에 없다.
-  정답 대조: 대화 생성 11:44:21 (정답 11:43:26), 첨부 2개 프롬프트 11:44:28 (11:44:38), 프롬프트 11:45:09 (11:45:20) · 11:46:36 (11:46:56) ✓
   대화 목록 응답(conversations?offset=…)과 ~/.codex/sqlite/codex-dev.db 의 local_thread_catalog 는 서버 계정의 대화 목록이라
   다른 기기에서 만든 대화도 들어 있다 → 이 PC 의 행위 근거로 쓰지 않는다.
 """
@@ -215,7 +213,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, siblings=None):
     try:
         cache = BlockfileCache(read)
         entries, unreadable, carved = cache.entries(vfile.read())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return [model.Record(rb.next_id(), "NA-00", events.name("NA-00"), model.timestamp(null_reason="캐시 index 해석 실패"),
                              model.user_action(observed="채팅창 HTTP 캐시 index 존재, 해석 실패"), model.evidence(image_desc, vfile, locator="index"),
                              status="error", errors=[{"code": "CACHE_INDEX_FAILED", "message": str(exc)}], details={"artifact": "webcache"})]

@@ -3,7 +3,7 @@
 
     python llm_forensic.py -i <이미지.E01|.dd> -o <출력폴더> [--only a,b] [--registry parsers.json]
 
-층 구성 (팀 설계도 순서):
+구성:
   1. Evidence Manager   입력 확인 · evidence_id · E01/DD 구분 · 세그먼트 결번 검사
   2. Parser Runner      parsers.json 레지스트리대로 파서 6개를 subprocess 실행 (각자 venv). 파서 stdout/stderr 는 run.log 에만
   3. Normalizer         원본 헤더 계약 검사 → canonical(snake_case) 열의 공통 Event/Message 형식 (+ artifact_path_normalized, volume_ref)
@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 파서 CSV 원본 헤더 = 팀 계약. 바이트 단위로 같아야 받는다 (끝 공백 포함, 틀려도 고쳐 받지 않는다)
+# 파서 CSV 원본 헤더 = 공통 CSV 형식. 바이트 단위로 같아야 받는다 (끝 공백 포함, 틀려도 고쳐 받지 않는다)
 TIMELINE_COLUMNS = ["Model", "Timestamp", "User_behavior", "Behavior_details ", "Verdict",
                     "Artifact_path", "Artifact_details "]
 CONV_COLUMNS = ["Model", "timestamp", "conversation_uuid", "conversation_title", "message_uuid",
@@ -43,7 +43,7 @@ def canonical_header(name):
 # 계약 검사를 통과한 뒤에만 쓰는 canonical 열 이름. 파서가 쓴 CSV 파일 자체는 다시 쓰지 않는다
 TIMELINE_FIELDS = [canonical_header(c) for c in TIMELINE_COLUMNS]
 CONV_FIELDS = [canonical_header(c) for c in CONV_COLUMNS]
-# provenance 열 (병합 CSV 와 DB 에 팀 7/10열 뒤에 붙는다). 원본 값은 절대 덮어쓰지 않는다:
+# provenance 열 (병합 CSV 와 DB 에 원본 7/10열 뒤에 붙는다). 원본 값은 절대 덮어쓰지 않는다:
 #   timestamp = timestamp_raw (파서 표기 그대로), timestamp_utc = 정규화 (DB) / artifact_path = raw, artifact_path_normalized = 정규화
 EXTRA_COLUMNS = ["source_parser", "parser_version", "source_file", "parse_time_utc",
                  "artifact_path_normalized", "volume_ref", "evidence_id", "evidence_sha256"]
@@ -52,7 +52,7 @@ USER_BEHAVIORS_FILE = os.path.join(HERE, "user_behaviors.txt")
 
 
 def load_user_behaviors(path=USER_BEHAVIORS_FILE):
-    """팀 행위 분류 체계 (한 줄에 하나, # 주석). 파일이 없으면 None → 검사 안 함."""
+    """행위 분류 목록 (한 줄에 하나, # 주석). 파일이 없으면 None → 검사 안 함."""
     if not os.path.isfile(path):
         return None
     with open(path, encoding="utf-8") as fh:
@@ -85,7 +85,7 @@ ERROR_STATUS = {
     "OUTPUT_WRITE_ERROR": "output_error",            # 병합 CSV·보고서 쓰기 실패 (다른 프로그램이 파일을 연 경우 등)
     "UNKNOWN_USER_BEHAVIOR": "warning",              # user_behaviors.txt 에 없는 행위명. 경고만 하고 적재는 한다 (파서 담당자가 이름을 맞춘다)
 }
-# ponytail: 경고는 상태에 영향 없음. 파서들이 이름을 다 맞추면 "warning" → "contract_violation" 으로 바꿔 승격한다
+# 경고는 상태에 영향 없음. 파서들이 이름을 다 맞추면 "warning" → "contract_violation" 으로 바꿔 승격한다
 _STATUS_ORDER = ["failed", "contract_violation", "normalization_error", "db_error", "output_error"]
 REPORT_ERROR_LIMIT = 100                             # 보고서에는 파서당 앞 100건만 (전체는 DB runs.violations)
 
@@ -455,7 +455,7 @@ def normalize(run, evidence):
             if len(errors) > before:
                 continue
             if kind == "timeline" and USER_BEHAVIORS is not None and r["user_behavior"] not in USER_BEHAVIORS:
-                warnings.append(make_error(parser, "UNKNOWN_USER_BEHAVIOR", "팀 행위 분류 체계에 없는 행위명 (적재는 함)", file=name, row=i,
+                warnings.append(make_error(parser, "UNKNOWN_USER_BEHAVIOR", "행위 분류 목록에 없는 행위명 (적재는 함)", file=name, row=i,
                                            field="user_behavior", actual=r["user_behavior"], expected=os.path.basename(USER_BEHAVIORS_FILE)))
             raw = dict(zip(columns, values))           # row_hash 는 파서 원본 헤더·값 기준 (이전 버전과 같은 값)
             row_hash = hashlib.sha256(json.dumps(raw, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
@@ -599,7 +599,7 @@ def write_merged(db, evidence_id, out_dir):
     for name, table, fields, columns in (("timeline.csv", "events", TIMELINE_FIELDS, TIMELINE_COLUMNS),
                                          ("recovered_conversations.csv", "messages", CONV_FIELDS, CONV_COLUMNS)):
         out_cols = fields + EXTRA_COLUMNS
-        header = columns + EXTRA_COLUMNS                 # 사람이 보는 병합 CSV 는 팀 계약 헤더 그대로 (DB 안에서만 snake_case)
+        header = columns + EXTRA_COLUMNS                 # 사람이 보는 병합 CSV 는 원본 헤더 그대로 (DB 안에서만 snake_case)
         rows = db.execute("select %s from %s where evidence_id=? order by (timestamp_utc is null), timestamp_utc, source_parser"
                           % (", ".join(map(_q, out_cols)), table), (evidence_id,)).fetchall()
         path = os.path.join(out_dir, name)
@@ -1084,7 +1084,7 @@ def _self_test_end_to_end(td, image, evidence_id):
                               "normalization_error": 0, "db_error": 0} and rep["exit_code"] == 1
     with open(os.path.join(case, "timeline.csv"), encoding="utf-8-sig", newline="") as fh:
         rows = list(csv.reader(fh))
-    assert rows[0] == TIMELINE_COLUMNS + EXTRA_COLUMNS                      # 병합 CSV 헤더는 팀 계약 그대로
+    assert rows[0] == TIMELINE_COLUMNS + EXTRA_COLUMNS                      # 병합 CSV 헤더는 원본 헤더 그대로
     tl = [dict(zip([canonical_header(h) for h in rows[0]], r)) for r in rows[1:]]
     assert {r["artifact_path_normalized"] for r in tl} == {r"users\a\downloads\x.pdf | users\a\downloads\x.pdf:Zone.Identifier",
                                                           r"users\a\y.txt | users\a\z"}

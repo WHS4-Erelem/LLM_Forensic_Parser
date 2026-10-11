@@ -1,6 +1,6 @@
 """~/.codex/*.sqlite 파서 (state_5 / thread_history_1 / logs_2).
 
-실제 표본에서 확인한 구조 (앱 0.150.0-alpha ~ 0.154.0-alpha 공통):
+테이블 구조:
   state_5.sqlite        threads(id, rollout_path, created_at[_ms], updated_at[_ms], title,
                                 first_user_message, preview, model, cwd, originator, archived, archived_at)
   thread_history_1.sqlite thread_items(thread_id, turn_id, item_id, created_at_ms, item_type, item_json)
@@ -30,7 +30,7 @@ HANDLED = ("state_5.sqlite", "thread_history_1.sqlite", "logs_2.sqlite")
 # logs_2 에서 행위 근거로 뽑는 패턴 (본문 일부 일치)
 LOG_LOGOUT = 'rpc.method="account/logout"'
 LOG_AUTH_CHANGED = "Reloaded auth, changed: true"
-AUTO_RESTART_SEC = 10   # ponytail: 표본 2개(자동 재시작 1초 / 사용자 재실행 24초 이상)에서 잡은 값. 표본이 늘면 조정
+AUTO_RESTART_SEC = 10   # 표본: 자동 재시작은 1초 뒤, 사용자 재실행은 24초 이상 뒤
 # 같은 요청이 여러 줄로 로깅되므로 요청 ID 로 묶는다
 _RPC_ID_RE = re.compile(r'rpc\.request_id=\w*\("?([^")]+)"?\)')
 
@@ -85,7 +85,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, siblings=None):
     try:
         try:
             conn = _open(vfile, siblings, tmpdir)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return [_err(rb, vfile, image_desc, "SQLITE_OPEN_FAILED", exc,
                          "%s 열기 실패" % name)]
         try:
@@ -147,7 +147,7 @@ def _state(conn, vfile, image_desc, rb, max_excerpt):
             "updated_at_ms": row["updated_at_ms"] if "updated_at_ms" in cols else None,
         }
         # 대화 수정(분기) 시 threads 행의 rollout_path 가 <원본ID>_<분기ID> 파일로 바뀌고
-        # created_at 도 분기 시각이 된다 (평서문 E01 표본에서 확인) → E03-03 으로 귀속
+        # created_at 도 분기 시각이 된다 → E03-03 으로 귀속
         fmeta = parse_rollout_filename(os.path.basename(str(details["rollout_path"] or "").replace("\\", "/")))
         branch = bool(fmeta and fmeta["is_branch"])
         details["branch_id"] = fmeta["branch_id"] if fmeta else None
@@ -160,9 +160,9 @@ def _state(conn, vfile, image_desc, rb, max_excerpt):
                 action="대화 수정(프롬프트 편집)" if branch else "새 대화 생성",
                 confidence=model.CONF_CONFIRMED,
                 rationale=("state_5.sqlite threads 행의 rollout_path 가 분기 파일(<원본ID>_<분기ID>) — "
-                           "대화 수정 시 행이 분기 시각·경로로 갱신됨 (분석표 E03-03)" if branch else
+                           "대화 수정 시 행이 분기 시각·경로로 갱신됨 (규칙 E03-03)" if branch else
                            "state_5.sqlite threads 행 — 대화 생성 시각·제목·첫 프롬프트가 "
-                           "행에 함께 기록됨 (분석표 E03-01)")),
+                           "행에 함께 기록됨 (규칙 E03-01)")),
             _db_evidence(image_desc, vfile, "threads", tid, sha),
             status="ok", details=details))
         if details["archived"]:
@@ -222,7 +222,7 @@ def _history(conn, vfile, image_desc, rb, max_excerpt):
                 action="프롬프트 전송",
                 confidence=model.CONF_CONFIRMED,
                 rationale=("thread_history_1.sqlite thread_items.item_type=userMessage — "
-                           "행에 전송 시각이 함께 기록됨 (분석표 E04-01)"))
+                           "행에 전송 시각이 함께 기록됨 (규칙 E04-01)"))
         elif itype == "agentMessage":
             event_id, action = "NA-00", model.user_action(
                 rationale="assistant 응답 기록 — 사용자 행위 아님",
@@ -282,7 +282,7 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
                     action="로그아웃",
                     confidence=model.CONF_CONFIRMED,
                     rationale=("앱 로그에 account/logout 요청 처리 기록 — 로그아웃 동작 자체의 "
-                               "흔적 (분석표 E01-02). auth.json 부재와 별개 근거"))
+                               "흔적 (규칙 E01-02). auth.json 부재와 별개 근거"))
             else:
                 key, event_id = ("auth", row["ts"]), "NA-00"
                 action = model.user_action(
@@ -325,8 +325,8 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
         details={"artifact": "codex_sqlite", "db": "logs_2.sqlite", "table": "logs",
                  "row_count": n, "first_ts_utc": lo_iso, "last_ts_utc": hi_iso}))
     # --- 프로세스 구간 → 실행(E08-01)·종료(E08-02) ----------------------------------------------
-    # 조사(2026-09-23): process_uuid 는 앱 프로세스마다 새로 붙는다. 평서문 표본 세 구간의 시작이 Prefetch 실행 시각·
-    # 재실행과 초 단위로 일치했고, 강제 종료 4초 전에 마지막 줄이 찍혔다. 앱은 종료 로그를 남기지 않아 정상/강제는 구분 못 한다.
+    # process_uuid 는 앱 프로세스마다 새로 붙고, 구간 시작은 Prefetch 실행 시각과 초 단위로 일치한다.
+    # 앱은 종료 로그를 남기지 않아 정상/강제 종료는 구분 못 한다.
     if "process_uuid" in cols:
         prev_hi = None
         for row in conn.execute("select process_uuid, min(ts) lo, max(ts) hi, count(*) n from logs "
@@ -336,7 +336,7 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
             pid = row["process_uuid"] or "-"
             lo_iso, hi_iso = parse_any_time(row["lo"])[0], parse_any_time(row["hi"])[0]
             # 사용자 실행 vs 자동 재시작: 직전 프로세스가 끝난 지 AUTO_RESTART_SEC 안에 새 프로세스가 뜨면 앱이 스스로 재실행한 것
-            # (표본: 샌드박스 설정 후 1초 뒤 재시작). 팀 합의(2026-09-23): 사용자가 아이콘을 눌러 켠 횟수 = 확정 행, 자동 재시작 = 의심 행.
+            # 사용자가 직접 켠 실행 = 확정 행, 자동 재시작 = 의심 행.
             gap = (row["lo"] - prev_hi) if prev_hi is not None else None
             auto = gap is not None and 0 <= gap <= AUTO_RESTART_SEC
             prev_hi = row["hi"]
@@ -362,7 +362,7 @@ def _logs(conn, vfile, image_desc, rb, max_excerpt):
                                 source=model.TS_SOURCE_CONTENT),
                 model.user_action(action="애플리케이션 종료(프로세스 로그 끝)", confidence=model.CONF_INFERRED,
                                   rationale=("같은 process_uuid 의 마지막 기록 — 이후 기록이 없으니 프로세스가 끝난 것. 앱이 종료 로그를 "
-                                             "남기지 않아 정상 종료와 강제 종료를 구분하지 못함 (팀 규칙: 강제 종료 근거 없으면 정상 종료·의심). "
+                                             "남기지 않아 정상 종료와 강제 종료를 구분하지 못함 (강제 종료 근거가 없으면 정상 종료·의심). "
                                              "강제 종료 표본에서는 마지막 줄이 종료 4초 전이었다")),
                 _db_evidence(image_desc, vfile, "logs", "process_uuid=%s last" % pid, sha), status="ok",
                 notes=["정상/강제 종료 구분 불가 — 창 닫기(트레이 상주)는 프로세스 종료가 아니라 여기 잡히지 않음"], details=det))

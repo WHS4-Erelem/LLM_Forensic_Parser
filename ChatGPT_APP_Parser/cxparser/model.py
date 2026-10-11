@@ -1,6 +1,6 @@
 """정규화 레코드 모델.
 
-프로젝트 필수 3항목:
+필수 3항목:
   1) timestamp  — 근거에서 확인한 시각 (원본값·의미 보존)
   2) user_action — 증거가 뒷받침하는 사용자 행위 (특정 불가 시 '미확정')
   3) evidence   — 재확인 가능한 원본 위치 (이미지 식별자, 내부 경로, 행번호/DB키/MFT#)
@@ -71,7 +71,7 @@ class Record(dict):
         self["schema_version"] = SCHEMA_VERSION
         self["record_id"] = record_id
         self["event"] = {"event_id": event_id, "event_name": event_name,
-                         "catalog": "WHS4 에레렘 아티팩트 분석표 (은정2, 2026-08-29 수집)"}
+                         "catalog": "ERELM 행위 분류 체계"}
         self["timestamp"] = ts
         self["user_action"] = action
         self["evidence"] = ev

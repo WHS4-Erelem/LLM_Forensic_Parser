@@ -1,10 +1,10 @@
 """~/.codex/auth.json 파서 — 토큰 값은 절대 출력하지 않는다.
 
-분석표 근거:
+근거:
   E01-01 로그인   : auth.json 최초 생성 (JWT id/access/refresh + 계정 UUID 평문)
   E01-02 로그아웃 : auth.json FILE_DELETE (명시적 로그아웃에서만 삭제)
   E01-03 계정전환 : auth.json 재생성 (새 account_id)
-주의: 파일의 존재/부재만으로 로그인·로그아웃을 확정하지 않는다(분석표 원칙).
+파일의 존재/부재만으로 로그인·로그아웃을 확정하지 않는다.
 """
 
 import json
@@ -18,7 +18,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     records = []
     try:
         data = json.loads(vfile.read().decode("utf-8", "replace"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         records.append(model.Record(
             rb.next_id(), "E01-01", events.name("E01-01"),
             model.timestamp(null_reason="auth.json 파싱 실패"),
@@ -59,7 +59,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
             action=model.ACTION_UNKNOWN,
             confidence=model.CONF_UNKNOWN,
             rationale=("auth.json 의 존재만으로 로그인 행위·시각을 확정하지 않음 "
-                       "(분석표: 앱 삭제 후에도 잔존, 재로그인 시 토큰만 갱신). "
+                       "(앱 삭제 후에도 잔존, 재로그인 시 토큰만 갱신). "
                        "로그인 시각 확정에는 MFT 생성시각·$UsnJrnl 대조 필요"),
             observed="계정 UUID %s, 토큰 필드 %s"
                      % (account_ids or "미확인", sorted(token_presence) or "미확인")),

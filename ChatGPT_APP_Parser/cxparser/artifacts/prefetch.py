@@ -1,6 +1,5 @@
 """C:\\Windows\\Prefetch\\CODEX.EXE-<해시>.pf — 윈도가 직접 남기는 실행 기록 (E08-01 애플리케이션 실행).
 
-조사(2026-09-23, 평서문 표본): CODEX.EXE-5FD576D9.pf 의 실행 시각 13:16:47 이 앱 로그의 두 번째 프로세스 시작(13:16:47)과 같은 초.
 Win10/11 의 .pf 는 MAM 압축(XPRESS Huffman) — 해제는 Windows 의 ntdll.RtlDecompressBufferEx 로만 한다.
 다른 OS 에서 돌리면 압축을 풀 수 없어 관찰 레코드만 남긴다 (실행 횟수·시각은 모름).
 포맷 v30/v31: 실행 시각 8개 = 오프셋 0x80 부터 FILETIME 8개, 실행 횟수 = 0xC8. v26: 0x80/0x98. v23(Win7): 시각 1개 0x80, 횟수 0x98.

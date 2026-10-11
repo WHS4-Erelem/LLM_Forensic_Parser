@@ -1,9 +1,8 @@
 """채팅창(Chromium web pane) HTTP 캐시 — Chrome Blockfile Cache 저수준 Reader.
 
 경로: %LOCALAPPDATA%\\Packages\\OpenAI.Codex_…\\LocalCache\\Roaming\\Codex\\web\\Codex\\Default\\Cache\\Cache_Data\\
-      (index + data_0~3 + f_XXXXXX). 앱을 삭제하면 패키지째 사라진다 (8월 분석 보고서 계통 B).
-읽는 방식은 팀 ChatGPT Web 파서(chatgpt_parser/artifacts/cache.py, 2026-09-15 검증)의 Blockfile Reader 를 옮겨 온 것이다.
-그쪽은 Source 객체·Record 모델에 묶여 있어 여기서는 "파일 이름 → bytes" 함수 하나만 받는 형태로 줄였다.
+      (index + data_0~3 + f_XXXXXX). 앱을 삭제하면 패키지째 사라진다.
+Blockfile 읽기는 ChatGPT Web 파서(chatgpt_parser/artifacts/cache.py)에서 옮겨 와 "파일 이름 → bytes" 함수 하나만 받는 형태로 줄였다.
   index: header 368 B 뒤 table_len 개의 CacheAddr → EntryStore.next 체인
   CacheAddr: bit31 사용 중, bit28-30 file type (0 external f_, 1 36 B, 2 256 B, 3 1 KB, 4 4 KB, 6 104 B, 7 48 B),
              bit24-25 block 수-1, bit16-23 data_N, bit0-15 시작 block
@@ -19,15 +18,15 @@ from datetime import datetime, timedelta, timezone
 
 try:
     import brotli
-except ImportError:  # pragma: no cover
+except ImportError:
     brotli = None
 try:
     from compression import zstd as _zstd          # Python 3.14+
     _zstd_decompress = _zstd.decompress
-except ImportError:  # pragma: no cover
+except ImportError:
     try:
         import zstandard
-        _zstd_decompress = lambda b: zstandard.ZstdDecompressor().decompressobj().decompress(b)  # noqa: E731
+        _zstd_decompress = lambda b: zstandard.ZstdDecompressor().decompressobj().decompress(b)
     except ImportError:
         _zstd_decompress = None
 
@@ -144,7 +143,7 @@ class BlockfileCache:
                 continue
             try:
                 blob = self.file(name)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 continue
             if blob[:4] != struct.pack("<I", BLOCK_MAGIC):
                 continue
@@ -208,7 +207,7 @@ class BlockfileCache:
                 out["decoded"] = _zstd_decompress(body)
             else:
                 out["warnings"].append("ENCODING_NOT_AVAILABLE:%s" % enc)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             out["warnings"].append("DECOMPRESS_FAILED:%s:%s" % (enc, type(exc).__name__))
         return out
 

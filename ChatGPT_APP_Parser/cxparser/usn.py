@@ -1,7 +1,7 @@
 """$Extend/$UsnJrnl:$J (USN 변경 저널) 파서 — Codex 아티팩트 이름에 한정.
 
 파일 자체가 남지 않는 행위(삭제·이름변경)의 **시각**을 잡기 위한 보조 근거다.
-분석표 근거: "로그아웃 지문 = ~/.codex\\auth.json FILE_DELETE", "강제 종료 구간 USN 0건".
+예: 로그아웃 = auth.json FILE_DELETE, 강제 종료 구간 = USN 0건.
 
 한계(반드시 결과에 남긴다):
   - USN 레코드에는 경로가 없다. 파일 이름 + 부모 파일참조번호(MFT#)만 있으므로,
@@ -227,11 +227,11 @@ def _key_record(r, reason, count, last_utc, image_desc, rb, journal_location):
     candidate = None
     if name.lower() == "auth.json" and "FILE_DELETE" == reason:
         event_id, action, conf = "E01-02", "로그아웃(auth.json 삭제)", model.CONF_INFERRED
-        why = ("USN 저널에 auth.json FILE_DELETE — 분석표의 로그아웃 지문. "
+        why = ("USN 저널에 auth.json FILE_DELETE — 로그아웃 지문. "
                "다만 USN 에는 경로가 없어 동명 파일 가능성은 배제 불가")
     elif name.lower().startswith("rollout-") and "FILE_CREATE" == reason:
         event_id, action, conf = "E03-01", "새 대화 생성(rollout 파일 생성)", model.CONF_INFERRED
-        why = "USN 저널에 rollout JSONL FILE_CREATE — 분석표 E03-01 의 파일 생성 흔적"
+        why = "USN 저널에 rollout JSONL FILE_CREATE — 규칙 E03-01 의 파일 생성 흔적"
     elif name.lower().startswith("rollout-") and "FILE_DELETE" == reason:
         event_id, action, conf = "E03-02", "대화 파일 삭제", model.CONF_INFERRED
         why = "USN 저널에 rollout JSONL FILE_DELETE — 로컬 대화 파일이 지워진 흔적"

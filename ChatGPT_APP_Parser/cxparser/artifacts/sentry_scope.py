@@ -12,7 +12,6 @@
                                      앱 시작 직후에도 올 수 있어 추정.
   NA-00                            : breadcrumb 보존 구간·요청 요약 (분석자가 "이 파일이 덮는 시간" 을 알게).
 
-검증(2026-10-11, 해킹 가상 시나리오 E01): 정답지 전송 00:19:03·00:20:37 ↔ 전송 요청 00:19:02·00:20:35.
 """
 
 import json
@@ -22,7 +21,7 @@ from datetime import datetime, timezone
 from .. import events, model
 
 ARTIFACT = "sentry_scope"
-PAIR_WINDOW_SEC = 10        # ponytail: 표본에서 검사→전송 1~2초. 재시도까지 봐도 10초면 충분, 표본 늘면 조정
+PAIR_WINDOW_SEC = 10        # 표본에서 검사→전송은 1~2초. 재시도까지 봐도 10초면 충분
 _SEND_CHECK = re.compile(r"^/backend-api/sentinel/chat-requirements(?:/prepare)?/?$")   # 전송 직전 검사 (…/prepare 가 먼저 옴)
 _SEND = re.compile(r"^/backend-api/(?:f/)?conversation/?$")                              # 전송 요청. …/conversation/prepare 는 준비 단계라 제외
 _NEW_CONV = re.compile(r"^/backend-api/conversation/init/?$")
@@ -82,7 +81,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     try:
         data = json.loads(vfile.read().decode("utf-8", "replace"))
         bc = (data.get("scope") or {}).get("breadcrumbs") or []
-    except Exception as exc:  # noqa: BLE001   잘린 파일(쓰다 만 JSON)도 흔하다 — 오류 기록만 남기고 끝
+    except Exception as exc:  # 쓰다 만 JSON 도 흔하다 — 오류 기록만 남기고 끝
         records.append(model.Record(
             rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(null_reason="scope_v3.json 파싱 실패"),
@@ -102,7 +101,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     send_times = [(s or c)[1] for c, s in pairs]
     inits = [e for e in http if e[2] == "POST" and _NEW_CONV.match(e[4])]
     for n, ev in enumerate(inits):
-        # init 은 새 대화 창을 열 때만이 아니라 파일 내려받기·앱 종료 때도 온다(기업유출 이미지: 4건 모두 새 대화 아님).
+        # init 은 새 대화 창을 열 때만이 아니라 파일 내려받기·앱 종료 때도 온다.
         # 다음 init 전에 실제 전송이 이어진 것만 새 대화 생성으로 보고, 나머지는 관찰로만 남긴다.
         nxt = inits[n + 1][1] if n + 1 < len(inits) else "9"
         followed = any(ev[1] < t < nxt for t in send_times)

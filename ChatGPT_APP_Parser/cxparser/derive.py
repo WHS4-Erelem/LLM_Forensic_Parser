@@ -1,4 +1,4 @@
-"""파생 규칙 — 이미 파싱된 레코드들을 서로 대조해 행위를 올린다 (2026-09-23, 1단계).
+"""파생 규칙 — 이미 파싱된 레코드들을 서로 대조해 행위를 올린다.
 
 관찰(NA-00)로만 남던 근거가 맞물리면 새 레코드를 덧붙인다. 원본 레코드는 건드리지 않는다.
   E01-01 로그인    : 앱 로그 'Reloaded auth, changed: true' + USN auth.json FILE_CREATE 가 ±120s 안 → 확인.
@@ -20,7 +20,7 @@ LOGIN_WINDOW_SEC = 120
 AUTH_CHANGED = "Reloaded auth, changed: true"
 _IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic", ".tif", ".tiff", ".svg"}
 _FILES_HEADER = "# Files mentioned by the user"
-# '## <파일명>: <경로>' 줄만. 경로는 'C:/…' 'C:\…' '/…' 어느 표기든 (표본: C:/Users/에레렘/Downloads/x.png). 경로 없는 '## My request:' 는 제목 줄이라 제외
+# '## <파일명>: <경로>' 줄만. 경로는 'C:/…' 'C:\…' '/…' 어느 표기든 (예: C:/Users/<user>/Downloads/x.png). 경로 없는 '## My request:' 는 제목 줄이라 제외
 _FILE_LINE_RE = re.compile(r"^##\s+(?P<name>[^\r\n:]+?)\s*:\s*(?P<path>[A-Za-z]:[\\/][^\r\n]*|/[^\r\n]*)\s*$", re.M)
 
 
@@ -60,7 +60,7 @@ def _login(records, rb):
             gap = _secs(_utc(lg)) - _secs(_utc(u))
             act = model.user_action(action="로그인", confidence=model.CONF_CONFIRMED,
                                     rationale=("앱 로그 '%s' 와 USN auth.json FILE_CREATE 가 %.0f초 차이로 맞물림 — "
-                                               "인증 파일이 새로 만들어지고 앱이 인증 상태 변경을 인식한 시각 (분석표 E01-01)") % (AUTH_CHANGED, gap))
+                                               "인증 파일이 새로 만들어지고 앱이 인증 상태 변경을 인식한 시각 (규칙 E01-01)") % (AUTH_CHANGED, gap))
             src, derived = lg, [lg["record_id"], u["record_id"]]
         else:
             act = model.user_action(action="로그인(인증 상태 변경 로그)", confidence=model.CONF_INFERRED,
@@ -132,7 +132,7 @@ def _uploads(records, rb):
         out.append(_new(rb, eid, src, ts,
                         model.user_action(action="첨부 파일 업로드 흔적", confidence=model.CONF_INFERRED,
                                           rationale=("프롬프트 본문의 '%s' 목록에 파일명이 있음 — 앱이 첨부 파일을 프롬프트에 "
-                                                     "적어 보낸 흔적 (분석표 E05). 파일 실물·해시는 확인하지 않음") % _FILES_HEADER),
+                                                     "적어 보낸 흔적 (규칙 E05). 파일 실물·해시는 확인하지 않음") % _FILES_HEADER),
                         {"artifact": _det(src).get("artifact"), "file_name": name, "file_path": path,
                          "derived_from": [src["record_id"]]}))
     return out
@@ -151,7 +151,7 @@ def _demote_saves_outside_sessions(records):
         if d.get("artifact") == "codex_sqlite" and d.get("session_first_utc") and d.get("session_last_utc") and r["event"]["event_id"] == "E08-01":
             spans.append((_secs(d["session_first_utc"]) - SESSION_MARGIN_SEC, _secs(d["session_last_utc"]) + SESSION_MARGIN_SEC))
     # Codex 가 다룬 파일명 모음: 프롬프트·응답·도구 호출 본문에 나온 이름만 Codex 의 저장으로 본다.
-    # (표본 2026-09-23: Claude Desktop 이 내려받은 PDF 가 Codex 실행 구간 안이라 오귀속됨 → 언급 검사 추가)
+    # (다른 앱이 내려받은 PDF 가 Codex 실행 구간 안에 있어 오귀속된 사례가 있어 언급 검사를 둔다)
     corpus = " ".join(str(v).lower() for r in records for v in (
         _det(r).get("text"), _det(r).get("prompt_text"), r["user_action"].get("observed_artifact"),
         (r.get("evidence") or {}).get("excerpt")) if v)

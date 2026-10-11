@@ -1,7 +1,6 @@
 """~/.codex/session_index.jsonl 파서 (대화 목록).
 
-분석표 근거: E03-01 에서 "session_index.jsonl 에 1행 추가",
-E03-02 에서 "대화 삭제 후에도 session_index.jsonl 4시각·크기 동일, rollout 잔존".
+새 대화(E03-01)마다 1행이 추가된다. 대화를 삭제(E03-02)해도 파일이 그대로라 삭제 근거로는 쓰지 못한다.
 행 스키마는 확정되지 않았으므로 관용적으로 추출하고 원문을 보존한다.
 """
 
@@ -27,7 +26,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     records = []
     try:
         raw = vfile.read()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         records.append(model.Record(
             rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(null_reason="파일 읽기 실패"),
@@ -74,7 +73,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
             model.user_action(
                 action="새 대화 생성(대화 목록 등재)",
                 confidence=model.CONF_INFERRED,
-                rationale=("session_index.jsonl 에 대화 1행 등재 — 분석표 E03-01. "
+                rationale=("session_index.jsonl 에 대화 1행 등재 — 규칙 E03-01. "
                            "단, 이 행의 존재만으로 삭제 여부는 판단하지 않음"),
                 observed=excerpt(mask_text(title), max_excerpt) if title else None),
             model.evidence(image_desc, vfile, locator="line=%d" % lineno,

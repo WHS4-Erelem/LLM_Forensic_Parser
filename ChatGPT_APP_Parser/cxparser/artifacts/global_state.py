@@ -1,8 +1,8 @@
 """~/.codex/.codex-global-state.json 파서.
 
-분석표에서 확인된 키:
+읽는 키:
   prompt-history.chatgpt-global                       -> E04-01 프롬프트 전송(평문 배열)
-    (실제 표본: "prompt-history": {"global": [...], "chatgpt-global": [...]} 중첩 dict.
+    ("prompt-history": {"global": [...], "chatgpt-global": [...]} 중첩 dict.
      점 표기 단일 키 형태도 함께 허용)
   chatgpt-last-selected-model-v1 {slug, versionId}    -> NA-00 관찰 (선택 모델 상태값. E09-01 은 rollout·웹 캐시의 변화로만)
   client-thread-bindings-v1.local-chatgpt:<UUID>      -> E07-02/03 공유 링크·대화 공유
@@ -22,7 +22,7 @@ K_PROMPT_HISTORY_PARENT = "prompt-history"
 K_LAST_MODEL = "chatgpt-last-selected-model-v1"
 K_THREAD_BINDINGS = "client-thread-bindings-v1"
 K_ONBOARDING_BY_ACCOUNT = "sidebar-onboarding-checklist-state-by-account-id-v2"
-# 실제 표본(S6a~c)에서 계정 UUID 를 dict 키로 쓰는 것이 관찰된 atom
+# 계정 UUID 를 dict 키로 쓰는 atom
 ACCOUNT_KEYED_ATOMS = (K_ONBOARDING_BY_ACCOUNT,
                        "electron:onboarding-conversational-completed-by-account-id",
                        "chatgpt-sidebar-state-v1", "sidebar-custom-sections-v3")
@@ -34,7 +34,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     try:
         raw = vfile.read()
         data = json.loads(raw.decode("utf-8", "replace"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         records.append(model.Record(
             rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(null_reason="파일 파싱 실패로 시각 확인 불가"),
@@ -72,7 +72,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                 model.user_action(
                     action="프롬프트 전송",
                     confidence=model.CONF_CONFIRMED,
-                    rationale=("전역 상태 파일의 %s 배열 — 분석표 E04-01 "
+                    rationale=("전역 상태 파일의 %s 배열 — 규칙 E04-01 "
                                "(입력 프롬프트 평문 누적)" % key_name)),
                 model.evidence(image_desc, vfile,
                                locator="json_pointer=%s/%d" % (ptr, i),
@@ -87,11 +87,9 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                          "prompt_text": mask_text(text) if text else None,
                          "raw_item_type": type(item).__name__}))
 
-    # --- 마지막 선택 모델 — 관찰(NA-00). E09-01 로 올리지 않는다 -----------------------------------
-    # 검증(2026-10-06, image2 'LLM 내부정보 유출' E01): 모델을 바꾸지 않은 시나리오에서도 이 키가 있어
-    # '모델 변경 의심(시각 없음)' 오탐이 났다. 이 키는 "지금 선택된 모델" 상태값이라 바꿨다는 근거가 못 된다.
-    # 모델 변경은 바뀐 지점이 보이는 아티팩트로만 판정한다: 에이전트 모드 rollout 의 turn_context.model 변화,
-    # 채팅 모드 웹 캐시의 default_model_slug 변화. 여기서는 선택 모델 slug 를 관찰로 남겨 그 판정의 보조 근거로 둔다.
+    # --- 마지막 선택 모델 — 관찰(NA-00). E09-01 로 올리지 않는다 ---
+    # "지금 선택된 모델" 상태값이라 바꿨다는 근거가 못 된다 (모델을 바꾸지 않은 이미지에도 있다). 모델 변경은
+    # rollout 의 turn_context.model 변화, 웹 캐시의 default_model_slug 변화처럼 바뀐 지점이 보이는 아티팩트로만 판정한다.
     for ptr, val in find_key(data, K_LAST_MODEL):
         slug = val.get("slug") if isinstance(val, dict) else val
         version = val.get("versionId") if isinstance(val, dict) else None
@@ -113,15 +111,14 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                      "model_slug": slug, "version_id": version}))
 
     # --- 스레드 바인딩 (공유 후보 관찰 — E07-02/03 로 단정하지 않음) --------
-    # 실제 표본 대조(WHS4_snap S1·S2): 공유 행위 이전 스냅샷에도 바인딩이 이미 7건 있었다.
-    # 즉 바인딩 존재는 스레드 생성·동기화 흔적이지 공유 지문이 아니다 -> NA-00 관찰로 남긴다.
+    # 공유 행위 이전 스냅샷에도 바인딩이 이미 있었다. 바인딩은 스레드 생성·동기화 흔적이지 공유 지문이 아니다 -> NA-00 관찰.
     for ptr, val in find_key(data, K_THREAD_BINDINGS):
         bindings = val if isinstance(val, dict) else {}
         for local_key, server_id in bindings.items():
             records.append(model.Record(
                 rb.next_id(), "NA-00", events.name("NA-00"),
                 model.timestamp(
-                    null_reason="바인딩 항목에 시각 없음 (분석표: 서버측 처리)"),
+                    null_reason="바인딩 항목에 시각 없음 (서버측 처리)"),
                 model.user_action(
                     action=model.ACTION_UNKNOWN,
                     confidence=model.CONF_UNKNOWN,
@@ -141,8 +138,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                          "server_thread_id": server_id}))
 
     # --- 계정 UUID 열거 (E01-01/03 보조) ------------------------------
-    # 실제 표본(S6c): 이전 계정 A 는 onboarding 키에, 현재 계정 B 는 chatgpt-sidebar-state-v1 에만
-    # 남아 있었다 -> 계정 UUID 를 키로 쓰는 atom 들을 모두 모아 출처와 함께 보고.
+    # 이전 계정은 onboarding 키에만, 현재 계정은 sidebar-state 키에만 남는 식이라 계정 UUID 를 키로 쓰는 atom 을 모두 모아 출처와 함께 보고.
     sources = {}
     for key in ACCOUNT_KEYED_ATOMS:
         for ptr, val in find_key(data, key):
@@ -155,7 +151,6 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
     if sources:
         account_ids = list(sources)
         # 계정 UUID 가 2개 이상일 때만 E01-03(계정 전환) 흔적. 1개면 로그인 계정 열거일 뿐(NA-00).
-        # (평서문 시나리오 E01 표본: 계정 전환 미수행인데 UUID 1개로 E01-03 이 붙던 오탐 수정)
         eid = "E01-03" if len(account_ids) >= 2 else "NA-00"
         records.append(model.Record(
             rb.next_id(), eid, events.name(eid),
@@ -164,7 +159,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
                 action=model.ACTION_UNKNOWN,
                 confidence=model.CONF_UNKNOWN,
                 rationale=("이 PC 에서 로그인했던 계정 UUID 가 전역 상태에 잔존 — "
-                           "분석표 E01-03. 각 계정의 로그인 시각은 이 키로 알 수 없음"
+                           "규칙 E01-03. 각 계정의 로그인 시각은 이 키로 알 수 없음"
                            if eid == "E01-03" else
                            "전역 상태에 계정 UUID 1개 잔존 — 로그인 계정 식별용. 계정 전환 근거 아님"),
                 observed="계정 UUID %d개: %s" % (len(account_ids),
@@ -184,7 +179,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500):
             rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(null_reason="추출 대상 키 미발견"),
             model.user_action(
-                observed="전역 상태 파일은 존재하나 분석표의 대상 키를 찾지 못함"),
+                observed="전역 상태 파일은 존재하나 대상 키를 찾지 못함"),
             model.evidence(image_desc, vfile, locator="file",
                            artifact_sha256=sha),
             status="partial",
