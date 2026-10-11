@@ -69,7 +69,7 @@ def badge(text, kind="BadgeNeutral"):
 
 
 def panel(title=None, badge_widget=None):
-    """(frame, body_layout). Panel = 흰 배경 + 얇은 Border."""
+    """(frame, body_layout). 색·테두리는 styles.qss 의 `QFrame#Panel` 이 정한다."""
     frame = QFrame()
     frame.setObjectName("Panel")
     outer = QVBoxLayout(frame)
@@ -512,7 +512,7 @@ def _draw_wrapped(painter, rect, text, font, lines=2):
 
 
 def _split_timestamp(stamp):
-    """'2026-08-25 18:47:16.514888 KST' → ('2026-08-25', '18:47:16'). 없으면 ('', '-')."""
+    """'2026-08-25 18:47:16.514888 KST' → ('2026-08-25', '18:47:16'). 값이 없으면 ('시각 없음', '-')."""
     if not stamp or stamp == EMPTY:
         return "시각 없음", EMPTY
     parts = str(stamp).split()
