@@ -13,7 +13,7 @@ from . import output, pipeline
 from .errors import CxError
 
 
-KEY_ENV = "ERELM_KEY_MATERIAL"   # BitLocker 키를 받는 환경변수 (팀 파서 공용으로 쓸 수 있게 파서 이름을 넣지 않았다)
+KEY_ENV = "ERELM_KEY_MATERIAL"   # BitLocker 키를 받는 환경변수 (다른 파서와 공용이라 파서 이름을 넣지 않았다)
 
 
 def build_parser():
@@ -28,7 +28,7 @@ def build_parser():
                         "live=실행 중인 이 PC 를 직접 분석 (자동 선택되지 않음, 명시해야 함)")
     p.add_argument("--out-dir", "-o", default="cx_out", help="결과 출력 폴더")
     p.add_argument("--format", choices=("json", "csv", "both"), default="csv",
-                   help="csv=팀 공통 timeline.csv + recovered_conversations.csv (기본) / "
+                   help="csv=공통 형식 timeline.csv + recovered_conversations.csv (기본) / "
                         "json=cx_result.json(전체 레코드·근거) / both")
     p.add_argument("--kinds", default=",".join(pipeline.DEFAULT_KINDS),
                    help="파싱할 아티팩트 종류 (쉼표구분): "

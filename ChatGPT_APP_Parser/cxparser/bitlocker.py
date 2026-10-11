@@ -1,4 +1,4 @@
-"""BitLocker 볼륨 잠금 해제 — 팀 Claude Web 파서(image/volumes.py)의 방식을 pytsk3 에 맞춰 옮긴 것.
+"""BitLocker 볼륨 잠금 해제 — Claude Web 파서(image/volumes.py)의 방식을 pytsk3 에 맞춰 옮긴 것.
 
 파티션 선두의 '-FVE-FS-' 로 BitLocker 를 알아보고 dissect.fve 로 푼 뒤, 복호화 스트림을 TSK 이미지로 노출한다.
 그 위에 pytsk3.FS_Info 를 그대로 올리므로 나머지 코드(vfs · usn)는 암호화 여부를 모른다.
@@ -115,7 +115,7 @@ def _speed_up(stream):
         c = stream.cipher
         if isinstance(c, XtsMode) and isinstance(c.iv_mode, Plain64) and c.iv_sector_size == c.sector_size:
             stream.cipher = _FastXts(c)
-    except Exception:  # noqa: BLE001 — 속도만 포기한다
+    except Exception:  # 속도만 포기한다
         pass
 
 
@@ -130,7 +130,7 @@ def open_volume(img, offset, size, key_material=None):
         bde = BDE(_PartitionFile(img, offset, size))
         protectors = {"clear_key": bde.has_clear_key(), "recovery_password": bde.has_recovery_password(),
                       "passphrase": bde.has_passphrase(), "bek": bde.has_bek()}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise VolumeLockedError("BitLocker 메타데이터를 읽을 수 없습니다: %s" % _short(exc))
 
     method, clear_error = None, None
@@ -140,7 +140,7 @@ def open_volume(img, offset, size, key_material=None):
         try:
             bde.unlock_with_clear_key()
             method = "clear_key"
-        except Exception as exc:  # noqa: BLE001 — 받은 키로 다시 시도한다
+        except Exception as exc:  # 받은 키로 다시 시도한다
             clear_error = _short(exc)
     if method is None:
         kind, _, value = (key_material or "").partition(":")
@@ -159,7 +159,7 @@ def open_volume(img, offset, size, key_material=None):
                     bde.unlock_with_bek(fh)
             else:
                 bde.unlock_with_fvek(bytes.fromhex(value))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise VolumeLockedError("받은 키(%s)로 BitLocker 볼륨을 풀지 못했습니다: %s" % (kind, _short(exc)),
                                     protectors=protectors)
         method = kind

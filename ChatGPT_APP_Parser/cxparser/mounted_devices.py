@@ -115,13 +115,13 @@ def assign(img, scheme, sector, volumes):
         try:
             hive, src = _read_all(fs.open(HIVE_PATH)), vd["index"]
             break
-        except Exception:  # noqa: BLE001 — 이 볼륨에는 없음 (데이터·복구 파티션)
+        except Exception:  # 이 볼륨에는 없음 (데이터·복구 파티션)
             continue
     if hive is None:
         return {"status": "SYSTEM 하이브 없음 — Artifact_path 의 드라이브 문자는 C: 로 가정"}
     try:
         by_key = {data: letter for letter, data in mounted_devices(hive).items()}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {"status": "SYSTEM 하이브 판독 실패 (%s) — 드라이브 문자는 C: 로 가정" % str(exc)[:100]}
     found = {}
     for vd, _fs in volumes:

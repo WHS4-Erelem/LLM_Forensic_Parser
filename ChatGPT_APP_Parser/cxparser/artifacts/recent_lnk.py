@@ -1,17 +1,12 @@
 """%APPDATA%\\Microsoft\\Windows\\Recent\\*.lnk — 윈도 최근 항목. Codex 가 파일을 저장하면 바로가기가 생긴다.
 
-조사(2026-09-23, 평서문 표본):
-  'Codex 이미지 2026년 9월 15일 오후 01_40_12.lnk' (13:40:19) → 바탕화면의 같은 이름 .png  : 정답 생성 이미지 다운로드 13:40:24 (5초 차)
-  '간단한_학습_계획서.lnk' (13:38:14)                 → 바탕화면 .docx, 같은 초에 생성        : 정답 문서 다운로드 13:38:21 (7초 차)
-  업로드한 파일(pdf)은 바로가기를 만들지 않았다 → 바로가기는 '저장' 흔적으로 본다.
-조사(2026-09-28, 삭제 제외 raw 표본):
-  '2019] 알기사 필기1(191224-수정)(4).lnk' (05:45:36) → Downloads 에 **확장자 없이** 저장된 2.4MB 파일, 첫 8바이트 %PDF-1.7 : 정답 문서 다운로드 05:45:35
-  → 확장자만 보면 놓친다. 대상 파일 머리 바이트로 종류를 판별한다. 이름 뒤 '(4)' 는 윈도가 중복 저장에 붙인 번호.
+업로드한 파일은 바로가기를 만들지 않으므로 바로가기는 '저장' 흔적으로 본다. 저장된 파일은 확장자 없이 저장되기도 하므로
+대상 파일의 머리 바이트로 종류를 판별한다. 이름 뒤 '(4)' 는 윈도가 중복 저장에 붙인 번호.
 규칙
   대상 파일명이 'Codex 이미지 …' 면 E06-02 생성 이미지 다운로드 (확인) — 앱 고유 명명.
   그 밖에는 대상 파일이 바로가기와 같은 시각(±15초)에 새로 생겼을 때만 저장 후보(추정):
     문서(확장자 또는 머리 바이트가 PDF·Office·텍스트) → E05-05 문서 다운로드 / 이미지 → E06-02 생성 이미지 다운로드(추정, 앱 명명 규칙 아님) /
-    종류 미확인 → E05-05 문서 다운로드 + 사유 (팀 행위 분류 체계 2026-10-08: '파일 다운로드' 삭제, 종류를 알 수 없으면 문서 다운로드 + Behavior_details 에 사유).
+    종류 미확인 → E05-05 문서 다운로드 + Behavior_details 에 사유 (별도의 '파일 다운로드' 행위는 두지 않는다).
   기존 문서를 열어서 생긴 바로가기(대상 생성 시각이 훨씬 이전)는 관찰(NA-00).
   어느 앱이 저장했는지는 바로가기에 없어, derive 에서 앱 실행 구간·Codex 대화의 파일명 언급으로 판정을 조정한다.
 """
@@ -51,7 +46,7 @@ def _open_target(vfile, win_path):
         return None
     try:
         return fs.open(win_path[2:].replace("\\", "/"))
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
@@ -73,7 +68,7 @@ def _target_info(vfile, win_path):
     try:
         head = f.read_random(0, min(8, meta.size)) if meta.size else b""
         kind = next((k for magic, k in _MAGIC if head.startswith(magic)), "unknown" if head else None)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return created, meta.size, kind
 
@@ -84,12 +79,12 @@ def _secs(iso):
 
 def classify(ext, kind):
     """저장된 파일의 (확장자, 머리 바이트 종류) → (이벤트, 행위 문구, 종류 설명).
-    문서 → E05-05, 이미지 → E06-02(추정), 그 밖(종류 미확인) → E05-05 + '종류 미확인' 사유 (팀 규칙 2026-10-08)."""
+    문서 → E05-05, 이미지 → E06-02(추정), 그 밖(종류 미확인) → E05-05 + '종류 미확인' 사유."""
     if ext in DOC_EXT or kind == "document":
         return "E05-05", "문서 저장(새 파일)", "문서"
     if ext in IMAGE_EXT or kind == "image":
         return "E06-02", "이미지 저장(새 파일)", "이미지 (앱 명명 규칙 'Codex 이미지 …' 아님)"
-    return "E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 팀 규칙에 따라 문서 다운로드로 표기"
+    return "E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 문서 다운로드로 표기"
 
 
 def parse(vfile, image_desc, rb, max_excerpt=500):
@@ -138,6 +133,6 @@ if __name__ == "__main__":  # python -m cxparser.artifacts.recent_lnk — 경로
     assert target_path(b"no path here") is None
     assert classify(".pdf", None)[0] == "E05-05" and classify("", "document")[0] == "E05-05"
     assert classify(".png", None)[0] == "E06-02" and classify("", "image")[0] == "E06-02"
-    assert classify("", "unknown") == ("E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 팀 규칙에 따라 문서 다운로드로 표기")
+    assert classify("", "unknown") == ("E05-05", "파일 저장(새 파일, 종류 미확인)", "종류 미확인 — 문서 다운로드로 표기")
     assert classify(".zip", None)[0] == "E05-05" and "E05-06" not in events.EVENTS      # '파일 다운로드' 는 더 이상 내지 않는다
     print("recent_lnk self-check ok")

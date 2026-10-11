@@ -1,6 +1,6 @@
-"""결과 출력 — cx_result.json(전체) + 팀 공통 CSV 2종.
+"""결과 출력 — cx_result.json(전체) + 공통 CSV 2종.
 
-팀 공통 형식(2026-09-20 공유본 timeline.csv / recovered_conversations.csv 헤더 그대로):
+공통 CSV 형식(헤더 그대로):
   timeline.csv               Model, Timestamp, User_behavior, Behavior_details , Verdict, Artifact_path, Artifact_details
   recovered_conversations.csv Model, timestamp, conversation_uuid, conversation_title, message_uuid,
                              parent_message_uuid, message order, role, content, Artifact_path
@@ -15,15 +15,15 @@ from . import events
 
 MODEL = "chatgpt-desktop"
 PACKAGE_NAME = "OpenAI.Codex_2p2nqsd0c76g0"
-ROOT_PARENT = "00000000-0000-4000-8000-000000000000"   # 공유본: 첫 메시지의 부모
+ROOT_PARENT = "00000000-0000-4000-8000-000000000000"   # 첫 메시지의 부모
 
-# 헤더는 공유본과 바이트 단위로 같게 유지한다 (끝 공백 2개 포함)
+# 헤더는 공통 형식과 바이트 단위로 같게 유지한다 (끝 공백 2개 포함)
 TIMELINE_COLUMNS = ["Model", "Timestamp", "User_behavior", "Behavior_details ", "Verdict",
                     "Artifact_path", "Artifact_details "]
 CONV_COLUMNS = ["Model", "timestamp", "conversation_uuid", "conversation_title", "message_uuid",
                 "parent_message_uuid", "message order", "role", "content", "Artifact_path"]
 
-# 회의록 5절: 확정 / 의심. 판단 불가(미확정) 는 CSV 에서 제외 (JSON 에는 남음)
+# 확정 / 의심. 판단 불가(미확정) 는 CSV 에서 제외 (JSON 에는 남음)
 VERDICT = {"확인": "확정", "추정": "의심", "미확정": "판단 불가"}
 CSV_VERDICTS = ("확정", "의심")
 
@@ -45,22 +45,22 @@ def write_json(path, payload):
 
 
 def to_kst(utc_iso):
-    """UTC ISO(...Z) -> 'YYYY-MM-DD HH:MM:SS[.ffffff] KST' (팀 표시 형식). 미상은 ''."""
+    """UTC ISO(...Z) -> 'YYYY-MM-DD HH:MM:SS[.ffffff] KST'. 미상은 ''."""
     if not utc_iso:
         return ""
     dt = datetime.fromisoformat(utc_iso.replace("Z", "+00:00")) + timedelta(hours=9)
-    return dt.strftime("%Y-%m-%d %H:%M:%S.%f") + " KST"      # 팀 공통: 소수 6자리 고정
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f") + " KST"      # 소수 6자리 고정
 
 
 def _secs(utc_iso):
     return datetime.fromisoformat(utc_iso.replace("Z", "+00:00")).timestamp()
 
 
-EMPTY = "-"   # 팀 공통: 시각·ID 등 값이 없는 셀은 빈칸 대신 "-"
+EMPTY = "-"   # 시각·ID 등 값이 없는 셀은 빈칸 대신 "-"
 
 
 def _safe(v):
-    """빈 셀은 EMPTY, 그 외는 Excel 수식 주입 방지 — 팀 파서 공통 관례."""
+    """빈 셀은 EMPTY, 그 외는 Excel 수식 주입 방지."""
     s = "" if v is None else str(v)
     if not s.strip():
         return EMPTY
@@ -77,10 +77,10 @@ def _one_line(v, limit=300):
 
 
 def _winpath(r):
-    """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...' (공유본 표기).
-    드라이브 문자는 location.drive — 이미지는 볼륨별로 SYSTEM\\MountedDevices 에서(0.3.24), 라이브는 실제 문자.
+    """이미지 내부 경로 '/Users/x/...' -> 'C:\\Users\\x\\...'.
+    드라이브 문자는 location.drive — 이미지는 볼륨별로 SYSTEM\\MountedDevices 에서, 라이브는 실제 문자.
     드라이브 문자가 없는 시스템(POSIX)이면 경로 그대로.
-    ponytail: location.drive 가 없으면(추출 폴더, 하이브 없는 이미지, 문자 없는 파티션) C: 로 가정"""
+    location.drive 가 없으면(추출 폴더, 하이브 없는 이미지, 문자 없는 파티션) C: 로 가정"""
     loc = (r.get("evidence") or {}).get("location") or {}
     p, drive = loc.get("path") or "", loc.get("drive")
     if not p:
@@ -156,7 +156,7 @@ def _fold_prompt_history(rows):
     return out, {k: "; ".join(v) for k, v in notes.items()}
 
 
-_RUN_FOLD_SEC = 120   # ponytail: 표본에서 Prefetch 시각이 첫 로그보다 10~70초 앞섬 (첫 실행은 초기화가 길다). 표본 늘면 조정
+_RUN_FOLD_SEC = 120   # 표본에서 Prefetch 시각이 첫 로그보다 10~70초 앞선다 (첫 실행은 초기화가 길다)
 
 
 def _fold_app_runs(rows, notes):
@@ -235,8 +235,7 @@ def _download_key(r):
 
 def _fold_downloads(rows, notes):
     """다운로드(E05-05/E05-06/E06-02): 같은 파일이 채팅 모드 웹 캐시(내려받기 요청 기록, 확인)와 최근 항목 바로가기
-    (저장된 파일, 추정) 양쪽에 남는다. 같은 파일명·60초 안이면 웹 캐시 행 하나만 두고 바로가기를 그 행의 근거로 접는다.
-    검증(2026-10-06, image2): CD_고객안내_승인대기.pdf 가 11:47:34(웹 캐시)·11:47:42(바로가기) 두 행으로 나와 한 행위가 두 건으로 세어졌다."""
+    (저장된 파일, 추정) 양쪽에 남는다. 같은 파일명·60초 안이면 웹 캐시 행 하나만 두고 바로가기를 그 행의 근거로 접는다."""
     dl = [r for r in rows if r["event"]["event_id"] in _DOWNLOAD_EVENTS and (r.get("timestamp") or {}).get("utc")]
     cache = [r for r in dl if (r.get("details") or {}).get("artifact") == "webcache"]
     drop = set()
@@ -269,7 +268,7 @@ def write_timeline_csv(path, records):
         w(TIMELINE_COLUMNS)
         for r in rows:
             w([MODEL, to_kst(r["timestamp"].get("utc")),
-               events.name(r["event"]["event_id"]),          # 팀 카탈로그 행위명
+               events.name(r["event"]["event_id"]),          # 카탈로그 행위명
                _behavior_details(r, titles),
                VERDICT[r["user_action"].get("confidence")],
                _winpath(r), _artifact_details(r, titles, fold_notes.get(r["record_id"]))])
@@ -292,7 +291,7 @@ def write_conversations_csv(path, records):
         key = (role, " ".join(det["text"].split()))
         # 같은 메시지의 사본만 접는다: 같은 대화 ID 이거나, 다른 아티팩트(rollout ↔ SQLite — 분기 스레드는
         # 두 쪽의 대화 ID 가 달라 ID 로 묶지 못한다). 같은 아티팩트 안의 다른 대화에 같은 본문이 2초 안에
-        # 있으면 별개 메시지다 (0.3.28: 대화 ID 를 보지 않아 다른 대화의 메시지가 지워지던 문제).
+        # 있으면 별개 메시지다.
         if any(u and utc and abs(_secs(u) - _secs(utc)) <= 2 and (t == tid or a != art)
                for u, t, a in seen.get(key, ())):
             continue

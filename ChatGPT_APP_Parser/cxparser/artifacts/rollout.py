@@ -1,6 +1,6 @@
-"""~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl 파서 (MVP 1차 대상).
+"""~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl 파서.
 
-분석표 근거:
+근거:
   E03-01 새 대화 생성 : rollout-<시각>-<스레드ID>.jsonl 최초 생성, 대화 전문 평문 JSON
   E03-03 대화 수정    : 파일명이 <원본대화ID>_<분기ID> 형태인 새 JSONL + 원본 미삭제
   E04-01 프롬프트 전송 : rollout JSONL 안의 user 메시지
@@ -9,7 +9,7 @@
   라인마다 envelope({timestamp, ordinal, type, payload}) / 평면 형태를 모두 허용하고,
   관찰된 구조를 schema_observation 으로 보고하며, 매핑되지 않은 라인은 버리지 않는다.
 
-실제 표본 반영 (WHS4_snap S1~S5 폴더 표본, 패키지 26.825.4187.0, 2026-09-18 확인):
+관찰된 구조 (패키지 26.825.4187.0):
   - 모든 라인이 {timestamp(Z), ordinal, type, payload}.
   - role=user 메시지는 payload.internal_chat_message_metadata_passthrough.content_item_kinds
     로 구분된다: user.text = 사용자 입력 / plugins.recommendations,
@@ -62,7 +62,7 @@ HANDOFF_REQUEST_MARK = "## My request:"
 
 
 class SchemaObservation:
-    """실제 표본과 대조하기 위한 관찰 결과(추측 방지용)."""
+    """파일에서 관찰된 구조. 스키마를 단정하지 않기 위해 결과에 보고한다."""
 
     def __init__(self, path):
         self.path = path
@@ -242,7 +242,7 @@ def _user_action_for(uclass, kinds, matches, content_text, details, max_excerpt)
             action="프롬프트 전송",
             confidence=model.CONF_CONFIRMED,
             rationale=("rollout JSONL role=user 메시지, content_item_kinds=user.text "
-                       "(분석표 E04-01)" +
+                       "(규칙 E04-01)" +
                        (" + 동일 본문 item_completed(UserMessage) 이벤트 %d건" % len(matches)
                         if matches else "")))
     if uclass == "chatgpt_handoff":
@@ -264,7 +264,7 @@ def _user_action_for(uclass, kinds, matches, content_text, details, max_excerpt)
     return "E04-01", model.user_action(
         action="프롬프트 전송",
         confidence=model.CONF_INFERRED,
-        rationale=("rollout JSONL role=user 메시지 (분석표 E04-01). content_item_kinds 가 "
+        rationale=("rollout JSONL role=user 메시지 (규칙 E04-01). content_item_kinds 가 "
                    "없어 자동 주입 문맥과 구분하지 못함"))
 
 
@@ -277,7 +277,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
 
     try:
         raw = vfile.read()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         records.append(model.Record(
             rb.next_id(), "NA-00", events.name("NA-00"),
             model.timestamp(null_reason="파일을 읽지 못해 시각 확인 불가"),
@@ -342,7 +342,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
         model_name = _find_model(item)
         if model_name and model_name not in models_seen:
             models_seen.append(model_name)
-        # turn_context 의 model 이 앞 turn 과 다르면 그 사이에 모델을 바꾼 것 (E09-01). 2026-09-23 표본: "5.5로 모델 변경 후" 프롬프트 직전 turn 에서 확인
+        # turn_context 의 model 이 앞 turn 과 다르면 그 사이에 모델을 바꾼 것 (E09-01).
         if item_type == "turn_context" and model_name:
             if last_turn_model is not None and model_name != last_turn_model:
                 records.append(model.Record(
@@ -393,7 +393,7 @@ def parse(vfile, image_desc, rb, max_excerpt=500, include_assistant=True):
             if not known:
                 obs.unmapped_lines += 1
             # 에이전트가 이미지 생성 도구를 찾거나 부른 도구 호출 = 사용자가 이미지 생성을 요청한 흔적 (E06-01).
-            # 2026-09-23 표본: imagegen/SKILL.md 읽기 → ALL_TOOLS 에서 /image_gen|generate image/ 검색 (정답 68초 뒤)
+            # (imagegen 스킬 읽기, 도구 목록에서 image_gen 검색 등)
             if line_type.endswith("custom_tool_call") and _IMAGE_GEN_RE.search(json.dumps(item, ensure_ascii=False)):
                 records.append(model.Record(
                     rb.next_id(), "E06-01", events.name("E06-01"),
@@ -530,12 +530,12 @@ def _session_record(rb, vfile, image_desc, fmeta, session_meta, msg_count, obs,
     is_branch = bool(fmeta.get("is_branch"))
     event_id = "E03-03" if is_branch else "E03-01"
     if is_branch:
-        rationale = ("rollout 파일명이 <원본대화ID>_<분기ID> 형태 — 분석표 E03-03 "
+        rationale = ("rollout 파일명이 <원본대화ID>_<분기ID> 형태 — 규칙 E03-03 "
                      "(대화 수정 시 분기 JSONL 생성, 원본 미삭제)")
         action_name = "대화 수정(프롬프트 편집)"
     else:
         rationale = ("~/.codex/sessions 아래 rollout JSONL 파일 존재 — "
-                     "분석표 E03-01 (새 대화 생성 시 파일 최초 생성)")
+                     "규칙 E03-01 (새 대화 생성 시 파일 최초 생성)")
         action_name = "새 대화 생성"
 
     raw_ts = fmeta.get("filename_timestamp_raw")

@@ -1,6 +1,6 @@
 """이미지 안에서 Codex Desktop 아티팩트 위치를 식별한다.
 
-경로 근거는 전부 첨부 분석표(에레렘, 2026-08-29 수집)에서 확인된 것이다:
+앱이 쓰는 경로:
   %USERPROFILE%\\.codex\\            (auth.json, .codex-global-state.json,
                                      session_index.jsonl, sessions\\YYYY\\MM\\DD\\rollout-*.jsonl,
                                      *.sqlite/-wal/-shm, thread-writer-locks\\*.lock,
@@ -45,11 +45,11 @@ _PATTERNS = [
     ("package_userdata", re.compile(r"/users/(?P<user>[^/]+)/appdata/local/packages/" + PACKAGE_FAMILY + r"/(?P<rest>.+)$")),
     ("package_binary",  re.compile(r"/program files/windowsapps/openai\.codex_(?P<ver>[^/]+)/(?P<rest>.+)$")),
     ("package_registration", re.compile(r"/programdata/packages/" + PACKAGE_FAMILY + r"(/(?P<rest>.+))?$")),
-    ("prefetch",       re.compile(r"/windows/prefetch/(codex|chatgpt)\.exe-[0-9a-f]{8}\.pf$")),   # 8월 판은 ChatGPT.exe, 9월 판은 Codex.exe
+    ("prefetch",       re.compile(r"/windows/prefetch/(codex|chatgpt)\.exe-[0-9a-f]{8}\.pf$")),   # 구버전은 ChatGPT.exe, 신버전은 Codex.exe
     ("recent_lnk",     re.compile(r"/users/(?P<user>[^/]+)/appdata/roaming/microsoft/windows/recent/(?P<fn>[^/]+\.lnk)$")),
 ]
 
-# 대화 내용 파싱 대상(1차 MVP)
+# 대화 내용 파싱 대상
 PRIMARY_KINDS = {"rollout", "rollout_loose"}
 
 # 부가 추출 대상
@@ -81,7 +81,7 @@ ROLLOUT_NAME_RE = re.compile(
 def parse_rollout_filename(name):
     """rollout 파일명에서 시작시각/스레드ID/분기ID 추출.
 
-    분석표 근거:
+    예:
       rollout-2026-08-29T02-22-56-01a04965-63f0-....jsonl      (E03-01 새 대화)
       rollout-...-<원본대화ID>_<분기ID>.jsonl                   (E03-03 대화 수정)
     """
