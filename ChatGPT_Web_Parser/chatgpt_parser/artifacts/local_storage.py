@@ -24,7 +24,7 @@ from ..source import FILE_STATUS_EMPTY, FILE_STATUS_NOT_A_FILE, FILE_STATUS_NOT_
 from ..utils import normalize_timestamp
 
 
-# ---- 7.3 Chrome Local Storage Reader (LevelDB .log / .ldb) -------------------
+# ---- Chrome Local Storage Reader (LevelDB .log / .ldb) -------------------------------------------
 # 2026-09-15 C: 분석용 사본 (E01-02 000010.log, POST_CLEANUP 000009.log) 에서 byte 로 확인한 형식:
 #   key   = b"_" + origin + b"\x00" + b"\x01" + Latin-1 key 이름   (예: _https://chatgpt.com\x00\x01nextauth.message)
 #           그 밖에 META:<origin>, METAACCESS:<origin> (origin 메타데이터 — 읽지 않음)
@@ -131,7 +131,7 @@ def _structure_account_switch_sessions(obj: Any, observed: dict[str, Any], warni
         sessions.append({
             "field_names": sorted(str(name) for name in item),
             "user_id_sha256_prefix": _sha256_prefix(item.get("userId")),
-            # 계정 이름은 원문을 남기지 않고 해시 앞자리로만 비교한다 (§8.21 ACCOUNT_NAME_CHANGE)
+            # 계정 이름은 원문을 남기지 않고 해시 앞자리로만 비교한다 (CHATGPT_ACCOUNT_NAME_CHANGE_001 이 쓴다)
             "account_name_sha256_prefix": _sha256_prefix(item.get("name") or item.get("accountName")),
             "session_token_present": isinstance(token, str) and bool(token),
             "session_token_length": len(token) if isinstance(token, str) else None,

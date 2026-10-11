@@ -21,9 +21,7 @@ from . import bitlocker
 from .source import Source, normalize_source_path
 
 
-# =============================================================================
-# 5. Disk Image Access (DD / RAW)
-# =============================================================================
+# ---- Disk Image Access (DD / RAW) ----------------------------------------------------------------
 # DD/RAW 이미지 → 파티션 → NTFS → ImageSource(Source). 이후 Discovery·Reader·Rule 은 DirectorySource 와 같은 코드를 쓴다.
 #   - Library: pytsk3==20260715 (Apache-2.0 바인딩 + Sleuth Kit, 2026-09-15 사용자 승인. AGPL 정책 미확정으로 dissect 미사용).
 #     표준 라이브러리가 아닌 유일한 의존성이라 선택적으로 import 한다 (없으면 --dir 모드는 그대로 동작, --image 는 명확한 오류).

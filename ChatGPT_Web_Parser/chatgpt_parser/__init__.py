@@ -13,7 +13,7 @@ Disk Image(E01 / DD·RAW) 또는 분석용 폴더에서 ChatGPT Web(Chrome) 흔�
     write_final_outputs(result, r"D:\\CASE\\out")                        # timeline.csv + recovered_conversations.csv
 
 내부 Reader·Rule·Cache carving 구현은 하위 모듈에 있고, 여기서는 통합에 필요한 것만 공개한다.
-자세한 내용은 docs/INTEGRATION_GUIDE.md.
+인자·반환 필드는 README 의 "Python 통합" 절에 있다.
 """
 from .constants import PARSER_NAME, PARSER_VERSION, SERVICE
 from .image import ImageOpenError, open_image_source

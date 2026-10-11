@@ -23,7 +23,7 @@ from ..models import ArtifactRecord
 from ..utils import normalize_timestamp
 
 
-# ---- 7.6 Chrome shared_proto_db Download Reader (21_download key 만) ----------
+# ---- Chrome shared_proto_db Download Reader (21_download key 만) ----------------------------------
 # 2026-09-19 실제 평문 DD (Users/llmtest/.../Chrome/User Data/Profile 1/shared_proto_db/000003.log) 에서 확인한 것:
 #   폴더 구성 = 000003.log · CURRENT · LOCK · LOG · LOG.old · MANIFEST-000001 · metadata (.ldb 없음)
 #   LevelDB .log 의 key = b"21_download,<guid>" (한 다운로드의 진행 단계마다 PUT 여러 건, DELETE 도 관찰됨)

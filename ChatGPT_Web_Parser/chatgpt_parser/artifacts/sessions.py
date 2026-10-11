@@ -25,7 +25,7 @@ from ..source import FILE_STATUS_EMPTY, FILE_STATUS_NOT_A_FILE, FILE_STATUS_NOT_
 from ..utils import normalize_timestamp
 
 
-# ---- 7.7 Chrome Sessions (SNSS) Navigation Reader ----------------------------
+# ---- Chrome Sessions (SNSS) Navigation Reader ----------------------------------------------------
 # 2026-09-19 실제 평문 DD (Users/llmtest/.../Chrome/User Data/Profile 1/Sessions/) 에서 byte 로 확인한 형식:
 #   파일 = b"SNSS" + int32 version (관찰값 3) + [uint16 size][uint8 command_id][payload(size-1)] 반복.
 #   payload = Chromium Pickle (선두 uint32 payload_size, 문자열 뒤는 4 byte 정렬).

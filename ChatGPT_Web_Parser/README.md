@@ -4,8 +4,8 @@ Disk Image(E01 / DD·RAW)에서 **ChatGPT 웹(chatgpt.com) 사용 흔적**을 �
 **"Timestamp + 사용자 행위 + Evidence"** 와 **복구된 대화 내용**을 출력하는 디지털 포렌식 CLI Parser.
 WHS 대학 팀 프로젝트 *"LLM 대화 내용 추출 및 사용자 행위 분석"* 의 ChatGPT Web 담당 산출물.
 
-구현은 `chatgpt_parser` 패키지에 있고, `chatgpt_web_parser.py` 는 기존 CLI 진입점이다.
-팀 Controller 에서는 `from chatgpt_parser import analyze_chatgpt_web` 으로 그대로 호출할 수 있다 (→ `docs/INTEGRATION_GUIDE.md`).
+구현은 `chatgpt_parser` 패키지에 있고, `chatgpt_web_parser.py` 는 CLI 진입점이다.
+팀 Controller 에서는 `from chatgpt_parser import analyze_chatgpt_web` 으로 그대로 호출할 수 있다 (→ [2-1. Python 통합](#2-1-python-통합-팀-controller-에서-호출)).
 
 ---
 
@@ -87,6 +87,23 @@ History 파일 하나를 고르는 방식이 **아니다**. Chrome User Data 를
 → 필요한 Artifact 만 읽기 전용으로 Working Copy → 기존 Folder 분석 로직 재사용
 ```
 
+**수집 목록과 분석 대상 목록은 다르다.** Live 가 사본으로 가져오는 것은 `live.py` 의
+`LIVE_PROFILE_FILES` · `LIVE_PROFILE_DIRS` 에 있는 6종이다.
+
+| Artifact | Live 수집 | Reader 분석 대상 |
+|---|---|---|
+| History | O | O |
+| Local Storage | O | O |
+| Session Storage | O | O |
+| Cache | O | O |
+| shared_proto_db | O | O |
+| Sessions | O | O |
+| Preferences | **X** | O |
+
+즉 Live Mode 에서는 `Preferences` 사본이 없으므로 그 Artifact 는 Coverage 에 `NOT_PRESENT` 로 남고,
+Preferences 를 근거로 쓰는 판정(`CACHE_DELETE` 등)은 Live 입력에서 나오지 않는다.
+Image · Folder Mode 에서는 7종 모두 읽는다.
+
 - **원본 Artifact 를 수정·삭제·덮어쓰지 않는다** (읽기로만 연다).
 - Chrome 이 실행 중이면 일부 파일이 잠겨 수집에 실패할 수 있다. **파일 하나가 실패해도 분석을 멈추지 않고**
   실패 건수를 warning 으로 알린다.
@@ -135,11 +152,28 @@ fvek:<hex>
 > Parser 는 키 값을 stdout · stderr · warning · 예외 메시지 · `result.json` · CSV 어디에도 쓰지 않는다
 > (키 종류와 보호자 목록만 남긴다).
 
-검증 상태: BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출 · clear key 해제 후 복호화 스트림이
-`dissect.ntfs` 로 넘어가는 배선 · 복호화 볼륨이 `pytsk3` 를 거치지 않는 것 · 비암호화 NTFS 가 기존
-`pytsk3` 경로를 유지하는 것은 **단위 테스트로 확인했다.**
-**실제 암호화 이미지로 여는 실증(E2E) 검증은 테스트용 암호화 이미지가 있어야 하며 아직 수행하지 않았다
-(`NOT TESTED / BLOCKED_NO_ENCRYPTED_IMAGE`). 별도 환경에서 재검증이 필요하다.**
+검증 상태:
+
+- **단위 테스트** — BitLocker 감지 · 키 형식 · 잠김/오류 처리 · 키 미노출 · clear key 해제 후 복호화 스트림이
+  `dissect.ntfs` 로 넘어가는 배선 · 복호화 볼륨이 `pytsk3` 를 거치지 않는 것 · 비암호화 NTFS 가 기존
+  `pytsk3` 경로를 유지하는 것.
+- **실제 암호화 이미지 (2026-10-09, `Scenario_Image-BitLocker.dd` 64 GiB DD/RAW)** — 아래까지 확인했다.
+  - BitLocker 파티션 감지 (`IMAGE_BITLOCKER_DETECTED:partition-6`)
+  - clear key 로 볼륨 해제 (`IMAGE_BITLOCKER_UNLOCKED:partition-6:clear_key`, 외부 키 입력 없음)
+  - 복호화 스트림의 NTFS 접근 (`$MFT` · `Windows` · `Users` 열거 성공)
+  - 아티팩트 분석 — `History` 393,216 B SQLite 파싱, Cache `index`(magic `0xC103CAC3`) + `data_0..3` · `f_*`
+    353 파일 72,175,706 B 읽기 성공, Cache entry 3,891건 전부 열거 (읽기 실패 0)
+  - 최종 산출 — Records 67 / Events 4 / Conversations 7 / **복구 메시지 0**
+- **대화 복구는 이 이미지에서 0건이고, 그 원인은 파서가 아니라 자료 부재다.** ChatGPT 응답 1,350건 중
+  Cache entry 를 전부 열거해도 대화 상세 endpoint(`/backend-api/conversation/<id>`) 응답이 **0건**이었다
+  (남아 있던 목록 API 응답은 `mapping`·`current_node`·`snippet` 이 모두 `null`, 수집 시점
+  `stream_status=IS_STREAMING` — 메시지 본문은 cache 되지 않는 POST 스트리밍으로 흐른다).
+  같은 reader 를 2026-09-20 추출 사본에 돌리면 메시지 42개가 복구되는 것을 positive control 로 확인했다.
+- **키를 입력해서 여는 경로(recovery key · passphrase · BEK · FVEK)는 실제 암호화 이미지로 확인하지 않았다**
+  — 위 검증은 clear key 볼륨 1건이다. 다른 보호자 유형은 해당 이미지가 있어야 재검증할 수 있다.
+
+같은 이미지의 Cache entry 분포: 전체 3,891 → chatgpt.com/openai.com 1,350 → `/backend-api/` 76 →
+대화 상세 응답 **0**.
 
 ## 2-1. Python 통합 (팀 Controller 에서 호출)
 
@@ -160,7 +194,8 @@ write_final_outputs(result, r"D:\CASE\out")   # timeline.csv + recovered_convers
 - 분석(`analyze_chatgpt_web`)과 출력(`write_final_outputs`)이 분리되어 있다. 분석만으로는 파일이 생기지 않는다.
 - 결과는 `result.events` / `result.recovered_messages` / `result.conversations` / `result.records` /
   `result.coverage` / `result.warnings` 로 읽는다. 내부 helper 를 직접 부를 필요가 없다.
-- 공개되는 이름은 `chatgpt_parser.__all__` 에 있는 것뿐이다. 인자·필드 설명은 **`docs/INTEGRATION_GUIDE.md`**.
+- 공개되는 이름은 `chatgpt_parser.__all__` 에 있는 것뿐이다. 각 필드의 의미는 `chatgpt_parser/models.py` 의
+  dataclass 정의와 아래 [3. 출력](#3-출력) · [4. 판정 값 읽는 법](#4-판정-값-읽는-법) 에 있다.
 
 ## 3. 출력
 
@@ -246,7 +281,49 @@ Event 1건 = 1 row, 시각순 정렬. 컬럼 이름·순서는 **팀 공통 CSV 
 
 행위의 **Device Attribution**(이 PC에서 일어났는가)은 confidence 와 별개다. 서버 캐시·Sync 근거는 `SERVER_SIDE_CACHE` 로 표시하며, 그 이유만으로 confidence 를 자동으로 내리지 않는다.
 
-Rule 별 근거와 한계는 `docs/EVENT_RULES.md`, 코드 구현 상태는 `docs/IMPLEMENTATION_STATUS.md` 에 있다.
+### 서버가 반환한 응답의 사본 (팀 최종 기준, 2026-10-09)
+
+근거가 **서버가 반환한 응답의 사본**이면 그 행위를 `DETECTED`(`확정`) 로 판정할 수 있다. 대표 예가
+HTTP Cache 에 저장된 대화 API 응답이다 — 전송된 메시지 자체가 응답 본문 안에 있어 추가 추론 없이 읽힌다.
+
+판정은 `detectors/common.py` 의 `_candidate_event()` 가 하며, **세 조건을 모두 만족할 때만**
+`DETECTED` 가 된다. 하나라도 어긋나면 `CANDIDATE` 다.
+
+```
+① Rule 이 이 기준을 쓰겠다고 명시했다          server_response_copy=True
+② 그 Record 가 실제로 서버 응답 사본이다        is_server_response_copy(record) == True
+③ 그 Event 의 confidence 가 LOW 가 아니다       confidence != "LOW"
+```
+
+②의 `is_server_response_copy()` 는 **Cache 라는 것만으로 True 가 되지 않는다.** 네 조건을 모두 본다.
+
+```
+artifact_type == "cache"
+cache_key_kind == "conversation_response"     # 대화 상세 API 응답 (목록 API·하위 경로 아님)
+http_status == 200
+decoded_sha256 가 있고 observed["conversation"] 이 dict      # 본문을 실제로 복호화·파싱했다
+```
+
+따라서 다음은 **확정되지 않는다** (`CANDIDATE` 유지): URL 문자열만 남은 entry · header 만 있는 entry ·
+본문 없음 · brotli decode 실패 · JSON parse 실패 · 정적 JS/CSS · 단순 host 흔적 ·
+Local Storage 초안 · 초안이 비워진 전이 · timestamp 없는 추론 · 간접 흔적 ·
+그 응답을 바탕으로 **한 단계 더 추론해야 하는 행위**(대화 수정·삭제 등).
+
+③ 때문에 **서버 응답 사본이 있어도 확정되지 않는 경우가 있다.** 응답 본문은 정상인데 그 안의 메시지 시각을
+UTC/KST 로 변환하지 못하면 confidence 가 `LOW` 가 되고, `DETECTED` 조건에서 탈락해 `CANDIDATE` / `LOW` 로
+남는다. 즉 `DETECTED` 는 **"서버 응답 사본 + 변환 가능한 메시지 시각"** 이 함께 있을 때만 나온다.
+
+확정되는 것은 **전송 사실**이고 **전송 시각이 아니다.** 시각 칸에 들어가는 값은
+`Cache.conversation.mapping[].message.create_time` — **서버가 메시지를 만든 시각**이며 사용자가 전송 버튼을
+누른 시각이 아니다 (그래서 confidence_reason 에 `TIMESTAMP_APPROXIMATED` 가 붙는다). 단말도
+`device_attribution=SERVER_SIDE_CACHE` 로 남는다 (같은 계정을 다른 기기에서 썼을 수 있다).
+이 한계는 `DETECTED` 가 되어도 `limitations` 에 그대로 남는다.
+
+현재 이 기준을 쓰는 Rule 은 `CHATGPT_PROMPT_SEND_001` 하나다. 다른 Cache 기반 Rule
+(`MODEL_CHANGE` · `FILE_UPLOAD_DELETE` · `CONVERSATION_DELETE`)은 서버 응답을 추가 해석해야 하는
+행위라서 `CANDIDATE` 로 둔다.
+
+Rule 별 판정 조건과 한계는 `chatgpt_parser/detectors/` 각 Rule 머리의 주석에 적혀 있다.
 
 ## 5. 판정하는 사용자 행위
 
@@ -258,11 +335,31 @@ Rule 별 근거와 한계는 `docs/EVENT_RULES.md`, 코드 구현 상태는 `doc
 
 **보조 근거로만 판정하는 행위 (항상 `CANDIDATE`, `LOW`~`MEDIUM`)**
 
-`CONVERSATION_REMOVED_FROM_LIST` · `PROMPT_SEND` · `FILE_UPLOAD_DELETE` · `SHARE_LINK` · `MODEL_CHANGE` ·
+`CONVERSATION_REMOVED_FROM_LIST` · `FILE_UPLOAD_DELETE` · `SHARE_LINK` · `MODEL_CHANGE` ·
 `ACCOUNT_NAME_CHANGE` · `HISTORY_DELETE` · `CONVERSATION_DELETE` · `CACHE_DELETE` · `INCOGNITO`
 
-이 10개는 그 행위에만 생기는 직접 증거가 현재 자료에서 확인되지 않아, 조건·한계를 Rule 안에 적고
+이 9개는 그 행위에만 생기는 직접 증거가 현재 자료에서 확인되지 않아, 조건·한계를 Rule 안에 적고
 `CANDIDATE` 로만 판정한다. 근거 Record 가 없으면 **Event 를 만들지 않는다.**
+
+**근거에 따라 `DETECTED` 와 `CANDIDATE` 가 갈리는 행위**
+
+`PROMPT_SEND` (`CHATGPT_PROMPT_SEND_001`) — 같은 Rule 이지만 근거에 따라 결과가 셋으로 갈린다.
+
+| 근거 | action_status | confidence |
+|---|---|---|
+| 서버 응답 사본(Cache 대화 상세 API 응답, HTTP 200, 본문 복구 성공)에 user 메시지가 있고 그 메시지의 `create_time` 을 UTC/KST 로 변환할 수 있다 | `DETECTED` (`확정`) | `MEDIUM` |
+| 서버 응답 사본은 있으나 메시지 시각을 변환할 수 없다 | `CANDIDATE` (`의심`) | `LOW` |
+| 초안이 비워진 전이(`conversationDrafts` non-empty → empty) 만 있다 | `CANDIDATE` (`의심`) | `LOW` |
+
+`MEDIUM` 이 상한이다 — Rule 이 `PARTIALLY_VERIFIED` 이므로 `HIGH` 는 쓰지 않는다.
+본문을 복구하지 못한 Cache entry(URL·header 만, decode/JSON 실패)는 애초에 서버 응답 사본이 아니라서
+위 표의 첫 줄에 해당하지 않는다.
+
+확정되는 것은 **전송 사실**이고 표의 `Timestamp` 는 **서버가 메시지를 만든 시각**이다 — 사용자가 전송한
+시각이 아니다
+(→ [서버가 반환한 응답의 사본](#서버가-반환한-응답의-사본-팀-최종-기준-2026-10-09)).
+
+또한 같은 Profile 에 전송된 메시지 자체가 남아 있으면, 더 약한 근거인 초안 전이로 Event 를 추가하지 않는다.
 
 **Rule 은 구현돼 있으나 `Scenario_Image.dd` 에서는 근거가 없어 Event 가 0건인 행위**
 
@@ -270,7 +367,8 @@ Rule 별 근거와 한계는 `docs/EVENT_RULES.md`, 코드 구현 상태는 `doc
 `CONVERSATION_DELETE` · `INCOGNITO` (그 이미지에 근거가 없다는 뜻이며 **미구현이 아니다**).
 같은 이미지에서 `CACHE_DELETE` · `HISTORY_DELETE` 는 CANDIDATE / LOW 로 각각 1건 나왔다.
 
-Rule 별 판정 조건과 한계는 `docs/EVENT_RULES.md` §11, 행위별 구현·탐지 상태는 `docs/IMPLEMENTATION_STATUS.md` 에 있다.
+배포된 Rule 목록은 `chatgpt_parser/parser.py` 의 `EVENT_RULES` 이며, Rule 하나하나의 근거·판정 조건·한계는
+`chatgpt_parser/detectors/` 의 해당 Rule 머리 주석에 적혀 있다.
 
 ## 6. 원본 보호 (read-only)
 
@@ -280,13 +378,17 @@ Rule 별 판정 조건과 한계는 `docs/EVENT_RULES.md` §11, 행위별 구현
 - **쿠키 값 / 세션 토큰 / API Key / OAuth `code`·`state` 는 출력·로그·CSV 에 남기지 않는다.** URL query 의 인증 값은 `REDACTED` 로 치환하며, 허용되는 표현은 키 이름 / 존재·부재 / 길이 / SHA-256 일부뿐이다.
 - 계정 이메일 등은 마스킹해 기록한다.
 
-## 7. 문서
+## 7. 더 자세한 내용을 찾는 곳
 
-| 문서 | 내용 |
+별도 문서 폴더는 두지 않는다. Artifact 구조·판정 근거·한계는 모두 해당 코드 머리의 주석에 있다.
+
+| 찾는 것 | 파일 |
 |---|---|
-| `docs/CHATGPT_ARTIFACTS.md` | Artifact 위치·구조·함정, 수동 분석으로 확인된 행위 |
-| `docs/EVENT_RULES.md` | Evidence / Confidence 정책, Rule 별 판정 조건과 한계 |
-| `docs/OUTPUT_SCHEMA.md` | 결과 JSON·CSV 구조 (팀 고정 Schema 아님) |
-| `docs/IMPLEMENTATION_STATUS.md` | 기능별 구현·테스트 상태, 구현하지 않기로 한 행위와 이유 |
-| `docs/TEST_PLAN.md` | 테스트 계획과 실행 결과 |
-| `docs/PARSER_REQUIREMENTS.md` | 요구사항, 판정 원칙 |
+| Artifact 위치·바이너리 구조·함정 | `chatgpt_parser/artifacts/` (Reader 별 머리 주석) |
+| Rule 별 근거·판정 조건·한계 | `chatgpt_parser/detectors/` (Rule 별 머리 주석) |
+| 배포된 Rule 목록 | `chatgpt_parser/parser.py` 의 `EVENT_RULES` |
+| JSON 필드 정의 | `chatgpt_parser/models.py` · 허용 값은 `chatgpt_parser/constants.py` |
+| CSV 컬럼 정의 | 최종 2종 `chatgpt_parser/output/final_csv.py` · debug 5종 `chatgpt_parser/output/debug.py` |
+| 대화·메시지 복구 규칙 | `chatgpt_parser/recovery/conversations.py` |
+| BitLocker 해제 경로 | `chatgpt_parser/bitlocker.py` · `chatgpt_parser/image.py` |
+| 테스트 | `tests/` (`python -B -m unittest discover -s tests`) |

@@ -22,23 +22,19 @@ from ..models import RecoveredConversation, RecoveredMessage
 from ..utils import normalize_timestamp
 
 
-# =============================================================================
-# 9. Evidence Correlation
-# =============================================================================
-# NOT IMPLEMENTED — 서로 다른 Artifact 근거(History + nextauth 등)를 시각 기준으로 묶는 기능.
-# (nextauth.message·accountSwitchSessions Record 는 S5 LOGOUT·S8 ACCOUNT_SWITCH 결과에 자동 연결하지 않는다)
+# 한계: 서로 다른 Artifact 의 근거를 시각으로 묶는 Evidence Correlation 은 하지 않는다.
+# nextauth.message·accountSwitchSessions Record 도 LOGOUT·ACCOUNT_SWITCH 결과에 자동 연결하지 않는다
+# (시간이 가깝다는 것만으로는 같은 행위라고 볼 근거가 되지 않기 때문이다).
 
 
-# =============================================================================
-# 9-1. Conversation Residue Extraction
-# =============================================================================
+# ---- Conversation Residue Extraction -------------------------------------------------------------
 # ArtifactRecord → RecoveredConversation(recovery_status="RESIDUAL_ONLY"). 파일을 읽지 않고, 사용자 행위를 판정하지 않는다.
 #   - 입력: Local Storage conversation-history PUT Record 의 conversation_items (id·title·create_time·update_time 만)
 #   - 같은 (os_user, browser_profile, 대화 ID) 의 여러 버전은 대화 1건으로 묶고 source_artifacts 에 버전별 위치·값을 모두 남긴다.
 #     버전마다 값이 다르면 하나를 고르지 않고 대화 필드를 None + RESIDUAL_VALUE_CONFLICT:<필드> warning
 #     (sequence 가 크면 나중에 기록된 값이지만, 그 값을 "진짜"로 볼 근거는 확인되지 않음).
 #   - DELETE operation 은 대화를 만들거나 없애지 않는다 (Record 로만 남음). CONVERSATION_DELETE 판정 없음.
-#   - messages 는 항상 [] — 메시지 본문 복구(Conversation Message Recovery)는 미구현.
+#   - 이 경로는 messages 를 항상 [] 로 둔다. 메시지 본문 복구는 아래 Cache 대화 응답 경로가 한다.
 #   - History /c/<id> 방문과는 같은 os_user·browser_profile 에서 ID 가 정확히 같을 때만 correlated_record_ids 로 연결한다.
 #     시간이 가깝다는 이유로 연결하지 않는다.
 
@@ -118,9 +114,7 @@ def extract_conversation_residue(
     return conversations
 
 
-# =============================================================================
-# 9-2. Conversation Message Extraction (Cache 대화 API 응답)
-# =============================================================================
+# ---- Conversation Message Extraction (Cache 대화 API 응답) -------------------------------------------
 # Cache Record 의 observed["conversation"] → RecoveredConversation + RecoveredMessage[]. 파일을 읽지 않고, 행위를 판정하지 않는다.
 # 2026-09-15 실제 응답 (6a86d3ee-…) 에서 확인한 구조를 기준으로 한다:
 #   mapping{node_id: {id, parent, children[], message|null}}, 루트 노드 message=null, children 순서 보존, 분기 있음

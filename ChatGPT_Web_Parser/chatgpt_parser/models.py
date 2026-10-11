@@ -20,15 +20,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from .constants import ACTION_STATUSES, ARTIFACT_TYPES, CONFIDENCES, COVERAGE_STATUSES, DEFAULT_BROWSER, DEVICE_ATTRIBUTIONS, DISPLAY_TIMEZONE, EVIDENCE_LEVELS, FINDING_TYPES, INPUT_KINDS, MESSAGE_RECOVERY_STATUSES, PARSER_NAME, PARSER_VERSION, RECOVERY_STATUSES, RULE_VERIFICATIONS, SERVICE, TIMESTAMP_TYPES
 
 
-# =============================================================================
-# 2. Result Models
-# =============================================================================
+# ---- Result Models -------------------------------------------------------------------------------
 # 규칙
-#   - 필드 순서와 이름은 docs/OUTPUT_SCHEMA.md 와 같다 (kw_only 로 순서 유지).
+#   - 필드 순서와 이름이 그대로 JSON·CSV 의 키가 된다 (kw_only 로 순서 유지).
 #   - timestamp_raw / timestamp_utc / timestamp_kst 는 str 또는 None 만 허용한다.
 #     (WebKit µs 같은 큰 정수를 JSON 숫자로 두면 정밀도가 손실될 수 있음)
 #   - 행위 시각이 없으면 timestamp 값을 모두 None 으로 둔다. 없는 시각을 만들지 않는다.
-#   - 변환은 §3 normalize_timestamp() 가 담당한다. 여기서는 값의 형태만 검사한다.
+#   - 변환은 utils.normalize_timestamp() 가 담당한다. 여기서는 값의 형태만 검사한다.
 
 
 def _require_choice(name: str, value: Any, allowed: tuple[str, ...]) -> None:

@@ -19,10 +19,8 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
-# =============================================================================
-# 4. Source Abstraction
-# =============================================================================
-# 목적: 상위 Reader 가 폴더 입력이든 (향후) E01/DD 이미지든 같은 메서드로 파일을 읽게 한다.
+# ---- Source Abstraction --------------------------------------------------------------------------
+# 목적: 상위 Reader 가 폴더 입력이든 E01/DD 이미지든 같은 메서드로 파일을 읽게 한다.
 #   - Source 는 읽기 기능만 제공한다. write / delete / rename / mkdir / move 는 없다.
 #   - 경로는 Source root 기준 상대 경로. '/' 와 '\' 모두 허용. root 밖(.., 절대 경로, 드라이브)은 거부.
 #   - 예외 의미 (Reader 가 Coverage 로 변환할 수 있게 구분)
@@ -62,7 +60,7 @@ def normalize_source_path(path: str) -> str:
 
 
 class Source:
-    """읽기 전용 Source 공통 인터페이스. DirectorySource / (향후) ImageSource 가 같은 메서드를 제공한다."""
+    """읽기 전용 Source 공통 인터페이스. DirectorySource 와 ImageSource 가 같은 메서드를 제공한다."""
 
     kind = "source"
 

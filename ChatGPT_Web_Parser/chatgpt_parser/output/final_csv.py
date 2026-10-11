@@ -22,7 +22,7 @@ from ..artifacts.preferences import PREFERENCES_CLEAR_DATA_KEY
 from ..discovery import _join_source_path
 
 
-# --- 12-2. 최종 사용자용 CSV 2종 ---------------------------------------------
+# ---- 최종 사용자용 CSV 2종 ------------------------------------------------------------------------------
 # 개발·검증용 CSV 5종 (위) 은 그대로 두고, 사람이 바로 읽는 최종 출력 2개를 같은 ParseResult 에서 파생한다.
 #   timeline.csv                → "사용자가 언제 무엇을 했는가"  (팀 행위 분류 체계에 있는 Event 1건 = 1 row, 시각순)
 #   recovered_conversations.csv → "사용자가 LLM 과 어떤 대화를 했는가" (복구된 메시지 1건 = 1 row)
@@ -94,7 +94,7 @@ CSV_TEAM_USER_BEHAVIORS = frozenset({
 #
 # 제외 대상을 이름마다 손으로 적지 않고 팀 목록과 대조해서 만든다 — 목록 밖 이름이 새로 생겨도
 # 통합기의 UNKNOWN_USER_BEHAVIOR 로 새지 않는다. (2026-09-30: FILE_UPLOAD "파일 업로드" 가 그 경우였다.)
-#   CONVERSATION_ACCESS            대화 열람 — 회의에서 개별 삭제 확정 ("무려 29개나, 얘도 그냥 지우는 걸로")
+#   CONVERSATION_ACCESS            대화 열람 — 회의에서 제외 확정 (분석표 기준 건수가 지나치게 많다)
 #   PROFILE_ACCESS                 프로필 화면 접근 — 분석표에 없는 파서 고유 행위
 #   CONVERSATION_REMOVED_FROM_LIST 대화 목록에서 사라짐 — 기존 대화 삭제 판정의 보조 근거로만 남긴다
 #   FILE_UPLOAD                    파일 업로드 — 첨부 MIME 으로 문서/이미지 업로드를 가려 낸다

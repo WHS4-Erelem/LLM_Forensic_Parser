@@ -22,9 +22,7 @@ from .models import _Model, _require_str
 from .source import SourcePathError
 
 
-# =============================================================================
-# 6. Windows / Chrome Discovery
-# =============================================================================
+# ---- Windows / Chrome Discovery ------------------------------------------------------------------
 # Source 구조만 탐색한다. 파일 내용(History 포함)을 읽지 않고, Event 를 만들지 않는다.
 #   - 대상: Google Chrome Stable 만 — Users/<user>/AppData/Local/Google/Chrome/User Data/<profile>
 #     (Chrome Beta·Dev·Canary, Chromium, Edge, Brave, Firefox 는 탐색하지 않는다)
