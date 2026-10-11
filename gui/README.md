@@ -1,4 +1,4 @@
-# ARTINEX — PyQt6 GUI (ERELM LLM Forensic Parser)
+# ARTINEX GUI — 통합 파서(ARTINEX)를 실행하고 결과를 보는 PyQt6 데스크톱 UI
 
 기존 통합 Runner(`integration/llm_forensic.py`)와 파서 6개를 **수정하지 않고** 호출하는 데스크톱 UI다.
 GUI 는 새 포렌식 Parser 가 아니며, 판정·Finding 을 만들지 않는다. 화면에 보이는 값은 모두
