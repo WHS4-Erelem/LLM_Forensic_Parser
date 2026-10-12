@@ -15,6 +15,7 @@
 import argparse
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -22,9 +23,11 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import unicodedata
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -225,6 +228,36 @@ def code_hash(cwd):
 
 def _text(v):
     return v.decode("utf-8", "replace") if isinstance(v, bytes) else (v or "")
+
+
+@contextmanager
+def heartbeat(prefix, restore=None, enabled=None, interval=1.0):
+    """블로킹 구간(해시 계산, 파서 subprocess) 동안 1초마다 같은 줄에 경과 시간을 덧써 '돌고 있음'을 보인다.
+    터미널에서만 동작한다 — GUI(QProcess)·파일 리다이렉트에는 아무것도 내보내지 않아 기존 콘솔 파싱이 그대로 유효하다.
+    끝나면 그 줄을 지우고 restore(기본: prefix)를 다시 찍어 뒤따르는 출력이 원래 자리에 이어진다."""
+    if enabled is None:
+        enabled = sys.stdout.isatty()
+    if not enabled:
+        yield
+        return
+    restore = prefix if restore is None else restore
+    stop, t0, cols = threading.Event(), time.time(), 0
+
+    def tick():
+        nonlocal cols
+        while not stop.wait(interval):
+            line = "%s %4.0fs 실행 중..." % (prefix, time.time() - t0)
+            cols = max(cols, sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in line))   # 한글은 2칸
+            print("\r" + line, end="", flush=True)
+
+    th = threading.Thread(target=tick, daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join()
+        print("\r" + " " * cols + "\r" + restore, end="", flush=True)
 
 
 def run_parser(p, image, out_dir):
@@ -661,11 +694,13 @@ def _parser_entry(status, run, events, messages, errors, source_rows, inserted):
             "errors": errors[:REPORT_ERROR_LIMIT], "errors_truncated": len(errors) > REPORT_ERROR_LIMIT}
 
 
-def run_one(p, ev, case_dir, db, run_id, report_path):
-    """파서 1개: 실행 → 계약 검사·정규화 → 적재. 반환: (status, 보고서 항목)."""
+def run_one(p, ev, case_dir, db, run_id, report_path, progress=""):
+    """파서 1개: 실행 → 계약 검사·정규화 → 적재. 반환: (status, 보고서 항목). progress: 터미널 heartbeat 에만 붙는 "(2/6)"."""
     out_dir = os.path.join(case_dir, p["name"])
-    print("[Runner] %-16s" % p["name"], end="", flush=True)
-    run = run_parser(p, ev["path"], out_dir)
+    head = "[Runner] %-16s" % p["name"]
+    print(head, end="", flush=True)
+    with heartbeat((head + " " + progress).rstrip(), restore=head):
+        run = run_parser(p, ev["path"], out_dir)
     errors, events, messages, source_rows = list(run["errors"]), [], [], {}
     if not errors:
         try:
@@ -710,7 +745,8 @@ def main(argv=None):
         ap.error("-i/--image 가 필요합니다")
 
     try:
-        ev = evidence_manager(args.image, quick=args.quick)
+        with heartbeat("[Evidence] 해시 계산 중", restore=""):
+            ev = evidence_manager(args.image, quick=args.quick)
     except ValueError as exc:
         print("[Evidence] 실패:", exc, file=sys.stderr)
         return 2
@@ -765,8 +801,8 @@ def main(argv=None):
         deleted["events"], deleted["messages"], " · 이전 버전 스키마 열 이름 변환" if migrated else ""))
 
     statuses = Counter()
-    for p in parsers:
-        status, report["parsers"][p["name"]] = run_one(p, ev, case_dir, db, run_id, report_path)
+    for i, p in enumerate(parsers, 1):
+        status, report["parsers"][p["name"]] = run_one(p, ev, case_dir, db, run_id, report_path, "(%d/%d)" % (i, len(parsers)))
         statuses[status] += 1
     failed = len(parsers) - statuses["success"]
 
@@ -925,6 +961,14 @@ def self_test():
         _self_test_contract(td)
         _self_test_db(td)
         _self_test_end_to_end(td, raw, ev["evidence_id"])
+    # heartbeat: 터미널이면 경과 시간을 같은 줄에 덧쓰고 끝나면 지운 뒤 restore 로 돌아온다. 터미널이 아니면 아무 출력도 없다
+    for enabled, want_tick in ((True, True), (False, False)):
+        buf = io.StringIO()
+        with redirect_stdout(buf), heartbeat("[X] 작업 중", restore="[X]", enabled=enabled, interval=0.05):
+            time.sleep(0.2)
+        got = buf.getvalue()
+        assert ("실행 중" in got) is want_tick, repr(got)
+        assert got.endswith("\r" + " " * 28 + "\r[X]" if want_tick else ""), repr(got)   # "[X] 작업 중    0s 실행 중..." 은 28칸
     print("self-test ok")
     return 0
 
