@@ -1,6 +1,6 @@
 ﻿# ARTINEX — Autopsy 애드온 설치 스크립트 (한 번 실행으로 실행 환경 준비 + 설치)
-#   1. 저장소 루트·파서 진입점 확인   2. 통합파서 전용 가상환경(integration\.venv312) 검사 → 없거나 의존성 부족이면 uv 준비 후
-#      integration\setup.ps1 로 환경 생성 → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
+#   1. 저장소 루트·파서 진입점 확인   2. 통합파서 전용 가상환경(integration\.venv312) 검사 → 없거나 검사 실패면 기존 환경을 지우고
+#      integration\setup.ps1 로 환경 생성(uv 설치 포함) → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
 #   5. 모듈 복사 + artinex_config.json 갱신(기존 설정 보존)
 # 사용: powershell -ExecutionPolicy Bypass -File setup.ps1 [-PluginDir <Autopsy python_modules 폴더>]
 #   자동으로 정할 수 없는 경로(플러그인 폴더 후보 0개·여러 개)만 묻는다.
@@ -34,18 +34,24 @@ function Test-Venv {   # 전용 가상환경을 쓸 수 있으면 $true (사유�
 }
 if (-not (Test-Venv)) {
     Write-Host "  $py : $script:why - preparing it with integration\setup.ps1"
-    # uv 가 없으면 공식 설치 스크립트로 먼저 설치하고, 설치 직후 이 프로세스에서도 쓰게 PATH 에 넣는다.
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-        Write-Host "  uv not found - installing with the official installer (https://astral.sh/uv/install.ps1)"
-        $ErrorActionPreference = "Continue"
-        & powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
-        $ErrorActionPreference = "Stop"
-        foreach ($d in @($env:UV_INSTALL_DIR, $env:XDG_BIN_HOME, (Join-Path $env:USERPROFILE ".local\bin"), (Join-Path $env:USERPROFILE ".cargo\bin"))) {
-            if ($d -and (Test-Path (Join-Path $d "uv.exe"))) { $env:Path = "$d;$env:Path"; break }
+    # integration\setup.ps1 은 .venv312 가 있으면 다시 만들지 않고 패키지만 맞춘다. Python 버전이 다르거나 손상된 환경은
+    # 그대로 남으므로, 검사에 실패한 기존 환경은 먼저 지운다. 지우는 대상은 이 저장소의 integration\.venv312 하나뿐이다.
+    $venv = Join-Path $repo "integration\.venv312"
+    if (Test-Path -LiteralPath $venv) {
+        $item = Get-Item -LiteralPath $venv -Force
+        $expected = [IO.Path]::Combine([IO.Path]::GetFullPath((Join-Path $repo "integration")), ".venv312")
+        if (-not $item.PSIsContainer -or $item.FullName.TrimEnd("\") -ne $expected) {
+            throw "refusing to delete unexpected path: $($item.FullName) (expected $expected). Plugin not installed."
         }
-        if (-not (Get-Command uv -ErrorAction SilentlyContinue)) { throw "uv installation failed (network or policy?). Plugin not installed." }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {   # 정션·링크면 연결된 원본 폴더 내용까지 지워질 수 있다
+            throw "$venv is a junction or symbolic link - remove it yourself, then run again. Plugin not installed."
+        }
+        Write-Host "  removing $venv"
+        try { Remove-Item -LiteralPath $venv -Recurse -Force }
+        catch { throw "could not delete $venv ($_). Close programs using it, then run again. Plugin not installed." }
+        if (Test-Path -LiteralPath $venv) { throw "could not delete $venv completely. Close programs using it, then run again. Plugin not installed." }
     }
-    $env:UV_VENV_CLEAR = "1"                 # 의존성이 깨진 기존 .venv312 를 묻지 않고 다시 만든다
+    # uv 가 없으면 integration\setup.ps1 이 공식 설치 스크립트로 먼저 설치한다
     $ErrorActionPreference = "Continue"
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "integration\setup.ps1")
     $code = $LASTEXITCODE
