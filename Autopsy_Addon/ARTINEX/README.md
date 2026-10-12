@@ -43,8 +43,10 @@ powershell -ExecutionPolicy Bypass -File <저장소>\Autopsy_Addon\setup.ps1
    가상환경이고 Python 3.12 이며 파서 의존성의 주요 모듈(pytsk3·pyewf·brotli·cramjam·zstandard·pycryptodome·ccl_simplesnappy·dissect.ntfs·dissect.fve·
    dissect.evidence·dissect.volume·ccl_chromium_reader)을 import 할 수 있는지 검사합니다. requirements 의 버전까지 대조하지는 않습니다.
    - 검사를 통과하면 그대로 씁니다 (다시 설치하지 않음).
-   - 가상환경이 없거나 검사에 실패하면 `integration\setup.ps1` 을 불러 `.venv312` 를 다시 만듭니다. 그 스크립트에 필요한 `uv` 가 없으면 공식 설치 스크립트
-     (`https://astral.sh/uv/install.ps1`)로 설치하고 현재 프로세스 PATH 에 넣습니다.
+   - 가상환경이 없거나 검사에 실패하면 `integration\setup.ps1` 을 불러 `.venv312` 를 만듭니다. 검사에 실패한 기존 환경(Python 버전이 다르거나 손상됨)은
+     먼저 지웁니다 — `integration\setup.ps1` 은 `.venv312` 가 있으면 다시 만들지 않고 패키지만 맞추기 때문입니다. 지우는 대상은 이 저장소의
+     `integration\.venv312` 하나뿐이며, 경로가 다르거나 정션·링크이거나 지우지 못하면 **설치하지 않고** 끝납니다.
+     `uv` 가 없으면 `integration\setup.ps1` 이 공식 설치 스크립트(`https://astral.sh/uv/install.ps1`)로 먼저 설치합니다.
    - 준비 뒤 종료 코드와 실제 가상환경·의존성을 다시 검사하고, 실패하면 원인을 표시하고 **설치하지 않고** 끝납니다.
 3. Autopsy 플러그인 폴더를 찾습니다: 설치된 Autopsy 의 `etc\autopsy.conf` `default_userdir` + `python_modules`. 그것으로 못 찾을 때만 `%APPDATA%\autopsy` 아래를 찾고,
    후보가 0개이거나 여러 개일 때만 묻습니다. 직접 주려면 `-PluginDir <python_modules 폴더>`.
@@ -58,7 +60,10 @@ powershell -ExecutionPolicy Bypass -File <저장소>\Autopsy_Addon\setup.ps1
 
 예외 상황
 - 네트워크가 막혀 `uv`·패키지를 받을 수 없으면 환경 준비가 실패하고 설치를 멈춥니다. 네트워크가 되는 곳에서 `integration\setup.ps1` 을 실행해 `.venv312` 를 준비한 뒤 다시 실행합니다.
-- `integration\setup.ps1` 은 기존 `.venv312` 를 지우고 새로 만듭니다 — 검사를 통과하지 못한 환경일 때만 부릅니다.
+- `uv` 가 없는 PC 에서 보안 프로그램(예: AhnLab Safe Transaction, 진단명 `Execution/MDP.Powershell.M1201`)이 '위협 행위 차단' 을 띄우고 설치가 실패할 수 있습니다.
+  uv 공식 설치 스크립트를 받아 실행한 PowerShell 이 이어서 Python 을 띄우는 것을 행동 기반으로 막는 것입니다. uv 설치는 이미 끝난 상태이므로 **새 PowerShell 창에서 setup.ps1 을 다시 실행**하면
+  uv 설치 단계를 건너뛰어 통과합니다. 처음부터 피하려면 `winget install astral-sh.uv` 등으로 uv 를 먼저 설치한 뒤 실행합니다.
+- 기존 `.venv312` 는 검사를 통과하지 못했을 때만 지우고 다시 만듭니다. 다른 프로그램(실행 중인 Autopsy·통합 실행기 등)이 그 Python 을 쓰고 있어 지우지 못하면, 그 프로그램을 닫고 다시 실행합니다.
 - 설정 파일 위치: `<python_modules>\ARTINEX\artinex_config.json` (`python`, `repo_root`, 선택 `work_dir`(대체 작업 위치)·`keep_export`). 환경변수 `ARTINEX_PYTHON`·`ARTINEX_REPO_ROOT`·`ARTINEX_WORK_DIR` 가 있으면 그 값이 우선합니다.
 - 저장소 안의 `Autopsy_Addon/ARTINEX` 를 그대로 플러그인 폴더로 쓰면(정션 등) 설정 없이 저장소와 `integration/.venv312` 를 씁니다.
 
@@ -300,8 +305,10 @@ Windows 가 ADS 를 지워, Claude Web 의 Zone.Identifier 근거가 빠졌습�
 | 상황 | 방법 | 결과 |
 |---|---|---|
 | 0.4.1: 대체 위치 준비(`C:\artinex_work` 쓰기·ADS 확인), 기존 `work_dir` 보존, `python`·`repo_root` 갱신 | 실제 저장소·Autopsy 설치 | 통과 |
-| 전용 가상환경만 사용(없음+준비 실패 → 중단 / 의존성 없음 → 준비·재검사 / 정상 → 재사용), 깨진 설정 JSON → 중단 | 가짜 저장소 (0.4.0 에서 시험, 해당 코드는 바뀌지 않음) | 통과 |
-| `uv` 없음 → 공식 설치 → 같은 프로세스에서 사용 | PATH 의 uv 를 빼고 임시 `UV_INSTALL_DIR` | 통과. uv 가 처음부터 없는 별도 PC 에서는 미검증 |
+| 깨진 설정 JSON → 중단 | 가짜 저장소 (0.4.0 에서 시험, 해당 코드는 바뀌지 않음) | 통과 |
+| 가상환경 없음 → 생성 / 정상 → 재사용(재설치 없음) / Python 3.14 환경·`python.exe` 손상·패키지 누락 → 지우고 3.12 로 재생성, 설정 `python` 경로 기록·기존 `work_dir` 보존 | 가짜 저장소 + 실제 `integration\setup.ps1` | 통과 |
+| `.venv312` 가 정션 → 지우지 않고 중단(연결된 폴더 보존) / 다른 프로세스가 `python.exe` 를 잡고 있어 삭제 실패 → `integration\setup.ps1` 을 부르지 않고 중단 | 가짜 저장소 | 통과 |
+| `uv` 없음 → `integration\setup.ps1` 이 공식 설치 | PATH 의 uv 를 빼고 임시 사용자 폴더 | uv 설치까지 통과. AhnLab Safe Transaction 이 켜진 PC 에서는 마지막 import 확인이 강제 종료되어 실패('설치' 의 예외 상황) — uv 가 설치된 상태로 다시 실행하면 통과 |
 
 미검증: 실제 여러 볼륨 이미지(다른 볼륨 History 대상·모호한 후보는 단위 검증만), 실제 이미지에서 2만 개 제한·1GB 상한 초과(두 이미지 모두 상한 안 — 단위 검증만),
 사건 폴더와 대체 위치가 모두 불가한 실제 환경(단위 검증만).
@@ -312,3 +319,10 @@ Windows 가 ADS 를 지워, Claude Web 의 Zone.Identifier 근거가 빠졌습�
 - `artinex_config.example.json` — 설정 예시. `setup.ps1` 이 `artinex_config.json` 을 만들고 갱신한다 (PC마다 다른 경로라 저장소에는 예시만 둔다)
 - `../setup.ps1` — 환경 준비·설치 스크립트
 - `README.md` — 이 문서
+
+## 라이선스
+
+ARTINEX 자체 작성 코드(이 모듈, 파서, 통합 실행기)는 **AGPL-3.0-or-later**(GNU Affero General Public License v3.0 이상)로 배포한다.
+Copyright (C) 2026 WHS4-Erelem contributors. 라이선스 전문은 저장소 최상위 [`LICENSE`](../../LICENSE).
+
+`setup.ps1` 이 설치하는 외부 라이브러리(pytsk3, libewf-python, dissect.*, ccl_chromium_reader 등)는 ARTINEX 에 포함되지 않으며, 각자의 라이선스와 저작권 고지를 따른다.

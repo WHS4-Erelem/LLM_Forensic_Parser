@@ -50,3 +50,10 @@ python validation\verify_merged.py --timeline out\<evidence_id>\timeline.csv --k
 - **분석 결과는 커밋하지 않는다.** `out/`, 병합 CSV, `unified.db`, 디스크 이미지는 `.gitignore` 로 막혀 있다. 복원된 대화 원문과 계정 식별자가 그대로 들어 있기 때문이다.
 - 통합기는 파서 코드를 수정하지 않는다. 파서 실행 방법은 `integration/parsers.json` 에만 적는다.
 - 파서가 쓴 원본 값은 덮어쓰지 않고, 정규화·출처(provenance) 열을 뒤에 덧붙인다.
+
+## 라이선스
+
+ARTINEX 자체 작성 코드(파서 6종, 통합 실행기, GUI, Autopsy 애드온)는 **AGPL-3.0-or-later**(GNU Affero General Public License v3.0 이상)로 배포한다.
+Copyright (C) 2026 WHS4-Erelem contributors. 라이선스 전문은 [`LICENSE`](LICENSE).
+
+`setup.ps1` 이 설치하는 외부 라이브러리(pytsk3, libewf-python, dissect.*, ccl_chromium_reader, PyQt6 등)는 ARTINEX 에 포함되지 않으며, 각자의 라이선스와 저작권 고지를 따른다.
