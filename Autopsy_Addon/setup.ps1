@@ -115,7 +115,7 @@ else { Write-Host "[4/5] fallback work location: $fallback - not writable or no 
 
 # 5. 설치: 모듈 파일만 복사 (파서는 저장소에 그대로 두고 경로만 적는다). 이름 바꾸기 전 모듈(ERELM_*)은 같은 일을 하므로 지운다.
 New-Item -ItemType Directory -Force $dest | Out-Null
-Copy-Item (Join-Path $module "ARTINEX.py"), (Join-Path $module "README.md") $dest -Force
+Copy-Item (Join-Path $module "ARTINEX.py") $dest -Force
 Get-ChildItem $dest -Filter "*.class" -ErrorAction SilentlyContinue | Remove-Item -Force
 foreach ($name in "ERELM_LLM_Parser", "ERELM_ChatGPT_Desktop") {
     $old = Join-Path $PluginDir $name
