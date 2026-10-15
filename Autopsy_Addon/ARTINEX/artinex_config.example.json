@@ -1,4 +1,5 @@
 {
   "python": "C:/path/to/llm-parser/integration/.venv312/Scripts/python.exe",
-  "repo_root": "C:/path/to/llm-parser"
+  "repo_root": "C:/path/to/llm-parser",
+  "language": "en"
 }

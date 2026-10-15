@@ -1,11 +1,14 @@
 ﻿# ARTINEX — Autopsy 애드온 설치 스크립트 (한 번 실행으로 실행 환경 준비 + 설치)
 #   1. 저장소 루트·파서 진입점 확인   2. 통합파서 전용 가상환경(integration\.venv312) 검사 → 없거나 검사 실패면 기존 환경을 지우고
 #      integration\setup.ps1 로 환경 생성(uv 설치 포함) → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
-#   5. 모듈 복사 + artinex_config.json 갱신(기존 설정 보존)
-# 사용: powershell -ExecutionPolicy Bypass -File setup.ps1 [-PluginDir <Autopsy python_modules 폴더>]
+#   5. 모듈 복사 + artinex_config.json 갱신(기존 설정 보존, 언어는 이번 값으로)
+# 사용: powershell -ExecutionPolicy Bypass -File setup.ps1 [-PluginDir <Autopsy python_modules 폴더>] [-Language en|ko]
+#   -Language: Autopsy 결과 표시 언어. 생략하면 en (영어), 한국어는 ko.
 #   자동으로 정할 수 없는 경로(플러그인 폴더 후보 0개·여러 개)만 묻는다.
-param([string]$PluginDir)
+param([string]$PluginDir, [string]$Language = "en")
 $ErrorActionPreference = "Stop"
+$Language = $Language.Trim().ToLowerInvariant()
+if ($Language -notin @("en", "ko")) { throw "unsupported -Language '$Language' (use en or ko). Plugin not installed." }   # 아무것도 바꾸기 전에 멈춘다
 $addon = $PSScriptRoot
 $repo = Split-Path $addon -Parent
 $module = Join-Path $addon "ARTINEX"
@@ -96,7 +99,7 @@ $cfgPath = Join-Path $dest "artinex_config.json"
 $oldCfg = Join-Path $PluginDir "ERELM_LLM_Parser\erelm_config.json"   # 이름 바꾸기 전(ERELM) 설치본의 설정 — 새 설정이 없으면 옮겨 온다
 $cfg = [ordered]@{}
 $from = if (Test-Path $cfgPath) { $cfgPath } elseif (Test-Path $oldCfg) { $oldCfg } else { $null }
-if ($from) {                                 # 기존 설정 보존 — python·repo_root 만 갱신한다
+if ($from) {                                 # 기존 설정 보존 — python·repo_root·language 만 갱신한다
     try { (Get-Content $from -Raw -Encoding UTF8 | ConvertFrom-Json).psobject.Properties | ForEach-Object { $cfg[$_.Name] = $_.Value } }
     catch { throw "existing config is not valid JSON, fix or remove it: $from ($_)" }
 }
@@ -123,9 +126,11 @@ foreach ($name in "ERELM_LLM_Parser", "ERELM_ChatGPT_Desktop") {
 }
 $cfg.python = $py
 $cfg.repo_root = $repo
+$cfg.language = $Language
 $cfg | ConvertTo-Json | Out-File $cfgPath -Encoding utf8
 Write-Host "[5/5] installed $dest"
 Write-Host ""
+Write-Host "  language    : $Language"
 Write-Host "  python      : $py"
 Write-Host "  plugin      : $dest"
 Write-Host "  config      : $cfgPath"

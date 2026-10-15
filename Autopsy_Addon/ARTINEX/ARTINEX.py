@@ -38,7 +38,7 @@ from org.sleuthkit.autopsy.ingest.IngestModule import IngestModuleException
 from org.sleuthkit.datamodel import BlackboardArtifact, BlackboardAttribute, TimelineEventType, TskData
 
 MODULE_NAME = "ARTINEX"
-MODULE_VERSION = "0.4.1"
+MODULE_VERSION = "0.4.2"
 MODULE_DIR = os.path.dirname(os.path.abspath(inspect.getsourcefile(lambda: 0)))
 PARSER_TIMEOUT_SEC = 3600                  # integration/parsers.json 의 최대 timeout_sec
 ERRORS = (Exception, java.lang.Exception)  # Jython 에서 Java 예외는 Python Exception 의 하위가 아니다 — 둘 다 잡아야 한 파일 오류가 전체를 멈추지 않는다
@@ -142,7 +142,6 @@ PARSER_NTFS = dict((p["name"], p.get("ntfs", ())) for p in PARSERS)
 # NTFS 메타파일을 원본 그대로 볼륨 루트에 둔다 (1GB 초과만 제외). 그것을 읽는 파서(PARSERS ntfs)를 그 볼륨에서 돌릴 때만 꺼낸다.
 NTFS_META = (("$MFT", "/"), ("$UsnJrnl:$J", "/$Extend/"))
 NTFS_META_MAX_BYTES = 1024 * 1024 * 1024
-BIG_WARNING = u"불완전 입력: $MFT 또는 $J가 1GB 상한을 초과하여 분석 입력에서 제외됨"
 # 내용은 꺼내지 않고 메타데이터(MFT 번호·순번·시각)만 _host_metadata.json 에 넘기는 폴더: (이름, 부모, 실행 근거가 되는 파서)
 META_DIR_QUERIES = (
     ("OpenAI.Codex_%", "/Program Files/WindowsApps/", "chatgpt_desktop"),   # 패키지 폴더 = 설치 행 (설치 파일이 없어도 나온다)
@@ -159,8 +158,6 @@ META_DIR_QUERIES = (
 META_FILE_PARENTS = ("/Downloads/", "/Desktop/", "/Documents/")
 META_FILE_LIMIT = 20000                    # ponytail: 저장 위치 3곳·2만 개 상한. 다른 드라이브·폴더 저장은 놓친다 → 필요 시 파서가 요청 목록을 내는 2단계로
 META_FILE_READERS = ("~chatgpt_desktop", "~claude_web")
-META_LIMIT_WARNING = u"불완전 입력: Downloads·Desktop·Documents 메타데이터가 %d개 제한을 초과하여 일부 수집되지 않음" % META_FILE_LIMIT
-NOT_RUN_REASON = u"실행 조건에 해당하는 관련 입력을 찾지 못함"
 FALLBACK_WORK_DIR = r"C:\artinex_work"     # 사건 폴더가 쓰기·ADS 불가일 때의 대체 작업 위치 (설정 work_dir 로 바꿀 수 있음)
 HOST_META_NAME = "_host_metadata.json"     # 파서들(DirectoryVfs 등)과 약속한 파일명
 DELETED_DIR = "_deleted"                   # 삭제 파일 트리 (Claude Desktop parser/vfs.py DirectoryVfs 와 약속). 다른 파서는 볼륨 루트의 Users/… 부터 찾으므로 보지 않는다
@@ -178,6 +175,463 @@ CONV_HEADER = [u"Model", u"timestamp", u"conversation_uuid", u"conversation_titl
                u"message order", u"role", u"content", u"Artifact_path"]
 TS_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{6} KST|-)$")
 VERDICTS = (u"확정", u"의심")
+
+# 표시 언어 — artinex_config.json 의 language (setup.ps1 -Language). 없거나 모르는 값이면 영어.
+# 번역은 Autopsy 에 올리는 표시값(Blackboard·Timeline·Inbox·영문 Report 사본)에만 한다. 파서 CSV·JSON 은 그대로 둔다.
+LANGUAGES = ("en", "ko")
+DEFAULT_LANGUAGE = "en"
+MESSAGES = {   # 애드온이 만드는 한국어 안내 (그 밖의 Inbox 문구는 원래 영어)
+    "ko": {"big": u"불완전 입력: $MFT 또는 $J가 1GB 상한을 초과하여 분석 입력에서 제외됨",
+           "meta_limit": u"불완전 입력: Downloads·Desktop·Documents 메타데이터가 %d개 제한을 초과하여 일부 수집되지 않음" % META_FILE_LIMIT,
+           "not_run": u"실행 조건에 해당하는 관련 입력을 찾지 못함"},
+    "en": {"big": u"incomplete input: $MFT or $J exceeds the 1 GB limit and was excluded from the analysis input",
+           "meta_limit": u"incomplete input: Downloads/Desktop/Documents metadata exceeded the %d-file limit; some was not collected"
+                         % META_FILE_LIMIT,
+           "not_run": u"no related input matching the run conditions was found"},
+}
+VERDICT_EN = {u"확정": u"Confirmed", u"의심": u"Suspected"}
+BEHAVIOR_EN = {   # integration/user_behaviors.txt 의 행위명
+    u"로그인": u"Login", u"로그아웃": u"Logout", u"계정 전환": u"Account switch", u"계정 이름 변경": u"Account name change",
+    u"애플리케이션 설치": u"Application install", u"애플리케이션 실행": u"Application launch",
+    u"애플리케이션 삭제": u"Application uninstall", u"정상 종료": u"Normal exit", u"강제 종료": u"Forced exit",
+    u"새로운 대화 생성": u"New conversation created", u"기존 대화 삭제": u"Conversation deleted", u"대화 수정": u"Conversation edited",
+    u"대화 재시도": u"Conversation retried", u"대화 공유": u"Conversation shared", u"공유 링크 생성": u"Share link created",
+    u"대화 데이터 Export": u"Conversation data export", u"사용자 프롬프트 입력/전송": u"User prompt input/send",
+    u"사용자 프롬프트 삭제": u"User prompt deleted", u"임시 채팅 사용": u"Temporary chat used",
+    u"이미지 업로드": u"Image upload", u"이미지 업로드 삭제": u"Image upload deleted", u"문서 업로드": u"Document upload",
+    u"문서 업로드 삭제": u"Document upload deleted", u"문서 다운로드": u"Document download",
+    u"이미지 생성 요청": u"Image generation request", u"생성 이미지 다운로드": u"Generated image download",
+    u"생성 이미지 다운로드 삭제": u"Generated image download deleted", u"모델 변경": u"Model change",
+    u"모델 다운로드 내역": u"Model download history", u"브라우저 시크릿 모드": u"Browser incognito mode",
+    u"방문기록 삭제": u"Browsing history deleted", u"캐시 삭제": u"Cache deleted",
+}
+# Behavior_details '<흔적 성격>_<핵심 내용>' 의 <흔적 성격> — 파서 6종이 만드는 고정 문구 (각 파서의 Behavior_details 생성 코드 기준).
+# Claude Desktop·LM Studio 는 행위명 자체를 앞부분으로 쓰므로 BEHAVIOR_EN 도 포함한다.
+DETAIL_HEAD_EN = dict(BEHAVIOR_EN)
+_CX_HEAD_EN = {
+    # ChatGPT Desktop (cxparser user_action.action)
+    u"미확정": u"Undetermined", u"프롬프트 전송": u"Prompt sent", u"프롬프트 전송(채팅 모드)": u"Prompt sent (chat mode)",
+    u"프롬프트 전송(서버 요청)": u"Prompt sent (server request)", u"프롬프트 전송 직전 검사 요청": u"Pre-send prompt check request",
+    u"애플리케이션 설치(패키지 쓰기 완료)": u"Application install (package write completed)",
+    u"애플리케이션 실행(프로세스 시작)": u"Application launch (process start)",
+    u"애플리케이션 실행(자동 재시작)": u"Application launch (automatic restart)",
+    u"애플리케이션 종료(프로세스 로그 끝)": u"Application exit (end of process log)",
+    u"생성 이미지 저장": u"Generated image saved", u"문서 저장(새 파일)": u"Document saved (new file)",
+    u"이미지 저장(새 파일)": u"Image saved (new file)", u"파일 저장(새 파일, 종류 미확인)": u"File saved (new file, type unconfirmed)",
+    u"ChatGPT 대화 참조 작업 요청(채팅→작업 모드 인계)": u"Task request referencing a ChatGPT conversation (chat → task mode handoff)",
+    u"이미지 생성 시도(도구 호출)": u"Image generation attempt (tool call)", u"이미지 생성 결과 수신": u"Image generation result received",
+    u"새 대화 창 열기 요청": u"New conversation window open request", u"새 대화 생성": u"New conversation created",
+    u"새 대화 생성(대화 목록 등재)": u"New conversation created (added to conversation list)",
+    u"새 대화 생성(채팅 모드)": u"New conversation created (chat mode)",
+    u"새 대화 생성(rollout 파일 생성)": u"New conversation created (rollout file created)",
+    u"대화 수정(프롬프트 편집)": u"Conversation edited (prompt edit)", u"대화 재시도(응답 재생성)": u"Conversation retried (response regenerated)",
+    u"대화 보관/삭제": u"Conversation archived/deleted", u"대화 파일 삭제": u"Conversation file deleted",
+    u"첨부 업로드(채팅 모드)": u"Attachment upload (chat mode)", u"첨부 파일 업로드 흔적": u"Attachment upload trace",
+    u"파일 내려받기(채팅 모드)": u"File download (chat mode)",
+    u"로그인(인증 상태 변경 로그)": u"Login (auth state change log)", u"로그인(auth.json 생성)": u"Login (auth.json created)",
+    u"로그아웃(auth.json 삭제)": u"Logout (auth.json deleted)", u"계정 전환(auth.json 재생성)": u"Account switch (auth.json recreated)",
+}
+DETAIL_HEAD_EN.update(_CX_HEAD_EN)
+DETAIL_HEAD_EN.update({
+    # ChatGPT Web (final_csv CSV_BEHAVIOR_REASONS) — 이전 버전 출력의 문구 포함
+    u"로그인 URL 방문 흔적": u"Login URL visit trace", u"로그아웃 URL 방문": u"Logout URL visit",
+    u"재인증/계정 전환 흔적": u"Re-authentication/account switch trace", u"계정 이름 변경 흔적": u"Account name change trace",
+    u"대화 생성 기록(첫 메시지 전송 후 대화 URL 확정)": u"Conversation creation record (conversation URL fixed after first message sent)",
+    u"대화 생성 기록": u"Conversation creation record", u"대화 삭제 요청/이벤트": u"Conversation delete request/event",
+    u"동일 사용자 메시지 아래 응답 분기": u"Response branch under the same user message",
+    u"사용자 메시지 전송": u"User message sent", u"프롬프트 작성 흔적(전송 미확인)": u"Prompt draft trace (send unconfirmed)",
+    u"다운로드 시작 기록": u"Download start record", u"다운로드 완료 기록": u"Download completed record",
+    u"이미지 생성 요청 기록": u"Image generation request record", u"공유 링크 생성 기록": u"Share link creation record",
+    u"모델 선택 값 변경": u"Model selection value changed", u"임시 대화 객체": u"Temporary conversation object",
+    u"시크릿 창 표식": u"Incognito window marker", u"대화 데이터 Export 요청 기록": u"Conversation data export request record",
+    u"방문 기록 결손 흔적": u"Browsing history gap trace", u"캐시 삭제 설정 흔적": u"Cache deletion setting trace",
+    u"대화 화면 방문 기록": u"Conversation page visit record", u"대화 목록에서 사라진 대화": u"Conversation missing from conversation list",
+    u"프로필 화면 방문 기록": u"Profile page visit record", u"업로드 첨부 기록": u"Upload attachment record",
+    u"업로드 첨부 삭제 기록": u"Upload attachment deletion record", u"세션 목록의 최근 로그인 기록": u"Recent login record in session list",
+    # Claude Web (analysis/detectors.py nature)
+    u"Export 설정 화면 접근(완료 미확인)": u"Export settings page access (completion unconfirmed)",
+    u"Export 요청/아카이브 확인": u"Export request/archive confirmed", u"USN 삭제 기록": u"USN deletion record",
+    u"USN Cache 파일 일괄 삭제(사용자 의도 미확인)": u"USN bulk Cache file deletion (user intent unconfirmed)",
+    u"공유 링크 흔적(신규 생성·시각 미확인)": u"Share link trace (new creation and time unconfirmed)",
+    u"공유 스냅샷 객체": u"Shared snapshot object", u"공유 스냅샷 객체(생성 시각 미상)": u"Shared snapshot object (creation time unknown)",
+    u"공유 실행 후 링크 복사(생성 시각 미상)": u"Link copied after sharing (creation time unknown)",
+    u"대화 내 모델 변경(변경 반영 시각 기준)": u"In-conversation model change (time the change took effect)",
+    u"로그아웃·재인증 후 다른 조직 계정의 세션 시작": u"Session started for a different organization account after logout/re-authentication",
+    u"메시지 첨부파일 제거": u"Message attachment removed", u"모델 선택 이벤트": u"Model selection event",
+    u"문서 다운로드 동작(저장 완료 미확인)": u"Document download action (save completion unconfirmed)",
+    u"사용자 메시지 내용 수정": u"User message content edited", u"사용자 메시지 전송 이벤트": u"User message sent event",
+    u"사용자 메시지 전송 이벤트(초안 길이 일치)": u"User message sent event (draft length matches)",
+    u"사용자 재시도 실행": u"User retry executed", u"동일 부모 아래 사용자 메시지 분기": u"User message branch under the same parent",
+    u"새 대화 URL 최초 방문(생성 객체 미확인)": u"First visit to new conversation URL (creation object unconfirmed)",
+    u"생성 이미지 파일 응답과 연결된 메시지 전송(대화 트리 미확인)":
+        u"Message sent linked to a generated image file response (conversation tree unconfirmed)",
+    u"생성 이미지 결과 객체": u"Generated image result object",
+    u"임시 대화 객체(is_temporary=true)": u"Temporary conversation object (is_temporary=true)",
+    u"임시 채팅 URL 접근 흔적(대화 미확인)": u"Temporary chat URL access trace (conversation unconfirmed)",
+    u"임시 채팅 메시지 전송 이벤트(is_incognito=true)": u"Temporary chat message sent event (is_incognito=true)",
+    u"전송 메시지 첨부": u"Attachment on sent message", u"휴지통 이동 기록": u"Moved to Recycle Bin record",
+    u"로그인 인증 흐름 흔적(인증 완료 미확인)": u"Login authentication flow trace (authentication completion unconfirmed)",
+    u"로그인 인증 흐름 후 인증 페이지 진입": u"Authenticated page reached after login flow",
+    u"로그인 인증 흐름 후 인증 페이지 진입(세션 생성 기록 미확인)":
+        u"Authenticated page reached after login flow (session creation record unconfirmed)",
+    u"다운로드 시도 흔적(완료 미확인)": u"Download attempt trace (completion unconfirmed)",
+    # Gemini Web (_timeline_action_detail)
+    u"로그인 URL 방문 흔적(인증 완료 미확인)": u"Login URL visit trace (authentication completion unconfirmed)",
+    u"magic-link 인증 URL 방문": u"Magic-link authentication URL visit", u"로그아웃 시각 기록": u"Logout time record",
+    u"재인증 이벤트와 복수 계정 컨텍스트": u"Re-authentication event with multiple account contexts",
+    u"복수 계정 컨텍스트(전환 순서/실행 미확인)": u"Multiple account contexts (switch order/execution unconfirmed)",
+    u"신규 대화 후보(History 최초 관찰, 생성 직접 증거 미확인)":
+        u"New conversation candidate (first seen in History, no direct creation evidence)",
+    u"대화 삭제 이벤트/요청 근거": u"Conversation delete event/request evidence",
+    u"대화 수정 이벤트/메시지 관계 근거": u"Conversation edit event/message relation evidence",
+    u"응답 재시도/재생성 이벤트 근거": u"Response retry/regeneration event evidence",
+    u"대화 관련 semantic/UI marker(행위 실행 미확인)": u"Conversation-related semantic/UI marker (action execution unconfirmed)",
+    u"프롬프트/전송 라벨 공존 흔적(실제 전송 미확인)": u"Prompt/send label co-occurrence trace (actual send unconfirmed)",
+    u"Gemini 활동/프롬프트 삭제 관련 페이지 접근(삭제 내용 미확인)":
+        u"Gemini activity/prompt deletion page access (deleted content unconfirmed)",
+    u"첨부 제거 이벤트": u"Attachment removal event", u"첨부 제거 관련 marker(실행 미확인)": u"Attachment removal marker (execution unconfirmed)",
+    u"이미지 생성 요청 관련 흔적(결과 객체 미확인)": u"Image generation request trace (result object unconfirmed)",
+    u"공유 URL/스냅샷 관련 흔적(신규 생성 미확인)": u"Share URL/snapshot trace (new creation unconfirmed)",
+    u"대화 내 모델 변경": u"In-conversation model change",
+    u"모델 관련 상태/라벨 흔적(변경 실행 미확인)": u"Model state/label trace (change execution unconfirmed)",
+    u"계정 표시 이름 변경 기록": u"Account display name change record",
+    u"계정 이름 변경 화면 접근(변경 완료 미확인)": u"Account name change page access (change completion unconfirmed)",
+    u"임시 채팅 상태/이벤트 근거": u"Temporary chat state/event evidence",
+    u"임시 채팅 관련 semantic/UI marker(사용 실행 미확인)": u"Temporary chat semantic/UI marker (use unconfirmed)",
+    u"시크릿/Off-the-record 관련 로컬 흔적(사용 사실 단독 확정 불가)":
+        u"Incognito/off-the-record local trace (use cannot be confirmed on its own)",
+    u"방문기록 삭제 관련 흔적(삭제 실행/범위 추가 검증 필요)":
+        u"Browsing history deletion trace (execution/scope needs further verification)",
+    u"Cache 파일 일괄 삭제/감소 흔적(사용자 의도 미확인)": u"Bulk Cache file deletion/decrease trace (user intent unconfirmed)",
+    u"캐시 삭제 관련 흔적(실제 삭제 실행/범위 추가 검증 필요)":
+        u"Cache deletion trace (actual execution/scope needs further verification)",
+    u"Gemini URL 방문 흔적": u"Gemini URL visit trace", u"대화 URL 접근 흔적": u"Conversation URL access trace",
+    u"Google 계정 활동 URL 접근 흔적(Gemini 관련)": u"Google account activity URL access trace (Gemini-related)",
+    u"대화 관련 raw 문자열 흔적(행위 미확인)": u"Conversation-related raw string trace (action unconfirmed)",
+    u"생성 이미지 후보 흔적(Cache raw, 결과 객체 미확인)": u"Generated image candidate trace (raw Cache, result object unconfirmed)",
+    u"다운로드 완료 기록(Gemini 연관 미확인)": u"Download completed record (Gemini association unconfirmed)",
+    u"Recycle Bin 삭제 메타데이터 기록(payload 존재 미확인)": u"Recycle Bin deletion metadata record (payload presence unconfirmed)",
+    u"Gemini raw 문자열 흔적": u"Gemini raw string trace", u"Gemini 관련 설정 흔적": u"Gemini-related settings trace",
+    u"Gemini 관련 설정 값": u"Gemini-related setting value", u"Gemini 쿠키 메타데이터": u"Gemini cookie metadata",
+    # LM Studio (candidate_behavior_details)
+    u"사용자 메시지 수정 기록": u"User message edit record", u"모델 변경 기록": u"Model change record",
+    u"대화 파일 삭제 흔적": u"Conversation file deletion trace", u"Export 완료 기록": u"Export completed record",
+    u"Export 파일 흔적(완료 미확인)": u"Export file trace (completion unconfirmed)", u"응답 재시도 기록": u"Response retry record",
+    u"사용자 메시지 삭제 흔적": u"User message deletion trace", u"로그인 성공 기록": u"Login success record",
+    u"로그아웃 성공 기록": u"Logout success record", u"계정 전환 기록": u"Account switch record",
+    u"로그인 상태 확인": u"Login state confirmed", u"계정 인증 상태 초기화": u"Account authentication state reset",
+    u"계정 전환 흔적": u"Account switch trace", u"설치 기록": u"Install record", u"프로그램 삭제 기록": u"Program uninstall record",
+    u"Prefetch 실행 기록": u"Prefetch execution record", u"애플리케이션 실행 흔적": u"Application launch trace",
+    u"정상 종료 기록": u"Normal exit record", u"정상 종료 흔적": u"Normal exit trace",
+    u"강제 종료 기록": u"Forced exit record", u"강제 종료 흔적": u"Forced exit trace",
+})
+for _ko, _en in ((u"이미지", u"Image"), (u"문서", u"Document")):   # Claude Web·Gemini·LM Studio 의 '{종류} …' 문구
+    DETAIL_HEAD_EN.update({
+        _ko + u" 파일 추가(서버 업로드 완료 미확인)": _en + u" file added (server upload completion unconfirmed)",
+        _ko + u" 업로드 준비 흔적(전송 불확인)": _en + u" upload preparation trace (send unconfirmed)",
+        _ko + u" 서버 업로드 완료(메시지 첨부 전송 미확인)": _en + u" server upload completed (message attachment send unconfirmed)",
+        u"업로드 " + _ko + u" 파일 조회 흔적(첫 조회 시각 기준, 메시지 첨부 전송 미확인)":
+            u"Uploaded " + _en.lower() + u" file retrieval trace (first retrieval time, message attachment send unconfirmed)"})
+# 앞부분에 증거 값이 끼는 문구: (정규식, 영문 틀). 괄호 그룹(모델명·필드명·수)은 그대로 옮긴다.
+DETAIL_HEAD_RULES = tuple((re.compile(rx + u"$"), en) for rx, en in (
+    (u"모델 변경\\(기본 모델 (.+) → (.+)\\)", u"Model change (default model %s → %s)"),        # ChatGPT Desktop
+    (u"모델 변경\\((.+) → (.+)\\)", u"Model change (%s → %s)"),
+    (u"계정 (\\S+) 변경 전후 값 관측\\(변경 시각 미상\\)", u"Account %s before/after values observed (change time unknown)"),   # Claude Web
+    (u"로그인 URL 방문 흔적\\(인증 완료 미확인\\) \\((\\d+)개 방문 레코드\\)",                   # Gemini (단계 없음)
+     u"Login URL visit trace (authentication completion unconfirmed) (%s visit records)"),
+))
+# <핵심 내용> 중 파서가 만든 고정 라벨: (그 라벨을 쓰는 <흔적 성격>들, 정규식(전체 일치), 영문 틀).
+# 해당 <흔적 성격> 뒤에서 전체가 일치할 때만 바꾼다 — 프롬프트·파일명 같은 증거 값은 일치하지 않으므로 그대로 남는다.
+_CX_HEADS = tuple(_CX_HEAD_EN)
+_PROC_HEADS = (u"애플리케이션 실행(프로세스 시작)", u"애플리케이션 실행(자동 재시작)", u"애플리케이션 종료(프로세스 로그 끝)")
+DETAIL_CORE_RULES = tuple((heads, re.compile(rx + u"$"), en) for heads, rx, en in (
+    (_PROC_HEADS, u"프로세스 (.+) \\(로그 (\\d+)줄\\)", u"process %s (%s log lines)"),                       # ChatGPT Desktop
+    (_PROC_HEADS, u"자동 재시작\\(직전 종료 (-?\\d+)초 뒤\\) 프로세스 (.+)", u"automatic restart (%s s after previous exit) process %s"),
+    # ChatGPT Desktop: 상세 값이 없는 레코드는 user_action.observed_artifact 가 <핵심 내용>이 된다 (cxparser output._behavior_details)
+    (_CX_HEADS, u"POST (\\S+) → (\\S+), 직전 입력창 입력 (\\d+)회", u"POST %s → %s, %s prompt-box inputs just before"),
+    (_CX_HEADS, u"POST (\\S+) → (\\S+) \\(이어진 전송 없음 — 새 대화로 보지 않음\\)",
+     u"POST %s → %s (no follow-up send — not treated as a new conversation)"),
+    (_CX_HEADS, u"auth\\.json 존재하나 파싱 실패", u"auth.json present but could not be parsed"),
+    (_CX_HEADS, u"계정 UUID (.+), 토큰 필드 (.+)", u"account UUID %s, token fields %s"),
+    (_CX_HEADS, u"\\.codex-global-state\\.json 파싱 실패", u".codex-global-state.json could not be parsed"),
+    (_CX_HEADS, u"마지막 선택 모델 (.+)", u"last selected model %s"),
+    (_CX_HEADS, u"로컬 스레드 (\\S+) -> 서버 스레드 (\\S+)", u"local thread %s -> server thread %s"),
+    (_CX_HEADS, u"계정 UUID (\\d+)개: (.*)", u"%s account UUIDs: %s"),
+    (_CX_HEADS, u"전역 상태 파일은 존재하나 대상 키를 찾지 못함", u"global state file present but target keys not found"),
+    (_CX_HEADS, u"패키지 사용자 데이터 폴더 생성 (\\S+) — 최초 설치\\(첫 등록\\) 시점 추정",
+     u"package user data folder created %s — estimated first install (first registration) time"),
+    (_CX_HEADS, u"Prefetch 파일 존재: (.+)", u"Prefetch file present: %s"),
+    (_CX_HEADS, u"최근 항목: (.+) \\(대상 파일은 (.+) 에 이미 존재\\)", u"recent item: %s (target file already existed at %s)"),
+    (_CX_HEADS, u"rollout 파일 읽기 실패", u"rollout file could not be read"),
+    (_CX_HEADS, u"메시지가 아닌 rollout 라인 \\(type=(.*)\\)", u"non-message rollout line (type=%s)"),
+    (_CX_HEADS, u"Sentry scope 파일 존재하나 JSON 으로 읽지 못함 \\(쓰다 만 파일로 추정\\)",
+     u"Sentry scope file present but not readable as JSON (likely partially written)"),
+    (_CX_HEADS, u"Sentry breadcrumb (\\d+)건 보존 \\((.+) ~ (.+) UTC\\): HTTP (\\d+), UI 입력 (\\d+)\\. 링 버퍼라 최근 활동만 남는다",
+     u"%s Sentry breadcrumbs kept (%s ~ %s UTC): HTTP %s, UI input %s. Ring buffer keeps only recent activity"),
+    (_CX_HEADS, u"session_index\\.jsonl 읽기 실패", u"session_index.jsonl could not be read"),
+    (_CX_HEADS, u"state_5\\.sqlite 의 threads 테이블이 비어 있음", u"threads table in state_5.sqlite is empty"),
+    (_CX_HEADS, u"thread_history_1\\.sqlite 항목 종류별 집계", u"thread_history_1.sqlite entry counts by kind"),
+    (_CX_HEADS, u"앱 로그 (\\d+)행, 기록 구간 (.+) ~ (.+)", u"%s app log rows, recorded span %s ~ %s"),
+    (_CX_HEADS, u"USN 저널에 (.+) 변경 (\\d+)건 \\((.*)\\)", u"USN journal: %s changed %s times (%s)"),
+    (_CX_HEADS, u"(.+): (.+) \\(같은 사유 USN 레코드 (\\d+)건, 마지막 (.+)\\)", u"%s: %s (%s USN records with the same reason, last %s)"),
+    (_CX_HEADS, u"채팅 모드 (\\S+) 응답: (.*)", u"chat mode %s response: %s"),
+    (_CX_HEADS, u"채팅창 HTTP 캐시 index 존재, 해석 실패", u"chat window HTTP cache index present but could not be parsed"),
+    (_CX_HEADS, u"채팅창 HTTP 캐시: entry (\\d+) \\(index 밖 carving (\\d+), 못 읽음 (\\d+)\\), 대화 (\\d+)개",
+     u"chat window HTTP cache: %s entries (%s carved outside the index, %s unreadable), %s conversations"),
+    ((u"세션 목록의 최근 로그인 기록",), u"세션 (\\d+)개", u"%s session(s)"),                             # ChatGPT Web
+    ((u"로그인",), u"인증 상태 변경\\(로그인\\)", u"auth state change (login)"),                         # Claude Desktop
+    ((u"로그아웃",), u"인증 상태 변경\\(로그아웃\\)", u"auth state change (logout)"),
+    ((u"정상 종료",), u"종료 신호\\(앱 로그\\)", u"shutdown signal (app log)"),
+    ((u"애플리케이션 실행",), u"실행 로그", u"launch log"),
+    ((u"계정 전환",), u"계정 전환", u"account switch"),
+    ((u"로그인",), u"계정 (\\S+) / 조직 (\\S+)", u"account %s / organization %s"),
+    ((u"로그인",), u"계정 (\\S+)", u"account %s"),
+    ((u"USN Cache 파일 일괄 삭제(사용자 의도 미확인)",), u"Cache 파일 (\\d+)건 삭제", u"%s Cache files deleted"),   # Claude Web
+    ((u"업로드 이미지 파일 조회 흔적(첫 조회 시각 기준, 메시지 첨부 전송 미확인)",
+      u"업로드 문서 파일 조회 흔적(첫 조회 시각 기준, 메시지 첨부 전송 미확인)"), u"다운로드 저장명 (.+)", u"download saved name %s"),
+    ((u"업로드 이미지 파일 조회 흔적(첫 조회 시각 기준, 메시지 첨부 전송 미확인)",
+      u"업로드 문서 파일 조회 흔적(첫 조회 시각 기준, 메시지 첨부 전송 미확인)"), u"파일명 미확인", u"file name unconfirmed"),
+    ((u"로그아웃·재인증 후 다른 조직 계정의 세션 시작",), u"조직 ([^\\s(]+)\\(로그인 (.+?)\\) → 조직 (\\S+)",
+     u"organization %s (login %s) → organization %s"),
+    ((u"로그인 URL 방문 흔적(인증 완료 미확인)",), u"(.*) \\((\\d+)개 방문 레코드\\)", u"%s (%s visit records)"),   # Gemini
+    ((u"Cache 파일 일괄 삭제/감소 흔적(사용자 의도 미확인)",), u"Cache 파일 (\\d+)건", u"%s Cache files"),
+    ((u"Gemini raw 문자열 흔적",), u"(.*) (\\d+)건", u"%s %s hits"),
+    ((u"Gemini 관련 설정 흔적",), u"(.*) (\\d+)개", u"%s %s keys"),
+    ((u"로그인 성공 기록",), u"명시적 로그인 성공", u"explicit login success"),                        # LM Studio
+    ((u"로그아웃 성공 기록",), u"명시적 로그아웃 성공", u"explicit logout success"),
+    ((u"계정 전환 기록",), u"명시적 계정 전환", u"explicit account switch"),
+    ((u"계정 인증 상태 초기화",), u"null/reset 상태 확인", u"null/reset state confirmed"),
+    ((u"로그인 상태 확인",), u"인증된 계정 상태", u"authenticated account state"),
+    ((u"계정 전환 흔적",), u"계정 전환 로그 문구", u"account switch log message"),
+    ((u"애플리케이션 실행 흔적",), u"runtime/server 상태", u"runtime/server state"),
+    ((u"정상 종료 흔적",), u"state flush 및 runtime 정리", u"state flush and runtime cleanup"),
+    ((u"강제 종료 흔적",), u"runtime/state 양성 근거", u"positive runtime/state evidence"),
+    (tuple(BEHAVIOR_EN), u"관찰된 LM Studio 아티팩트", u"observed LM Studio artifact"),
+))
+
+# Artifact_details: '[아티팩트] 라벨=값, … | [아티팩트] …' (Claude Web 은 줄바꿈으로 잇는다). 파서 6종의 생성 코드 기준.
+# 라벨(키), 정해진 값, 파서가 만든 문장 틀만 바꾸고 제목·파일명·URL·경로·ID·시각 같은 값은 그대로 둔다.
+AD_KEY_EN = {
+    # ChatGPT Desktop · Claude Desktop (output._artifact_details)
+    u"유형": u"Type", u"대화 제목": u"Conversation title", u"대화 UUID": u"Conversation UUID", u"분기 UUID": u"Branch UUID",
+    u"모델": u"Model", u"위치": u"Location", u"삭제 엔트리": u"Deleted entry", u"중복 병합": u"Merged duplicates",
+    u"규칙": u"Rule", u"패키지": u"Package", u"계정 UUID": u"Account UUID", u"조직 UUID": u"Organization UUID",
+    u"병합": u"Merged", u"수집": u"Collection",
+    # ChatGPT Web (CSV_ARTIFACT_DETAIL_FIELDS)
+    u"제목": u"Title", u"다운로드 상태": u"Download state", u"완료 시각": u"Completed at", u"파일명": u"File name",
+    u"저장 경로": u"Saved path", u"파일 형식": u"File type", u"저장 key": u"Stored key", u"대화 항목": u"Conversation entries",
+    u"초안": u"Drafts", u"계정 세션": u"Account sessions", u"사라진 대화": u"Missing conversation",
+    u"대화 ID": u"Conversation ID", u"메시지 ID": u"Message ID",
+    # Claude Web (summaries.py · detectors.py)
+    u"파일": u"File", u"크기": u"Size", u"경로": u"Path", u"할당": u"Allocated", u"대체 스트림": u"Alternate streams",
+    u"변경": u"Changes", u"시각": u"Time", u"원본 경로": u"Original path", u"원본 크기": u"Original size",
+    u"삭제 시각": u"Deleted at", u"$R 존재": u"$R present", u"상태": u"State", u"본문 형식": u"Body format",
+    # Gemini (_timeline_artifact_detail)
+    u"로그인 관련 URL": u"Login-related URLs", u"단계": u"Steps", u"대표 URL": u"Representative URL",
+    u"다운로드 URL": u"Download URL", u"방문 횟수": u"Visit count", u"형식": u"Format",
+    u"Gemini 문자열 동일 파일": u"Gemini strings in same file", u"내용": u"Content", u"문자열": u"String",
+    u"저장소": u"Store", u"값": u"Value", u"raw hit": u"raw hit", u"Gemini raw hit": u"Gemini raw hit",
+    # LM Studio (fact_artifact_detail · candidate_artifact_details)
+    u"대상": u"Target", u"이벤트": u"Event", u"응답 버전 수": u"Response versions", u"실행 파일": u"Executable",
+    u"대표 파일": u"Representative file", u"대표 위치": u"Representative location", u"동일 근거": u"Same evidence",
+    u"시각 출처": u"Time source", u"계정 식별값": u"Account identifier", u"JSON 위치": u"JSON location",
+}
+# 값이 파서가 정한 상태·이벤트 이름일 때만 바꾸는 라벨과 그 값 (제목·파일명 자리의 같은 낱말은 건드리지 않는다)
+AD_ENUM_KEYS = frozenset([u"상태", u"이벤트", u"$R 존재", u"Gemini 문자열 동일 파일", u"시각 출처"])
+AD_VALUE_EN = {
+    u"예": u"yes", u"아니오": u"no", u"다운로드 시작": u"download start",
+    u"생성": u"created", u"수정": u"modified", u"삭제": u"deleted", u"이름 변경": u"renamed", u"관찰": u"observed",
+    u"로그인 성공": u"login success", u"로그아웃 성공": u"logout success", u"계정 전환": u"account switch",
+    u"재인증": u"re-authentication", u"추론 실행": u"inference run", u"모델 로드 성공": u"model load success",
+    u"정상 종료": u"normal exit", u"강제 종료": u"forced exit", u"메시지 첨부 연결": u"message attachment linked",
+    u"사용자 메시지 수정": u"user message edited", u"대화 선택": u"conversation selected",
+    u"완료": u"completed", u"완료 미확인": u"completion unconfirmed", u"부분 다운로드": u"partial download",
+    u"인터넷 출처 표시": u"internet origin mark", u"서버 로그 확인": u"server log confirmed",
+    u"HTTP 서버 상태 확인": u"HTTP server state confirmed", u"PID lock 확인": u"PID lock confirmed",
+    u"UI 상태 저장": u"UI state saved", u"활성 대화 상태 초기화": u"active conversation state cleared",
+    u"파일 목록 관찰": u"file listing observed", u"로그인 상태": u"logged-in state", u"계정 프로필 확인": u"account profile confirmed",
+    u"null/reset 상태": u"null/reset state", u"계정 상태 확인": u"account state confirmed", u"인증 상태 존재": u"credential present",
+}
+AD_UNIT = re.compile(u"(\\d+)(?:건|개|회|자|명)$")        # '동일 근거=3건' 처럼 라벨 뒤 수치의 단위
+_TS = u"(\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d|-)"   # Claude Web 의 KST 시각 (없으면 '-')
+# 파서가 만든 문장 틀: (정규식(전체 일치), 영문 틀(str.format, 없는 선택 그룹은 빈 문자열)). 위에서부터 처음 맞는 것.
+AD_PHRASE_RULES = tuple((re.compile(rx + u"$"), en) for rx, en in (
+    # ChatGPT Web 요약 · Evidence 설명
+    (u"방문 기록 확인", u"visit record confirmed"), (u"응답 데이터 확인", u"response data confirmed"),
+    (u"저장 값 확인", u"stored value confirmed"), (u"세션 복원 기록 확인", u"session restore record confirmed"),
+    (u"다운로드 메타데이터 확인", u"download metadata confirmed"), (u"다운로드 기록 확인", u"download record confirmed"),
+    (u"기록 확인", u"record confirmed"),
+    (u"인증 체인 직전에 Local Storage 에서 관찰된 계정 식별자 \\(SHA-256 앞자리\\) (.*)",
+     u"account identifier (SHA-256 prefix) observed in Local Storage just before the auth chain {0}"),
+    (u"인증 체인 직후에 Local Storage 에서 관찰된 계정 식별자 \\(SHA-256 앞자리\\) (.*)",
+     u"account identifier (SHA-256 prefix) observed in Local Storage just after the auth chain {0}"),
+    (u"목록에서 빠진 대화의 Cache 응답이 남아 있음 \\(잔존 — 삭제 여부를 뜻하지 않음\\)",
+     u"Cache response remains for a conversation missing from the list (residue; does not indicate deletion)"),
+    # ChatGPT Desktop · Claude Desktop 병합 메모
+    (u"global-state prompt-history 에도 기록 \\((\\d+)건, 삭제된 이전 버전 포함\\)",
+     u"also recorded in global-state prompt-history ({0}, including deleted earlier versions)"),
+    (u"global-state prompt-history 에도 기록 \\((\\d+)건\\)", u"also recorded in global-state prompt-history ({0})"),
+    (u"삭제된 이전 버전\\(MFT (\\S+)\\)의 (\\S+) 목록에도 동일", u"same in the {1} list of a deleted earlier version (MFT {0})"),
+    (u"삭제된 이전 버전\\(MFT (\\S+)\\)에도 동일", u"same in a deleted earlier version (MFT {0})"),
+    (u"(\\S+) 목록에도 기록", u"also recorded in the {0} list"),
+    (u"Prefetch 실행 기록 (.+) 와 일치", u"matches Prefetch run record {0}"),
+    (u"같은 실행의 다른 프로세스 Prefetch (\\S+)", u"Prefetch of another process in the same run {0}"),
+    (u"최근 항목 바로가기 (\\S+) 와 일치 \\(저장 파일 생성 (\\S+)\\)", u"matches recent-item shortcut {0} (saved file created {1})"),
+    (u"최근 항목 바로가기 (\\S+) 와 일치", u"matches recent-item shortcut {0}"),
+    (u"USN 생성 기록 (\\S+)", u"USN creation record {0}"),
+    # Claude Web 탐지기 문장
+    (u"대화 객체(.*?) ((?:created|updated)_at .+)", u"conversation object{0} {1}"),
+    (_TS + u"~(\\S+) 인증 URL (\\d+)건\\((.*)\\) 후 " + _TS + u" (\\S+) 진입( \\(.*\\))?",
+     u"{0}~{1} {2} auth URLs ({3}), then entered {5} at {4}{6}"),
+    (u"rq-cache-confirmed-account-session 세션 확인 " + _TS, u"rq-cache-confirmed-account-session session confirmed {0}"),
+    (u"logout-at 마커 (\\d+)건 " + _TS + u" \\((.*)\\)", u"{0} logout-at markers {1} ({2})"),
+    (u"로그인 후 조직 범위 API 응답 " + _TS + u" (.*)", u"organization-scoped API response after login {0} {1}"),
+    (u"전송 직전 초안 (\\S+) (\\d+)자 " + _TS, u"last draft before send {0}, {1} chars, {2}"),
+    (u"초안 (\\S+) 저장 (\\d+)회((?: \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d~\\S+)?)", u"draft {0} saved {1} times{2}"),
+    (u"최종 (\\d+)자", u"final {0} chars"),
+    (u"업로드 파일 (\\S+) 조회 " + _TS, u"uploaded file {0} fetched {1}"),
+    (u"같은 파일 UUID 다운로드 기록: (.*)", u"download record with the same file UUID: {0}"),
+    (u"생성 파일 (\\S+) 응답 " + _TS, u"generated file {0} response {1}"),
+    (u"공유 스냅샷 객체 visibility=(\\S*)", u"shared snapshot object visibility={0}"),
+    (u"공유 접근 대상 (\\d+)명", u"share access for {0} people"),
+    (u"응답 " + _TS, u"response {0}"),
+    (u"(.+) 관측 " + _TS, u"{0} observed {1}"),
+    # Claude Web 레코드 요약 (summaries.py · parsers)
+    (u"다운로드 (\\S+) " + _TS, u"download {0} {1}"),
+    (_TS + u" 방문 (.+)", u"{0} visit {1}"),
+    (u"방문 (\\d+)회", u"{0} visits"), (u"마지막 " + _TS, u"last {0}"),
+    (_TS + u" 탭 탐색 (.+)", u"{0} tab navigation {1}"),
+    (u"(\\S+) (\\S+) 생성 " + _TS, u"{0} {1} created {2}"),
+    (u"(\\S+) (\\S+) 응답 " + _TS, u"{0} {1} response {2}"),
+    (u"기록 시각 " + _TS, u"recorded at {0}"), (u"값 (\\d+)자", u"value {0} chars"),
+    (u"IndexedDB 역직렬화 실패 레코드", u"IndexedDB record that failed to deserialize"),
+    (u"탭 탐색: (.*)", u"tab navigation: {0}"), (u"쿠키: (.*)", u"cookie: {0}"),
+    (u"휴지통 삭제: (.*)", u"Recycle Bin deletion: {0}"), (u"MFT 엔트리 (\\S+): (.*)", u"MFT entry {0}: {1}"),
+    (u"파일 존재: (.*) \\((\\S+) bytes\\)", u"file present: {0} ({1} bytes)"),
+    (u"URL 방문: (.*)", u"URL visit: {0}"), (u"방문 기록: (.*)", u"visit record: {0}"),
+    (u"다운로드 (\\S+): (.*)", u"download {0}: {1}"),
+))
+# 병합 메모는 파서가 120자에서 자른다 — 잘린 끝 조각은 알아볼 수 있는 앞부분만 바꾸고 '…' 로 잘렸음을 남긴다
+AD_TRUNCATED = (
+    (u"같은 실행의 다른 프로세스 Prefetch ", u"Prefetch of another process in the same run "),
+    (u"Prefetch 실행 기록 ", u"matches Prefetch run record "),
+    (u"최근 항목 바로가기 ", u"matches recent-item shortcut "),
+    (u"USN 생성 기록 ", u"USN creation record "),
+    (u"global-state prompt-history 에도 기록 ", u"also recorded in global-state prompt-history "),
+)
+_AD_CUT_TAIL = re.compile(u" 와(?: 일치?)?$| \\(저장 파일.*$| \\(\\d*건?.*$")
+_AD_SEGMENT = re.compile(u"( \\| |\\n)")
+_AD_FIELD = re.compile(u", |; ")
+_AD_TAG = re.compile(u"(\\[[^\\]\\n]*\\] ?)?(.*)$", re.S)
+_AD_KEY = re.compile(u"(^|[\\s,;|\\]])(%s)=" % u"|".join(
+    k.replace(u"$", u"\\$") for k in sorted(AD_KEY_EN, key=len, reverse=True)))
+
+
+def pick_language(value):
+    """설정값 -> 'en' | 'ko'. 없거나 지원하지 않는 값이면 영어."""
+    try:
+        value = value.strip().lower()
+    except (AttributeError, TypeError):
+        return DEFAULT_LANGUAGE
+    return value if value in LANGUAGES else DEFAULT_LANGUAGE
+
+
+def detail_en(value):
+    """Behavior_details 영문 표시값. 앞부분(<흔적 성격>)이 번역표에 있을 때만 바꾸고, <핵심 내용>은 파서가 만든 고정 라벨일 때만 바꾼다.
+    '_' 가 앞부분 안에도 있을 수 있어(is_temporary 등) 왼쪽 '_' 부터 차례로 앞부분 후보를 시험한다. 못 찾으면 원문 그대로."""
+    for i in [i for i, ch in enumerate(value) if ch == u"_"] + [len(value)]:
+        head, tail = value[:i], value[i + 1:]
+        en = DETAIL_HEAD_EN.get(head)
+        if en is None:
+            for rx, tpl in DETAIL_HEAD_RULES:
+                m = rx.match(head)
+                if m:
+                    en = tpl % m.groups()
+                    break
+        if en is None:
+            continue
+        if i == len(value):
+            return en
+        for heads, rx, tpl in DETAIL_CORE_RULES:
+            m = head in heads and rx.match(tail)
+            if m:
+                return en + u"_" + tpl % m.groups()
+        return en + u"_" + tail
+    return value
+
+
+def _ad_phrase(text):
+    for rx, tpl in AD_PHRASE_RULES:
+        m = rx.match(text)
+        if m:
+            return tpl.format(*[g or u"" for g in m.groups()])
+    for ko, en in AD_TRUNCATED:
+        if text.startswith(ko):                       # 값까지 남고 뒤가 잘림: '… 11:38:21 와 일'
+            return en + _AD_CUT_TAIL.sub(u"", text[len(ko):]) + u"…"
+        if len(text) >= 4 and ko.startswith(text):    # 문구 중간에서 잘림: '같은 실행의 다른 프로세스 Pre'
+            return en.rstrip() + u"…"
+    return None
+
+
+def _ad_split(text):
+    """', ' · '; ' 로 나눈다 (구분자는 홀수 자리). 괄호 안의 구분자는 값의 일부라 나누지 않는다."""
+    out, last = [], 0
+    for m in _AD_FIELD.finditer(text):
+        head = text[:m.start()]
+        if head.count(u"(") <= head.count(u")"):
+            out += [text[last:m.start()], m.group()]
+            last = m.end()
+    return out + [text[last:]]
+
+
+def _ad_field(field):
+    en = _ad_phrase(field)
+    if en is not None:
+        return en
+    key, eq, value = field.partition(u"=")
+    if eq and key in AD_KEY_EN:
+        en = AD_VALUE_EN.get(value) if key in AD_ENUM_KEYS else None
+        if en is None:
+            m = AD_UNIT.match(value)
+            en = m.group(1) if m else _ad_phrase(value)
+        if en is not None:
+            return key + eq + en                  # 라벨은 artifact_en 끝에서 한꺼번에 바꾼다
+    return field
+
+
+def artifact_en(value):
+    """Artifact_details 영문 표시값. 조각(' | '·줄바꿈) → 항목(', '·'; ') 순으로 문장 틀·정해진 값을 바꾸고, 끝으로 라벨을 바꾼다.
+    틀에 맞지 않는 문구(번역표 밖, 파서가 잘라 낸 끝부분)와 값은 원문 그대로."""
+    parts = _AD_SEGMENT.split(value)
+    for i in range(0, len(parts), 2):
+        tag, body = _AD_TAG.match(parts[i]).groups()
+        en = _ad_phrase(body)
+        if en is None:
+            en = u"".join(p if j % 2 else _ad_field(p) for j, p in enumerate(_ad_split(body)))
+        parts[i] = (tag or u"") + en
+    return _AD_KEY.sub(lambda m: m.group(1) + AD_KEY_EN[m.group(2)] + u"=", u"".join(parts))
+
+
+# 파서가 증거 값 자리에 넣는 가림 표식 (LM Studio safe_nonconversation_text). 값 중간에도 들어가므로 번역 뒤 문자열 치환.
+MARKER_EN = {u"[민감정보 비노출]": u"[sensitive data redacted]", u"[바이너리 데이터 비노출]": u"[binary data redacted]"}
+
+
+def marker_en(value):
+    for ko, en in MARKER_EN.items():
+        value = value.replace(ko, en)
+    return value
+
+
+def display_row(row, lang):
+    """timeline 행(dict, 헤더 끝 공백 없음)의 표시용 사본. 번역 대상은 User_behavior·Behavior_details·Verdict·Artifact_details 넷뿐."""
+    if lang != "en":
+        return row
+    out = dict(row)
+    out["User_behavior"] = BEHAVIOR_EN.get(row.get("User_behavior"), row.get("User_behavior"))
+    out["Behavior_details"] = marker_en(detail_en(row.get("Behavior_details") or u""))
+    out["Verdict"] = VERDICT_EN.get(row.get("Verdict"), row.get("Verdict"))
+    out["Artifact_details"] = marker_en(artifact_en(row.get("Artifact_details") or u""))
+    return out
 
 
 def iso_utc(epoch):
@@ -209,6 +663,7 @@ def load_config():
     선택 work_dir: 대체 작업 위치 (기본 C:\\artinex_work). 작업 위치는 실행마다 사건의 ModuleOutput\\ARTINEX 를 먼저 쓰고,
     그곳이 쓰기 또는 ADS(Zone.Identifier·$J) 불가일 때만 이 위치를 쓴다 (pick_work_root).
     선택 keep_export: true 면 정상 완료여도 추출본(export·in_<파서>)을 지우지 않는다 (cleanup 참조).
+    선택 language: 결과 표시 언어 'en'(기본) | 'ko'. 없거나 잘못된 값이면 'en' (pick_language).
     모듈을 저장소 안(Autopsy_Addon/ARTINEX)에서 그대로 쓰면 설정 없이 저장소와 integration/.venv312 를 쓴다."""
     cfg = {}
     path = os.path.join(MODULE_DIR, "artinex_config.json")
@@ -223,6 +678,7 @@ def load_config():
     if not cfg.get("python"):
         venv = os.path.join(cfg["repo_root"], "integration", ".venv312", "Scripts", "python.exe")
         cfg["python"] = venv if os.path.isfile(venv) else "python"
+    cfg["language"] = pick_language(cfg.get("language"))
     return cfg
 
 
@@ -245,6 +701,22 @@ def read_csv(path):
         return []
     header = [h.strip() for h in rows[0]]
     return [dict(zip(header, r)) for r in rows[1:]]
+
+
+DISPLAY_TIMELINE = "timeline_en.csv"       # 영어 설정에서 Report 로 함께 등록하는 표시용 사본 (원본 timeline.csv 는 바꾸지 않는다)
+
+
+def write_display_timeline(src, dst, lang):
+    """원본 timeline.csv -> 같은 헤더·열의 표시용 사본 (UTF-8 BOM). User_behavior·Behavior_details·Verdict 만 display_row 로 바꾼다."""
+    rows = read_rows(src)
+    header = [h.strip() for h in rows[0]]
+    with open(dst, "wb") as fh:
+        fh.write("\xef\xbb\xbf")
+        w = csv.writer(fh)
+        w.writerow([c.encode("utf-8") for c in rows[0]])
+        for r in rows[1:]:
+            d = display_row(dict(zip(header, r)), lang)
+            w.writerow([d[h].encode("utf-8") for h in header])
 
 
 def check_csv(path, header, verdict=False):
@@ -351,6 +823,8 @@ class ArtinexIngestModule(DataSourceIngestModule):
     def startUp(self, context):
         self.context = context
         self.cfg = load_config()
+        self.lang = self.cfg["language"]
+        self.text = MESSAGES[self.lang]
         missing = [os.path.join(self.cfg["repo_root"], p["dir"], p["entry"]) for p in PARSERS
                    if not os.path.isfile(os.path.join(self.cfg["repo_root"], p["dir"], p["entry"]))]
         if (os.sep in self.cfg["python"] or "/" in self.cfg["python"]) and not os.path.isfile(self.cfg["python"]):
@@ -552,7 +1026,7 @@ class ArtinexIngestModule(DataSourceIngestModule):
                 if not users:
                     continue
                 if f.getSize() > NTFS_META_MAX_BYTES:  # 이 메타파일을 읽는 파서에만 경고
-                    count_missing(v, users, BIG_WARNING)
+                    count_missing(v, users, self.text["big"])
                     notes.append("big\tvol%s\t%s\tsize=%d\tlimit=%d\tparsers=%s" % (
                         v["key"], rel, f.getSize(), NTFS_META_MAX_BYTES, ",".join(users)))
                     continue
@@ -571,9 +1045,9 @@ class ArtinexIngestModule(DataSourceIngestModule):
                          % (META_FILE_LIMIT, n_meta, ",".join(p.lstrip("~") for p in META_FILE_READERS)))
             self.log(Level.WARNING, "metadata limit %d exceeded in %s" % (META_FILE_LIMIT, META_FILE_PARENTS))
             for v in vols.values():
-                count_missing(v, META_FILE_READERS, META_LIMIT_WARNING)
+                count_missing(v, META_FILE_READERS, self.text["meta_limit"])
         for v in sorted(vols.values(), key=lambda v: v["key"]) or [{"key": "-", "run": {}}]:
-            notes.extend(u"parser_not_run\tvol%s\t%s\t%s" % (v["key"], p["label"], NOT_RUN_REASON) for p in PARSERS if p["name"] not in v["run"])
+            notes.extend(u"parser_not_run\tvol%s\t%s\t%s" % (v["key"], p["label"], self.text["not_run"]) for p in PARSERS if p["name"] not in v["run"])
         for v in vols.values():
             if v["run"]:
                 File(v["dir"]).mkdirs()
@@ -732,17 +1206,19 @@ class ArtinexIngestModule(DataSourceIngestModule):
             counts[counter] += 1
 
         try:
-            # timeline.csv 한 행 = 'LLM User Behavior (ARTINEX)' 한 건 (팀 계약 7열을 값 그대로).
+            # timeline.csv 한 행 = 'LLM User Behavior (ARTINEX)' 한 건 (팀 계약 7열. 영어 설정이면 행위·상세·판정·근거 상세를 표시용 번역).
             # 시각은 문자열 그대로 두고, Timeline 용으로는 TSK_TL_EVENT 를 따로 올린다 — 사용자 정의 artifact 에 DATETIME 을
             # 넣으면 Timeline 설명이 '<유형>: <artifact id>' 로만 나오기 때문 (TL_EVENT 는 TSK_DESCRIPTION 이 설명이 된다).
-            for r in read_csv(os.path.join(out_dir, "timeline.csv")):
-                content = source_of(r.get("Artifact_path"), r.get("Artifact_details"))
+            # 행 키는 원본 행으로 만든다 — 언어를 바꿔 다시 돌려도 같은 행은 중복 등록되지 않는다 (먼저 등록된 언어가 남는다).
+            for orig in read_csv(os.path.join(out_dir, "timeline.csv")):
+                r = display_row(orig, self.lang)
+                content = source_of(orig.get("Artifact_path"), orig.get("Artifact_details"))   # MFT=·삭제 표식은 원문에서 읽는다
                 attrs = ArrayList()
                 for name, col in (("ARTINEX_TIMESTAMP", "Timestamp"), ("ARTINEX_MODEL", "Model"), ("ARTINEX_USER_BEHAVIOR", "User_behavior"),
                                   ("ARTINEX_BEHAVIOR_DETAILS", "Behavior_details"), ("ARTINEX_VERDICT", "Verdict"),
                                   ("ARTINEX_ARTIFACT_PATH", "Artifact_path"), ("ARTINEX_ARTIFACT_DETAILS", "Artifact_details")):
                     attrs.add(attr(custom[name], r.get(col) or "-"))
-                key = row_key(u"timeline", r)
+                key = row_key(u"timeline", orig)
                 add(content, behavior_type, attrs, "behaviors", key)
                 epoch = kst_to_epoch(r.get("Timestamp"))
                 if epoch is not None:
@@ -789,7 +1265,7 @@ class ArtinexIngestModule(DataSourceIngestModule):
             return IngestModule.ProcessResult.ERROR
         work = os.path.join(root, "%s_ds_%d" % (case.getName(), dataSource.getId()), stamp)
         os.makedirs(work)
-        self.log(Level.INFO, "work folder %s" % work)
+        self.log(Level.INFO, "work folder %s (display language %s)" % (work, self.lang))
 
         progressBar.progress("Exporting LLM artifacts from Autopsy", 0)
         vols, skipped = self.export_files(dataSource, work)
@@ -866,6 +1342,11 @@ class ArtinexIngestModule(DataSourceIngestModule):
                                     shutil.copy(path, report_dir)
                                 case.addReport(os.path.join(report_dir, fn), MODULE_NAME,
                                                "ARTINEX %s %s (data source %d, %s)" % (p["label"], label, dataSource.getId(), stamp))
+                        if self.lang == "en":                # 원본 timeline.csv 는 그대로 두고 영문 표시용 사본을 따로 등록
+                            write_display_timeline(tl, os.path.join(report_dir, DISPLAY_TIMELINE), self.lang)
+                            case.addReport(os.path.join(report_dir, DISPLAY_TIMELINE), MODULE_NAME,
+                                           "ARTINEX %s timeline, English display (data source %d, %s)"
+                                           % (p["label"], dataSource.getId(), stamp))
                     status.append("%s: %d behaviors, %d messages (ran on %s)%s%s%s%s" % (
                         tag, counts["behaviors"], counts["messages"], why,
                         " (%d already present)" % counts["duplicates"] if counts["duplicates"] else "",

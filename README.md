@@ -1,94 +1,100 @@
 # ARTINEX
 
-[한국어](README.md) · [English](README.en.md)
+[English](README.md) · [한국어](README.ko.md)
 
-Windows 디스크 이미지(E01 / raw)에서 LLM 서비스 6종의 사용 흔적을 찾아
-**사용자 행위 타임라인**과 **복구된 대화 내용**을 뽑아내는 포렌식 파서 모음과, 그 6개를 한 번에 돌리는 ARTINEX 통합 실행기.
-명령행 통합 실행기, GUI, Autopsy 애드온을 제공한다.
-ARTINEX 는 이 통합 파서 전체의 이름이다 (저장소: `LLM_Forensic_Parser`).
+A set of forensic parsers that find traces of six LLM services in Windows disk images (E01 / raw) and extract
+a **user behavior timeline** and **recovered conversations**, plus the ARTINEX integration runner that runs all six at once.
+ARTINEX provides a command-line integration runner, a GUI, and an Autopsy add-on.
+ARTINEX is the name of the whole integrated parser (repository: `LLM_Forensic_Parser`).
 
-WHS4 팀 프로젝트 「LLM 대화 내용 추출 및 사용자 행위 분석」 산출물.
+Deliverable of the WHS4 team project "LLM Conversation Extraction and User Behavior Analysis".
 
-## 구성
+## Components
 
-| 폴더 | 대상 | 진입점 | 실행 환경 |
+| Folder | Target | Entry point | Runtime |
 |---|---|---|---|
-| `ChatGPT_APP_Parser` | ChatGPT / Codex 데스크톱 앱 (MS Store `OpenAI.Codex`) | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python |
+| `ChatGPT_APP_Parser` | ChatGPT / Codex desktop app (MS Store `OpenAI.Codex`) | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python |
 | `ChatGPT_Web_Parser` | chatgpt.com (Chrome) | `python -m chatgpt_parser.cli` | Python 3.12 · pytsk3 · brotli · cramjam |
-| `Claude_APP_Parser` | Claude 데스크톱 앱 | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python · ccl-chromium-reader · zstandard |
+| `Claude_APP_Parser` | Claude desktop app | `run_parser.py` | Python 3.12 · pytsk3 · libewf-python · ccl-chromium-reader · zstandard |
 | `Claude_Web_Parser` | claude.ai (Chrome) | `python -m claude_web_forensics` | Python 3.12 · dissect · ccl-chromium-reader |
 | `Gemini_Web_Parser` | gemini.google.com (Chrome) | `gemini_parser.py` | Python 3.10+ · pytsk3 · libewf-python |
-| `LMstudio_parser` | LM Studio (로컬 LLM) | `lmstudio_parser.py` | Python 3.12 · dissect |
-| `integration` | ARTINEX 통합 실행기 : 위 6개를 순서대로 실행·검증·병합 | `llm_forensic.py` | 표준 라이브러리만 (파서는 공용 `.venv312`) |
-| [`gui`](gui/README.md) | ARTINEX GUI : 그래픽 화면에서 입력·실행·결과 확인 | `main.py` | 공용 Python 3.12 가상환경 · PyQt6 |
-| [`Autopsy_Addon`](Autopsy_Addon/README.md) | Autopsy 애드온 : 파서 실행 및 Autopsy 결과 등록 | `setup.ps1` (설치) | Autopsy 4.23.1 검증 · 외부 Python 3.12 |
+| `LMstudio_parser` | LM Studio (local LLM) | `lmstudio_parser.py` | Python 3.12 · dissect |
+| [`integration`](integration/README.md) | ARTINEX integration runner : runs, validates and merges the six parsers above in order | `llm_forensic.py` | Standard library only (parsers use the shared `.venv312`) |
+| [`gui`](gui/README.md) | ARTINEX GUI : select input, run analysis, and inspect results | `main.py` | Shared Python 3.12 environment · PyQt6 |
+| [`Autopsy_Addon`](Autopsy_Addon/README.md) | Autopsy add-on : run parsers and register results in Autopsy | `setup.ps1` (installation) | Tested on Autopsy 4.23.1 · external Python 3.12 |
 
-파서마다 자세한 사용법과 판정 규칙은 각 폴더의 README 에 있다.
+Detailed usage and detection rules for each parser are in the README of its folder.
 
-## 다운로드 및 설치 준비
+## Download and Setup Preparation
 
-Autopsy 사용자는 [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases)에서 해당 버전의 안내에 따라 Autopsy용 배포 ZIP을 다운로드하고 전체 압축을 해제한다. 소스 코드로 작업하는 경우 저장소를 다운로드하거나 Git으로 복제할 수 있다. 이후 명령은 `integration`과 `Autopsy_Addon`이 있는 배포 폴더 또는 저장소 루트에서 시작한다.
+Autopsy users should download and fully extract the Autopsy distribution ZIP from [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases), following the instructions for that version. For source development, download or clone the repository. Start the commands below from the distribution or repository root containing `integration` and `Autopsy_Addon`.
 
-- [저장소](https://github.com/WHS4-Erelem/LLM_Forensic_Parser)
-- [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases) : Autopsy용 배포 패키지와 버전별 설치 안내.
+- [Repository](https://github.com/WHS4-Erelem/LLM_Forensic_Parser)
+- [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases) : Autopsy distribution packages and version-specific installation instructions.
 
-설치는 Windows PowerShell 기준이다. 최초 환경 준비에는 uv·Python·의존성 다운로드를 위한 네트워크가 필요하다. `setup.ps1`이 Python 3.12 가상환경을 준비한다.
+The installation instructions use Windows PowerShell. Initial setup requires network access to download uv, Python, and dependencies. The setup script prepares a Python 3.12 virtual environment.
 
-## 공통 출력 계약
+## Common Output Contract
 
-모든 파서는 같은 형식의 CSV 두 개를 낸다. 통합기는 이 계약을 어긴 결과를 적재하지 않는다.
+Every parser produces the same two CSV files. The integration runner does not load results that violate this contract.
 
-- `timeline.csv` 7열: `Model, Timestamp, User_behavior, Behavior_details, Verdict, Artifact_path, Artifact_details`
-- `recovered_conversations.csv` 10열: `Model, timestamp, conversation_uuid, conversation_title, message_uuid, parent_message_uuid, message order, role, content, Artifact_path`
-- `Verdict` 는 `확정` 또는 `의심`, 시각은 `YYYY-MM-DD HH:MM:SS.ffffff KST`, 빈 값은 `-`
-- `User_behavior` 는 팀 행위 분류 체계 `integration/user_behaviors.txt` 의 이름만 쓴다 (서비스명 없이). 목록 밖 이름은 통합기가 경고로 보고한다
+- `timeline.csv`, 7 columns: `Model, Timestamp, User_behavior, Behavior_details, Verdict, Artifact_path, Artifact_details`
+- `recovered_conversations.csv`, 10 columns: `Model, timestamp, conversation_uuid, conversation_title, message_uuid, parent_message_uuid, message order, role, content, Artifact_path`
+- `Verdict` is `확정` (confirmed) or `의심` (suspected), timestamps are `YYYY-MM-DD HH:MM:SS.ffffff KST`, and empty values are `-`
+- `User_behavior` uses only names from the team behavior taxonomy `integration/user_behaviors.txt` (without the service name). The integration runner reports names outside the list as warnings
 
-## 빠른 시작 (ARTINEX 통합 실행)
+## Quick Start (ARTINEX integration run)
 
-`setup.ps1` 은 [uv](https://docs.astral.sh/uv/) 가 없으면 먼저 설치하고, 파서 6개와 GUI(PyQt6)가 함께 쓰는 `.venv312` 를 만든다.
+`setup.ps1` installs [uv](https://docs.astral.sh/uv/) first if it is missing, then creates `.venv312`, shared by the six parsers and the GUI (PyQt6).
 
 ```powershell
 cd integration
 powershell -ExecutionPolicy Bypass -File setup.ps1
 
-# 명령행 실행 (입력 경로를 실제 증거 이미지 경로로 변경)
+# Command-line analysis (replace the input path with your evidence image)
 .\.venv312\Scripts\python.exe llm_forensic.py -i "D:\Evidence\sample.E01" -o out
 
-# GUI 실행
+# GUI
 .\.venv312\Scripts\python.exe ..\gui\main.py
 ```
 
-> 참고: 설치 중 AhnLab Safe Transaction 등의 보안 프로그램이 차단하면, 새 PowerShell 창에서 `uv --version`으로 설치 여부를 확인한 뒤 `setup.ps1`을 다시 실행한다. uv가 없다면 [공식 안내](https://docs.astral.sh/uv/getting-started/installation/)에 따라 먼저 설치한다.
+> Note: If security software such as AhnLab Safe Transaction blocks setup, open a new PowerShell window, check `uv --version`, and rerun `setup.ps1`. If uv is missing, install it using the [official instructions](https://docs.astral.sh/uv/getting-started/installation/) first.
 
-결과는 `out\<evidence_id>\` 에 병합 `timeline.csv` · `recovered_conversations.csv` · `unified.db`(SQLite) ·
-`evidence_manifest.json`(세그먼트별 SHA-256) · `integration_report.json`(파서별 상태·오류 목록) · 파서별 원본 결과 폴더로 남는다.
-종료코드 0 전부 성공 / 1 일부 파서 실패·계약 위반 / 2 입력 실패 / 3 통합 DB·출력 오류. 자세한 내용은 [통합 실행기 안내](integration/README.md)와 [GUI 안내](gui/README.md).
+Results are written to `out\<evidence_id>\`: merged `timeline.csv` · `recovered_conversations.csv` · `unified.db` (SQLite) ·
+`evidence_manifest.json` (SHA-256 per segment) · `integration_report.json` (status and errors per parser) · each parser's original result folder.
+Exit codes: 0 all succeeded / 1 some parsers failed or violated the contract / 2 input failure / 3 integration DB or output error. For details, see the [integration runner guide](integration/README.md) and the [GUI guide](gui/README.md).
 
-## Autopsy 애드온
+## Autopsy Add-on
 
-Autopsy에서 증거 이미지를 등록한 뒤 ARTINEX 모듈로 파서를 실행하고, 사용자 행위와 복구된 대화를 Autopsy에서 확인할 수 있다. 검증 환경은 Windows 11 · Autopsy 4.23.1이다.
+Add an evidence image to Autopsy and run the ARTINEX ingest module to inspect reconstructed user behaviors and recovered conversations in Autopsy. The tested environment is Windows 11 with Autopsy 4.23.1.
 
-[Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases)에서 **Autopsy용 배포 ZIP 전체**를 받아 압축을 해제한다. `Autopsy_Addon`, `integration`, 파서 폴더 6개를 함께 유지해야 한다. 애드온은 배포 폴더의 파서를 외부 Python 프로세스로 실행하므로, 설치 후 배포 폴더를 이동하거나 삭제하면 안 된다. 이동했다면 설치 스크립트를 다시 실행한다.
+Download and fully extract the **Autopsy distribution ZIP** from [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases). Keep `Autopsy_Addon`, `integration`, and all six parser folders together. The add-on runs the parsers from this folder as external Python processes. Do not move or delete the distribution folder after installation. If you move it, run the setup script again.
 
-Autopsy를 종료하고 압축을 해제한 배포 패키지 루트에서 실행한다.
+Close Autopsy and run the following from the extracted distribution root:
 
 ```powershell
+# English results (default)
 powershell -ExecutionPolicy Bypass -File .\Autopsy_Addon\setup.ps1
+
+# Korean results
+powershell -ExecutionPolicy Bypass -File .\Autopsy_Addon\setup.ps1 -Language ko
 ```
 
-설치 후 Autopsy를 다시 열고 Ingest 모듈 목록에서 **ARTINEX**를 선택한다. 상세 설치 방법·결과 확인·제약 사항은 [국문 안내](Autopsy_Addon/README.md)와 [영문 안내](Autopsy_Addon/README.en.md)를 참고한다.
+The add-on shows results in **English by default**; `-Language ko` selects Korean, and any other value stops setup with an error. With the English setting, behavior names, verdicts, the fixed parser phrases in behavior details, the labels and fixed phrases in evidence details, Timeline descriptions and add-on notices are shown in English. Conversation content, titles, prompts, file names, paths, IDs, times and other evidence values stay exactly as recovered (Korean evidence stays Korean), and the parsers' CSV and JSON files are not modified. See [Display Language](Autopsy_Addon/README.md#display-language) for the full list and the limits.
 
-## 개발 검증
+Restart Autopsy and select **ARTINEX** in the ingest module list. For detailed installation instructions, result locations, and limitations, see the [English guide](Autopsy_Addon/README.md) or [Korean guide](Autopsy_Addon/README.ko.md).
 
-정답 시트가 있는 경우에만 실행한다. 일반 분석에 필요한 단계는 아니다. 아래 명령은 `integration` 폴더 기준이며 `<evidence_id>`를 실제 결과 폴더명으로 변경한다.
+## Development Validation
+
+Run this only when an answer key is available. It is not required for normal analysis. Run the command from `integration` and replace `<evidence_id>` with the actual result folder name.
 
 ```powershell
 .\.venv312\Scripts\python.exe validation\verify_merged.py --timeline "out\<evidence_id>\timeline.csv" --key validation\scenario_keys\plain_2026-09-15.csv
 ```
 
-## 라이선스
+## License
 
-ARTINEX 자체 작성 코드(파서 6종, 통합 실행기, GUI, Autopsy 애드온)는 **AGPL-3.0-or-later**(GNU Affero General Public License v3.0 이상)로 배포한다.
-Copyright (C) 2026 WHS4-Erelem contributors. 라이선스 전문은 [`LICENSE`](LICENSE).
+The code written for ARTINEX (the six parsers, the integration runner, the GUI and the Autopsy add-on) is licensed under **AGPL-3.0-or-later** (GNU Affero General Public License v3.0 or later).
+Copyright (C) 2026 WHS4-Erelem contributors. The full license text is in [`LICENSE`](LICENSE).
 
-`setup.ps1` 이 설치하는 외부 라이브러리(pytsk3, libewf-python, dissect.*, ccl_chromium_reader, PyQt6 등)는 ARTINEX 에 포함되지 않으며, 각자의 라이선스와 저작권 고지를 따른다.
+External libraries installed by `setup.ps1` (pytsk3, libewf-python, dissect.*, ccl_chromium_reader, PyQt6, etc.) are not part of ARTINEX and remain under their own licenses and copyright notices.
