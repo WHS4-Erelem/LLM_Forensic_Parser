@@ -45,7 +45,7 @@ Autopsy 사용자는 [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Pars
 
 ## 빠른 시작 (ARTINEX 통합 실행)
 
-`setup.ps1` 은 [uv](https://docs.astral.sh/uv/) 가 없으면 먼저 설치하고, 파서 6개와 GUI(PyQt6)가 함께 쓰는 `.venv312` 를 만든다.
+`setup.ps1` 은 [uv](https://docs.astral.sh/uv/) 가 없으면 WinGet(`astral-sh.uv`)으로 먼저 설치하고, 파서 6개와 GUI(PyQt6)가 함께 쓰는 `.venv312` 를 만든다.
 
 ```powershell
 cd integration
@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 .\.venv312\Scripts\python.exe ..\gui\main.py
 ```
 
-> 참고: 설치 중 AhnLab Safe Transaction 등의 보안 프로그램이 차단하면, 새 PowerShell 창에서 `uv --version`으로 설치 여부를 확인한 뒤 `setup.ps1`을 다시 실행한다. uv가 없다면 [공식 안내](https://docs.astral.sh/uv/getting-started/installation/)에 따라 먼저 설치한다.
+> 참고: 설치 중 AhnLab Safe Transaction 등의 보안 프로그램이 차단하면, 새 PowerShell 창에서 `uv --version`으로 설치 여부를 확인한 뒤 `setup.ps1`을 다시 실행한다. uv가 없거나 WinGet을 쓸 수 없다면 [공식 안내](https://docs.astral.sh/uv/getting-started/installation/)에 따라 먼저 설치한다.
 
 결과는 `out\<evidence_id>\` 에 병합 `timeline.csv` · `recovered_conversations.csv` · `unified.db`(SQLite) ·
 `evidence_manifest.json`(세그먼트별 SHA-256) · `integration_report.json`(파서별 상태·오류 목록) · 파서별 원본 결과 폴더로 남는다.

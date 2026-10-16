@@ -42,7 +42,7 @@ Autopsy의 Python은 Jython 2.7이므로 파서를 직접 import하지 않습니
 | Autopsy | 4.23.1에서 검증했습니다. 다른 버전은 검증하지 않았습니다. |
 | 배포 패키지 | [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases)의 Autopsy용 배포 ZIP 전체. `Autopsy_Addon`, `integration`, 파서 폴더 6개가 필요합니다. |
 | Python | 설치 스크립트가 생성하는 `integration\.venv312`의 전용 Python 3.12 가상환경. 일부 파서 의존성(pytsk3, libewf-python)은 Python 3.12까지만 Windows 휠을 제공합니다. |
-| uv | 설치 스크립트에서 환경 생성에 사용합니다. uv가 없으면 공식 설치 프로그램으로 설치합니다. |
+| uv | 설치 스크립트에서 환경 생성에 사용합니다. uv가 없으면 WinGet(`astral-sh.uv`)으로 설치합니다. WinGet이 없거나 설치에 실패하면 설치가 중단되므로 uv를 직접 설치([공식 안내](https://docs.astral.sh/uv/getting-started/installation/))한 뒤 다시 실행하세요. |
 | 네트워크 | 설치 중 uv, Python 3.12, 패키지를 다운로드할 때 필요합니다. 분석 중에는 필요하지 않습니다. |
 | 디스크 공간 | 애드온은 파서가 읽는 파일을 작업 폴더로 추출합니다(기본 위치는 사건 폴더 내부). `Zone.Identifier` 스트림을 실제 대체 데이터 스트림으로 전달하므로 작업 폴더는 NTFS에 있어야 합니다. |
 
@@ -68,7 +68,7 @@ Autopsy의 Python은 Jython 2.7이므로 파서를 직접 import하지 않습니
    1. 저장소에 파서 진입점 6개가 있는지 확인합니다.
    2. 전용 가상환경 `integration\.venv312`를 검사합니다. 가상환경이어야 하고, Python 3.12를 사용하며, 주요 파서 의존성을 import할 수 있어야 합니다.
       - 검사를 통과하면 재설치 없이 환경을 재사용합니다.
-      - 환경이 없으면 `integration\setup.ps1`을 실행합니다. 이 스크립트는 필요한 경우 uv를 설치하고 환경을 생성합니다.
+      - 환경이 없으면 `integration\setup.ps1`을 실행합니다. 이 스크립트는 필요한 경우 WinGet으로 uv를 설치하고 환경을 생성합니다.
       - 환경이 있지만 검사에 실패하면(Python 버전 불일치, 인터프리터 손상, 패키지 누락), 이 저장소의 `integration\.venv312`만 삭제하고 다시 생성합니다. 경로가 예상과 다르거나 정션·링크이거나 삭제할 수 없으면 설치하지 않고 중단합니다.
       - 준비 후 종료 코드와 환경을 다시 검사하며, 둘 중 하나라도 실패하면 설치하지 않고 중단합니다.
    3. 설치된 Autopsy 설정에서 Python 플러그인 폴더(`python_modules`)를 찾습니다. 후보가 없거나 여러 개일 때만 사용자에게 묻습니다. `-PluginDir <python_modules folder>`로 직접 지정할 수도 있습니다.
@@ -232,7 +232,7 @@ powershell -ExecutionPolicy Bypass -File .\Autopsy_Addon\setup.ps1 -Language ko
 |---|---|
 | Ingest 모듈 목록에 ARTINEX가 없음 | 설치 스크립트 실행 후 Autopsy를 다시 시작하세요. `<python_modules>\ARTINEX\ARTINEX.py`가 있는지 확인하세요(Autopsy의 Tools → Python Plugins에서 해당 폴더를 열 수 있습니다). |
 | 설치가 "parser environment preparation failed" 메시지와 함께 중단됨 | 해당 메시지 위의 내용을 확인하세요. 패키지를 다운로드하지 못했다면 PyPI와 GitHub에 접속할 수 있는 네트워크에서 설치를 다시 실행하세요. |
-| uv가 없는 PC에서 보안 프로그램(예: AhnLab Safe Transaction, 진단명 `Execution/MDP.Powershell.M1201`)이 설치를 차단함 | 차단은 uv 설치가 끝난 뒤 발생합니다. **새 PowerShell 창**을 열어 설치 스크립트를 다시 실행하세요. 이를 피하려면 uv를 먼저 설치한 뒤 스크립트를 실행하세요(https://docs.astral.sh/uv/ 참고). |
+| uv가 없는 PC에서 보안 프로그램(예: AhnLab Safe Transaction)이 설치를 차단함 | **새 PowerShell 창**을 열어 `uv --version`으로 설치 여부를 확인하세요. 설치되어 있으면 설치 스크립트를 다시 실행하고, 없으면 uv를 먼저 설치([공식 안내](https://docs.astral.sh/uv/getting-started/installation/))한 뒤 실행하세요. |
 | 설치가 "unsupported -Language …" 메시지와 함께 중단됨 | `-Language en` 또는 `-Language ko`를 지정하거나, 영어로 설치하려면 옵션을 생략하세요. 아무것도 설치하거나 바꾸지 않은 상태입니다. |
 | 결과가 원하지 않는 언어로 표시됨 | 원하는 언어로 설치 스크립트를 다시 실행하세요. 데이터 소스에 이미 등록된 행은 그 언어로 남습니다([표시 언어](#표시-언어) 참고). |
 | 설치가 "could not delete … .venv312" 메시지와 함께 중단됨 | 해당 Python을 사용하는 프로그램(예: Autopsy, 통합 실행기)을 종료하고 설치를 다시 실행하세요. |

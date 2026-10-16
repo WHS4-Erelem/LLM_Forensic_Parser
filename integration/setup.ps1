@@ -1,4 +1,4 @@
-﻿# 파서·GUI 실행 환경을 만든다 (uv 가 없으면 먼저 설치: https://docs.astral.sh/uv/)
+﻿# 파서·GUI 실행 환경을 만든다 (uv 가 없으면 WinGet 으로 먼저 설치: https://docs.astral.sh/uv/getting-started/installation/)
 #   .venv312  ChatGPT Desktop · ChatGPT Web · Claude Desktop · Gemini · Claude Web · LM Studio + GUI(PyQt6)
 #             (pytsk3 + libewf-python 은 3.12 휠까지만 있음. Claude Web 의 zstd 도 3.14 에선 MSVC 빌드가 필요해 3.12 로)
 # 사용: powershell -ExecutionPolicy Bypass -File setup.ps1
@@ -12,12 +12,23 @@ function Invoke-Step {
 }
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    Write-Host "uv 가 없어 설치합니다 (https://astral.sh/uv/install.ps1)"
-    powershell -ExecutionPolicy ByPass -NoProfile -Command "irm https://astral.sh/uv/install.ps1 | iex"
-    $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"    # 설치 직후에는 이 창의 PATH 에 아직 없다
-    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-        throw "uv 설치를 확인하지 못했습니다. https://docs.astral.sh/uv/ 안내대로 설치한 뒤 새 PowerShell 에서 다시 실행하세요."
+    $uvGuide = "https://docs.astral.sh/uv/getting-started/installation/ 안내대로 uv 를 설치한 뒤 새 PowerShell 에서 다시 실행하세요."
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "uv 가 없고 WinGet 도 없어 자동 설치할 수 없습니다. $uvGuide"
     }
+    Write-Host "uv 가 없어 WinGet 으로 설치합니다 (astral-sh.uv)"
+    winget install --id astral-sh.uv -e --source winget --accept-package-agreements --accept-source-agreements
+    $wingetExit = $LASTEXITCODE
+    # 설치 직후에는 이 창의 PATH 에 아직 없다: 레지스트리의 PATH 와 WinGet 링크 폴더를 다시 읽는다
+    $env:Path = @(
+        [Environment]::GetEnvironmentVariable("Path", "Machine"),
+        [Environment]::GetEnvironmentVariable("Path", "User"),
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+    ) -join ";"
+    if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+        throw "WinGet 으로 uv 를 설치하지 못했습니다 (winget exit $wingetExit). $uvGuide"
+    }
+    if ($wingetExit -ne 0) { Write-Warning "winget exit $wingetExit 이지만 uv 를 찾았으므로 계속합니다: $((Get-Command uv).Source)" }
 }
 
 $py = ".venv312\Scripts\python.exe"

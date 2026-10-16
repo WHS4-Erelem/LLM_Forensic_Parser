@@ -43,7 +43,7 @@ Autopsy's Python is Jython 2.7, so the parsers are not imported; they run as ext
 | Autopsy | 4.23.1 (tested). Other versions have not been tested. |
 | Distribution package | The complete Autopsy distribution ZIP from [Releases](https://github.com/WHS4-Erelem/LLM_Forensic_Parser/releases). Requires `Autopsy_Addon`, `integration`, and all six parser folders. |
 | Python | A dedicated Python 3.12 virtual environment at `integration\.venv312`, created by the setup script. Some parser dependencies (pytsk3, libewf-python) only provide Windows wheels up to Python 3.12. |
-| uv | Used by the setup script to create the environment. If uv is missing, the script installs it with the official installer. |
+| uv | Used by the setup script to create the environment. If uv is missing, the script installs it with WinGet (`astral-sh.uv`). If WinGet is not available or the install fails, setup stops; install uv yourself ([official instructions](https://docs.astral.sh/uv/getting-started/installation/)) and run setup again. |
 | Network | Required during setup to download uv, Python 3.12 and packages. Not required during analysis. |
 | Disk space | The add-on exports the files the parsers read into a work folder (by default inside the case folder). The folder must be on NTFS, because `Zone.Identifier` streams are passed as real alternate data streams. |
 
@@ -68,7 +68,7 @@ Autopsy's Python is Jython 2.7, so the parsers are not imported; they run as ext
    1. Checks that the six parser entry points exist in the repository.
    2. Checks the dedicated virtual environment `integration\.venv312` (must be a virtual environment, Python 3.12, and able to import the main parser dependencies).
       - If the check passes, the environment is reused without reinstalling.
-      - If it is missing, the script runs `integration\setup.ps1`, which installs uv when needed and creates the environment.
+      - If it is missing, the script runs `integration\setup.ps1`, which installs uv with WinGet when needed and creates the environment.
       - If it exists but fails the check (wrong Python version, broken interpreter, missing packages), the script deletes only this repository's `integration\.venv312` and recreates it. It stops without installing if the path is unexpected, is a junction or link, or cannot be deleted.
       - After preparation it checks both the exit code and the environment again, and stops without installing if either fails.
    3. Finds the Autopsy Python plugin folder (`python_modules`) from the installed Autopsy configuration, and asks only if it finds none or several. You can pass it directly with `-PluginDir <python_modules folder>`.
@@ -232,7 +232,7 @@ Translation limits:
 |---|---|
 | ARTINEX is not in the ingest module list | Restart Autopsy after running the setup script. Check that `<python_modules>\ARTINEX\ARTINEX.py` exists (Autopsy: Tools → Python Plugins opens the folder). |
 | Setup stops with "parser environment preparation failed" | Read the message above it. If packages could not be downloaded, run setup again from a network that can reach PyPI and GitHub. |
-| A security program (for example AhnLab Safe Transaction, detection `Execution/MDP.Powershell.M1201`) blocks setup on a PC without uv | The block happens after uv has already been installed. Open a **new** PowerShell window and run the setup script again. To avoid it, install uv first (see https://docs.astral.sh/uv/) and then run setup. |
+| A security program (for example AhnLab Safe Transaction) blocks setup on a PC without uv | Open a **new** PowerShell window and check `uv --version`. If uv is installed, run the setup script again. If not, install uv first ([official instructions](https://docs.astral.sh/uv/getting-started/installation/)) and then run setup. |
 | Setup stops with "unsupported -Language …" | Use `-Language en` or `-Language ko`, or omit the option for English. Nothing was installed or changed. |
 | Results are shown in the other language | Run the setup script again with the language you want. Rows already posted to a data source keep their language (see [Display Language](#display-language)). |
 | Setup stops with "could not delete … .venv312" | Close programs that use that Python (for example Autopsy or the integration runner) and run setup again. |
