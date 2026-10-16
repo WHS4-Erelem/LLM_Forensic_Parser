@@ -45,7 +45,7 @@ Every parser produces the same two CSV files. The integration runner does not lo
 
 ## Quick Start (ARTINEX integration run)
 
-`setup.ps1` installs [uv](https://docs.astral.sh/uv/) first if it is missing, then creates `.venv312`, shared by the six parsers and the GUI (PyQt6).
+`setup.ps1` installs [uv](https://docs.astral.sh/uv/) first with WinGet (`astral-sh.uv`) if it is missing, then creates `.venv312`, shared by the six parsers and the GUI (PyQt6).
 
 ```powershell
 cd integration
@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 .\.venv312\Scripts\python.exe ..\gui\main.py
 ```
 
-> Note: If security software such as AhnLab Safe Transaction blocks setup, open a new PowerShell window, check `uv --version`, and rerun `setup.ps1`. If uv is missing, install it using the [official instructions](https://docs.astral.sh/uv/getting-started/installation/) first.
+> Note: If security software such as AhnLab Safe Transaction blocks setup, open a new PowerShell window, check `uv --version`, and rerun `setup.ps1`. If uv is missing, or WinGet is not available, install uv using the [official instructions](https://docs.astral.sh/uv/getting-started/installation/) first.
 
 Results are written to `out\<evidence_id>\`: merged `timeline.csv` · `recovered_conversations.csv` · `unified.db` (SQLite) ·
 `evidence_manifest.json` (SHA-256 per segment) · `integration_report.json` (status and errors per parser) · each parser's original result folder.

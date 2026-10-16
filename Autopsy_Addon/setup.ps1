@@ -1,6 +1,6 @@
 ﻿# ARTINEX — Autopsy 애드온 설치 스크립트 (한 번 실행으로 실행 환경 준비 + 설치)
 #   1. 저장소 루트·파서 진입점 확인   2. 통합파서 전용 가상환경(integration\.venv312) 검사 → 없거나 검사 실패면 기존 환경을 지우고
-#      integration\setup.ps1 로 환경 생성(uv 설치 포함) → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
+#      integration\setup.ps1 로 환경 생성(uv 가 없으면 WinGet 으로 설치) → 재검사   3. Autopsy python_modules 폴더 찾기   4. 대체 작업 위치(C:\artinex_work) 준비
 #   5. 모듈 복사 + artinex_config.json 갱신(기존 설정 보존, 언어는 이번 값으로)
 # 사용: powershell -ExecutionPolicy Bypass -File setup.ps1 [-PluginDir <Autopsy python_modules 폴더>] [-Language en|ko]
 #   -Language: Autopsy 결과 표시 언어. 생략하면 en (영어), 한국어는 ko.
@@ -54,7 +54,7 @@ if (-not (Test-Venv)) {
         catch { throw "could not delete $venv ($_). Close programs using it, then run again. Plugin not installed." }
         if (Test-Path -LiteralPath $venv) { throw "could not delete $venv completely. Close programs using it, then run again. Plugin not installed." }
     }
-    # uv 가 없으면 integration\setup.ps1 이 공식 설치 스크립트로 먼저 설치한다
+    # uv 가 없으면 integration\setup.ps1 이 WinGet(astral-sh.uv)으로 먼저 설치한다
     $ErrorActionPreference = "Continue"
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo "integration\setup.ps1")
     $code = $LASTEXITCODE
